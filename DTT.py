@@ -38,6 +38,10 @@ class DTTModel(nn.Module):
         # Access the embedding layer from the base model
         self.embedding = base_causallm.get_input_embeddings()
 
+        # Storage for hidden states and logits during generation
+        self.last_hidden_states = []  # List of lists: [batch_size, num_latent_steps, hidden_dim]
+        self.last_logits = []  # List of lists: [batch_size, num_tokens, vocab_size]
+
     def forward(self, input_ids, attention_mask, labels=None, position_ids=None, **kwargs):
         """
         Forward pass to compute logits and loss, handling latent reasoning with <continue> tokens.
@@ -156,7 +160,7 @@ class DTTModel(nn.Module):
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=50, **kwargs):
         """
-        Custom generation method implementing DTT inference with latent mode.
+        Custom generation method implementing DTT inference with latent mode, collecting hidden states and logits.
 
         Args:
             input_ids (torch.Tensor): Input token IDs of shape (batch_size, sequence_length).
@@ -186,6 +190,10 @@ class DTTModel(nn.Module):
             attention_mask = torch.ones_like(input_ids, device=device)
         current_attention_mask = attention_mask.clone()
 
+        # Initialize storage for hidden states and logits
+        self.last_hidden_states = [[] for _ in range(batch_size)]
+        self.last_logits = [[] for _ in range(batch_size)]
+
         past_key_values = None
 
         for _ in range(max_new_tokens):
@@ -202,6 +210,11 @@ class DTTModel(nn.Module):
 
             # Sample next tokens
             next_tokens = torch.argmax(logits, dim=-1)  # (batch_size,)
+
+            # Store logits for each generated token
+            for b in range(batch_size):
+                if not finished[b]:
+                    self.last_logits[b].append(logits[b].clone())
 
             # Process each sequence in the batch
             new_embeds = []
@@ -227,6 +240,7 @@ class DTTModel(nn.Module):
                     else:
                         # Use the hidden state as the next input embedding
                         embed = hidden_states[b:b+1].unsqueeze(0)  # (1, hidden_size)
+                        self.last_hidden_states[b].append(hidden_states[b].clone())
                         latent_steps_counters[b] += 1
 
                 new_embeds.append(embed)
@@ -250,6 +264,13 @@ class DTTModel(nn.Module):
 
         # Compute total latent steps per sequence
         total_latent_steps = [sum(steps) for steps in latent_steps_list]
+
+        # Convert logits lists to tensors for reward computation
+        for b in range(batch_size):
+            if self.last_logits[b]:
+                self.last_logits[b] = torch.stack(self.last_logits[b])
+            else:
+                self.last_logits[b] = torch.tensor([], device=device)
 
         return {
             'sequences': sequences,

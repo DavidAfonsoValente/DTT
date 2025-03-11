@@ -72,7 +72,7 @@ def main():
         print(f"Resuming from checkpoint epoch_{configs.resume}!")
     elif configs.resume != 0:
         if configs.load_model_path == "None":
-            print("Warning: Resuming from epoch {configs.resume} without loading a checkpoint!")
+            print(f"Warning: Resuming from epoch {configs.resume} without loading a checkpoint!")
         print(f"Loading from {configs.load_model_path} and skipping first {configs.resume} epochs")
 
     # Initialize base model and tokenizer
@@ -110,13 +110,13 @@ def main():
 
     # Resize token embeddings if new tokens are added
     if not (configs.cot or configs.no_thoughts or configs.no_cot):
-        model.resize_token_embeddings(len(tokenizer))
+        base_model.resize_token_embeddings(len(tokenizer))
         embeddings = model.get_input_embeddings()
         target_id = tokenizer.convert_tokens_to_ids("<<")
         for token_id in [latent_id, start_latent_id, end_latent_id]:
             target_embedding = embeddings.weight.data[target_id]
             embeddings.weight.data[token_id] = target_embedding
-            lm_head = model.lm_head
+            lm_head = base_model.lm_head
             lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
 
     if configs.no_thoughts:
@@ -173,10 +173,14 @@ def main():
 
     total_train_steps = 0
 
-    # Initialize phased reward system
+    # Initialize phased reward system with model access
     if not configs.only_eval:
         total_train_steps = (len(base_dataset_train) // (configs.per_device_train_batch_size * world_size)) * configs.num_train_epochs
-        phased_reward = reward.PhasedReward(total_steps=total_train_steps, tokenizer=tokenizer)
+        phased_reward = reward.PhasedReward(
+            model=parallel_model.module if isinstance(parallel_model, (FSDP, DDP)) else parallel_model,
+            total_steps=total_train_steps,
+            tokenizer=tokenizer
+        )
 
     # Configure and initialize GRPOTrainer for training
     if not configs.only_eval:
