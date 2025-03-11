@@ -14,10 +14,29 @@ from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 
 
-def get_dataset(path, tokenizer, max_size=1000000000):
+import json
+import itertools
+import torch
+import torch.distributed as dist
+from datasets import Dataset
 
-    def tokenize_sample(sample):
+def get_dataset(path, tokenizer, max_size=1000000000, mode='cot'):
+    """
+    Loads and processes the dataset based on the specified mode.
 
+    Args:
+        path (str): Path to the JSON dataset.
+        tokenizer: Tokenizer object with an encode method (e.g., from transformers).
+        max_size (int): Maximum number of samples to load (default: 1,000,000,000).
+        mode (str): Processing mode, either 'cot' for chain-of-thought or 'dtt' for Dynamic Thinking Tokens (default: 'cot').
+
+    Returns:
+        Dataset: A processed dataset with fields depending on the mode:
+            - For 'cot': "question_tokenized", "steps_tokenized", "answer_tokenized", "idx"
+            - For 'dtt': "input_ids", "answer", "idx"
+    """
+    # Tokenization function for CoT mode (original behavior)
+    def tokenize_sample_cot(sample):
         question_tokenized = tokenizer.encode(
             sample["question"] + "\n", add_special_tokens=True
         )
@@ -28,21 +47,39 @@ def get_dataset(path, tokenizer, max_size=1000000000):
         answer_tokenized = tokenizer.encode(
             "### " + sample["answer"], add_special_tokens=False
         ) + [tokenizer.eos_token_id]
-
-        sample = {
+        return {
             "question_tokenized": question_tokenized,
             "steps_tokenized": steps_tokenized,
             "answer_tokenized": answer_tokenized,
             "idx": sample["idx"],
         }
-        return sample
 
+    # Tokenization function for DTT mode
+    def tokenize_sample_dtt(sample):
+        input_ids = tokenizer.encode(
+            sample["question"] + "\n", add_special_tokens=True
+        )
+        return {
+            "input_ids": input_ids,
+            "answer": sample["answer"],  # Answer remains a string
+            "idx": sample["idx"],
+        }
+
+    # Load and preprocess data
     data = json.load(open(path))[:max_size]
     data = [{**d, "idx": idx} for idx, d in enumerate(data)]
-
     keys = data[0].keys()
     dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
 
+    # Select tokenization function based on mode
+    if mode == 'cot':
+        tokenize_sample = tokenize_sample_cot
+    elif mode == 'dtt':
+        tokenize_sample = tokenize_sample_dtt
+    else:
+        raise ValueError("Invalid mode. Choose 'cot' or 'dtt'.")
+
+    # Process dataset with distributed support
     if torch.cuda.device_count() > 1:
         if dist.get_rank() == 0:
             processed_dataset = [
@@ -54,24 +91,24 @@ def get_dataset(path, tokenizer, max_size=1000000000):
             processed_dataset = [None]
         dist.broadcast_object_list(processed_dataset, src=0)
         dataset = processed_dataset[0]
-
     else:
         dataset = dataset.map(
             tokenize_sample, remove_columns=list(dataset.features), num_proc=32
         )
 
-    # verify
-    d = data[0]
-    complete = d["question"] + "\n" + "\n".join(d["steps"]) + "\n### " + d["answer"]
-    complete_tokenized = tokenizer.encode(complete, add_special_tokens=True) + [
-        tokenizer.eos_token_id
-    ]
-    assert (
-        complete_tokenized
-        == dataset[0]["question_tokenized"]
-        + list(itertools.chain.from_iterable(dataset[0]["steps_tokenized"]))
-        + dataset[0]["answer_tokenized"]
-    )
+    # Verification step (only for CoT mode)
+    if mode == 'cot':
+        d = data[0]
+        complete = d["question"] + "\n" + "\n".join(d["steps"]) + "\n### " + d["answer"]
+        complete_tokenized = tokenizer.encode(complete, add_special_tokens=True) + [
+            tokenizer.eos_token_id
+        ]
+        assert (
+            complete_tokenized
+            == dataset[0]["question_tokenized"]
+            + list(itertools.chain.from_iterable(dataset[0]["steps_tokenized"]))
+            + dataset[0]["answer_tokenized"]
+        )
 
     return dataset
 
