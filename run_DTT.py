@@ -109,18 +109,14 @@ def main():
             print(model.load_state_dict(saved_weights, strict=False))
 
     # Resize token embeddings if new tokens are added
-    if not (configs.cot or configs.no_thoughts or configs.no_cot):
-        base_model.resize_token_embeddings(len(tokenizer))
-        embeddings = model.get_input_embeddings()
-        target_id = tokenizer.convert_tokens_to_ids("<<")
-        for token_id in [latent_id, start_latent_id, end_latent_id]:
-            target_embedding = embeddings.weight.data[target_id]
-            embeddings.weight.data[token_id] = target_embedding
-            lm_head = base_model.lm_head
-            lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
-
-    if configs.no_thoughts:
-        configs.c_thought = 0
+    base_model.resize_token_embeddings(len(tokenizer))
+    embeddings = model.get_input_embeddings()
+    target_id = tokenizer.convert_tokens_to_ids("<<")
+    for token_id in [latent_id, start_latent_id, end_latent_id]:
+        target_embedding = embeddings.weight.data[target_id]
+        embeddings.weight.data[token_id] = target_embedding
+        lm_head = base_model.lm_head
+        lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -155,7 +151,6 @@ def main():
     # Extract ground truth for evaluation
     question_val = [d["question"] for d in json.load(open(configs.val_path))]
     answers_val = [d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))]
-    cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
 
     # Initialize wandb logging
     if not configs.debug and rank == 0:
@@ -283,7 +278,6 @@ def main():
             batch = {k: v.to(rank) for k, v in batch.items() if k not in ["idx", "position_ids"]}
             assert len(batch["input_ids"]) == 1
             answer = answers_val[test_idx.cpu().item()]
-            answer_cot = cot_val[test_idx.cpu().item()]
             question = question_val[test_idx.cpu().item()]
 
             total += 1
@@ -299,36 +293,32 @@ def main():
             cot_output = ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
 
             if idx < 5 and rank == 0:
-                print(f"Question {test_idx}: Answer = '{answer}' CoT = '{answer_cot}'")
+                print(f"Question {test_idx}: Answer = '{answer}'")
                 print(f"Full output: '{tokenizer.decode(outputs[0])}'")
                 print(f"Extracted Output: '{answer_output}'")
 
             cor += answer_output == answer
-            cor_cot += cot_output == answer_cot
 
             pbar.update(1)
             pbar.set_description(f"Test accuracy: {round(float(cor / total), 2)}")
 
         pbar.close()
         if rank == 0:
-            print(f"Device {rank}: Cor={cor}, CoT={cor_cot}, Total={total}")
+            print(f"Device {rank}: Cor={cor}, Total={total}")
 
     # Aggregate metrics across ranks
-    dist.all_reduce(cor_cot, op=dist.ReduceOp.SUM)
     dist.all_reduce(cor, op=dist.ReduceOp.SUM)
     dist.all_reduce(total, op=dist.ReduceOp.SUM)
 
-    cor_cot = cor_cot.item()
     cor = cor.item()
     total = total.item()
 
     if rank == 0:
         print(f"Accuracy on validation set: {cor} / {total} = {cor/total}")
-        print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
     sys.stdout.flush()
 
     if wandb_run and rank == 0:
-        wandb_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
+        wandb_run.log({"eval/acc": cor / total})
 
     # Save checkpoint if accuracy improves
     if not configs.only_eval and not configs.debug:
