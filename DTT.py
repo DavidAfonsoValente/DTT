@@ -17,6 +17,7 @@ class DTTModel(nn.Module):
         eot_token_id,
         continue_token_id,
         eos_token_id,
+        config,
     ):
         """
         Initialize the DTTModel with the base causal language model and special token IDs.
@@ -34,6 +35,7 @@ class DTTModel(nn.Module):
         self.eot_token_id = eot_token_id
         self.continue_token_id = continue_token_id
         self.eos_token_id = eos_token_id
+        self.config = config
 
         # Access the embedding layer from the base model
         self.embedding = base_causallm.get_input_embeddings()
