@@ -135,13 +135,10 @@ def main():
         transformer_layer_cls={LlamaDecoderLayer, GPT2Block}
     )
 
-    #if configs.only_eval:
-    #    parallel_model = DDP(model, device_ids=[rank])
-    #else:
-    #    parallel_model = FSDP(model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank)
-
-    #del model
-    parallel_model = model
+    if configs.only_eval:
+        parallel_model = DDP(model, device_ids=[rank])
+    else:
+        parallel_model = FSDP(model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank)
 
     if rank == 0:
         print(parallel_model)
@@ -205,13 +202,15 @@ def main():
         )
 
         trainer = GRPOTrainer(
-            model=parallel_model.module if isinstance(parallel_model, (FSDP, DDP)) else parallel_model,
+            model=model if isinstance(parallel_model, (FSDP, DDP)) else parallel_model,
             reward_funcs=phased_reward,
             args=training_args,
             train_dataset=base_dataset_train,
             eval_dataset=base_dataset_valid,
             processing_class=tokenizer,
         )
+
+        del model
 
         # Log data table for first batch (simplified for RL)
         if wandb_run and rank == 0:
