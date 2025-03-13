@@ -105,20 +105,12 @@ def main():
     embeddings = model.get_input_embeddings()
     target_id = tokenizer.convert_tokens_to_ids("<<")
     with torch.no_grad():
-        # Clone the whole embedding weight
-        new_embedding_weight = embeddings.weight.detach().clone()
-        # For each special token, update the corresponding row with the target embedding
         for token_id in [latent_id, start_latent_id, end_latent_id]:
-            new_embedding_weight[token_id] = embeddings.weight[target_id].detach().clone()
-        # Replace the embedding weight with a new parameter
-        embeddings.weight = torch.nn.Parameter(new_embedding_weight)
-
-        lm_head = model.lm_head
-        new_lm_head_weight = lm_head.weight.detach().clone()
-        for token_id in [latent_id, start_latent_id, end_latent_id]:
-            new_lm_head_weight[token_id] = lm_head.weight[target_id].detach().clone()
-        lm_head.weight = torch.nn.Parameter(new_lm_head_weight)
-
+            target_embedding = embeddings.weight.data[target_id]
+            embeddings.weight.data[token_id] = target_embedding.clone()
+            lm_head = model.lm_head
+            lm_head.weight.data[token_id] = lm_head.weight.data[target_id].clone()
+    
     # Initialize DTTModel with special tokens
     model = DTTModel(
         base_causallm=model,
