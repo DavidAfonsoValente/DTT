@@ -104,11 +104,15 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
     embeddings = model.get_input_embeddings()
     target_id = tokenizer.convert_tokens_to_ids("<<")
-    for token_id in [latent_id, start_latent_id, end_latent_id]:
-        target_embedding = embeddings.weight.data[target_id]
-        embeddings.weight.data[token_id] = target_embedding
+    with torch.no_grad():
+        target_embedding = embeddings.weight[target_id].clone()
+        for token_id in [latent_id, start_latent_id, end_latent_id]:
+            embeddings.weight[token_id].copy_(target_embedding)
         lm_head = model.lm_head
-        lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
+        target_lm_head = lm_head.weight[target_id].clone()
+        for token_id in [latent_id, start_latent_id, end_latent_id]:
+            lm_head.weight[token_id].copy_(target_lm_head)
+
     
     # Initialize DTTModel with special tokens
     model = DTTModel(
