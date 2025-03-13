@@ -111,14 +111,14 @@ def main():
         lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
     
     # Initialize DTTModel with special tokens
-    #model = DTTModel(
-    #    base_causallm=model,
-    #    bot_token_id=start_latent_id,
-    #    eot_token_id=end_latent_id,
-    #    continue_token_id=latent_id,
-    #    eos_token_id=eos_id,
-    #    config=configs,
-    #)
+    model = DTTModel(
+        base_causallm=model,
+        bot_token_id=start_latent_id,
+        eot_token_id=end_latent_id,
+        continue_token_id=latent_id,
+        eos_token_id=eos_id,
+        config=configs,
+    )
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -135,12 +135,13 @@ def main():
         transformer_layer_cls={LlamaDecoderLayer, GPT2Block}
     )
 
-    if configs.only_eval:
-        parallel_model = DDP(model, device_ids=[rank])
-    else:
-        parallel_model = FSDP(model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank)
+    #if configs.only_eval:
+    #    parallel_model = DDP(model, device_ids=[rank])
+    #else:
+    #    parallel_model = FSDP(model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank)
 
-    del model
+    #del model
+    parallel_model = model
 
     if rank == 0:
         print(parallel_model)
