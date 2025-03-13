@@ -98,6 +98,7 @@ def main():
         else:
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
+        configs._name_or_path = configs.load_model_path
 
     # Resize token embeddings if new tokens are added
     model.resize_token_embeddings(len(tokenizer))
