@@ -104,22 +104,21 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
     embeddings = model.get_input_embeddings()
     target_id = tokenizer.convert_tokens_to_ids("<<")
-    with torch.no_grad():
-        for token_id in [latent_id, start_latent_id, end_latent_id]:
-            target_embedding = embeddings.weight.data[target_id]
-            embeddings.weight.data[token_id] = target_embedding.clone()
-            lm_head = model.lm_head
-            lm_head.weight.data[token_id] = lm_head.weight.data[target_id].clone()
+    for token_id in [latent_id, start_latent_id, end_latent_id]:
+        target_embedding = embeddings.weight.data[target_id]
+        embeddings.weight.data[token_id] = target_embedding
+        lm_head = model.lm_head
+        lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
     
     # Initialize DTTModel with special tokens
-    model = DTTModel(
-        base_causallm=model,
-        bot_token_id=start_latent_id,
-        eot_token_id=end_latent_id,
-        continue_token_id=latent_id,
-        eos_token_id=eos_id,
-        config=configs,
-    )
+    #model = DTTModel(
+    #    base_causallm=model,
+    #    bot_token_id=start_latent_id,
+    #    eot_token_id=end_latent_id,
+    #    continue_token_id=latent_id,
+    #    eos_token_id=eos_id,
+    #    config=configs,
+    #)
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
