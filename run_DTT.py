@@ -202,7 +202,7 @@ def main():
         )
 
         trainer = GRPOTrainer(
-            model=model if isinstance(parallel_model, (FSDP, DDP)) else parallel_model,
+            model=model if isinstance(parallel_model, (FSDP, DDP)) else model,
             reward_funcs=phased_reward,
             args=training_args,
             train_dataset=base_dataset_train,
