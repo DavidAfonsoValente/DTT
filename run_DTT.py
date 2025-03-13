@@ -188,7 +188,7 @@ def main():
             gradient_accumulation_steps=configs.gradient_accumulation_steps,
             num_generations=8,  # G=8 as per DTT specification
             beta=0.04,  # KL coefficient
-            epsilon=0.2,  # Clipping parameter
+            #epsilon=0.2,  # Clipping parameter
             logging_steps=500,
             save_steps=500,
             save_strategy="steps",
