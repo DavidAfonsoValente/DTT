@@ -7,6 +7,7 @@ import torch.distributed as dist
 import torch.optim as optim
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
+from trl.models.modeling_base import create_reference_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -109,7 +110,7 @@ def main():
         embeddings.weight.data[token_id] = target_embedding
         lm_head = model.lm_head
         lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
-    
+
     # Initialize DTTModel with special tokens
     model = DTTModel(
         base_causallm=model,
@@ -123,11 +124,13 @@ def main():
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
 
-    print(f"Running FSDP on rank = {rank}, world size = {world_size}")
+    # Move model to device and apply bfloat16 if needed
     model = model.to(rank)
-
     if configs.bf16:
         model.to(torch.bfloat16)
+
+    # Create the reference model BEFORE wrapping with FSDP
+    ref_model = create_reference_model(model).to(rank)
 
     # Prepare model for distributed training
     llama_auto_wrap_policy = functools.partial(
@@ -139,6 +142,8 @@ def main():
         parallel_model = DDP(model, device_ids=[rank])
     else:
         parallel_model = FSDP(model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank)
+
+    del model  # Clean up the original model
 
     if rank == 0:
         print(parallel_model)
@@ -202,15 +207,14 @@ def main():
         )
 
         trainer = GRPOTrainer(
-            model=model if isinstance(parallel_model, (FSDP, DDP)) else model,
+            model=parallel_model.module if isinstance(parallel_model, (FSDP, DDP)) else parallel_model,
+            ref_model=ref_model,  # Pass the pre-created reference model
             reward_funcs=phased_reward,
             args=training_args,
             train_dataset=base_dataset_train,
             eval_dataset=base_dataset_valid,
             processing_class=tokenizer,
         )
-
-        del model
 
         # Log data table for first batch (simplified for RL)
         if wandb_run and rank == 0:
