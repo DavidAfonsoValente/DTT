@@ -27,9 +27,6 @@ class DTTModel(nn.Module):
         self.warnings_issued = {}
         self._ddp_params_and_buffers_to_ignore = []
 
-    def __getattr__(self, name):
-        return getattr(self.base_causallm, name)
-
     def __deepcopy__(self, memo):
         # Create a new instance of DTTModel
         new_model = DTTModel.__new__(DTTModel)
@@ -38,6 +35,11 @@ class DTTModel(nn.Module):
         # Deep copy the base_causallm separately
         new_model.base_causallm = copy.deepcopy(self.base_causallm, memo)
         return new_model
+    
+    def __getattr__(self, name):
+        if hasattr(self.base_causallm, name):
+            return getattr(self.base_causallm, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def forward(self, input_ids, attention_mask, labels=None, position_ids=None, **kwargs):
         """
