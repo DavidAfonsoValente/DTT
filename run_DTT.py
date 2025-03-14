@@ -129,9 +129,6 @@ def main():
     if configs.bf16:
         model.to(torch.bfloat16)
 
-    # Create the reference model BEFORE wrapping with FSDP
-    ref_model = create_reference_model(model).to(rank)
-
     # Prepare model for distributed training
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
@@ -208,7 +205,6 @@ def main():
 
         trainer = GRPOTrainer(
             model=parallel_model.module if isinstance(parallel_model, (FSDP, DDP)) else parallel_model,
-            ref_model=ref_model,  # Pass the pre-created reference model
             reward_funcs=phased_reward,
             args=training_args,
             train_dataset=base_dataset_train,
