@@ -26,6 +26,7 @@ class DTTModel(nn.Module):
         self.last_logits = []
         self.warnings_issued = {}
         self._ddp_params_and_buffers_to_ignore = []
+        self._model_tags = []
 
     def __deepcopy__(self, memo):
         new_base_causallm = copy.deepcopy(self.base_causallm, memo)
@@ -42,6 +43,15 @@ class DTTModel(nn.Module):
         new_model.warnings_issued = {}
         new_model._ddp_params_and_buffers_to_ignore = []
         return new_model
+
+    def add_model_tags(self, tags):
+        """
+        Store tags provided by the trainer.
+
+        Args:
+            tags (list): List of tags to associate with the model.
+        """
+        self._model_tags = tags
 
     def forward(self, input_ids, attention_mask, labels=None, position_ids=None, **kwargs):
         """
