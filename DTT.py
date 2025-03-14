@@ -29,6 +29,15 @@ class DTTModel(nn.Module):
     def __getattr__(self, name):
         return getattr(self.base_causallm, name)
 
+    def __deepcopy__(self, memo):
+        # Create a new instance of DTTModel
+        new_model = DTTModel.__new__(DTTModel)
+        # Copy all attributes except 'base_causallm' to avoid recursion
+        new_model.__dict__ = {k: copy.deepcopy(v, memo) for k, v in self.__dict__.items() if k != 'base_causallm'}
+        # Deep copy the base_causallm separately
+        new_model.base_causallm = copy.deepcopy(self.base_causallm, memo)
+        return new_model
+
     def forward(self, input_ids, attention_mask, labels=None, position_ids=None, **kwargs):
         """
         Forward pass to compute logits and loss, handling latent reasoning with <continue> tokens.
