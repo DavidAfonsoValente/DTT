@@ -2,6 +2,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
+import copy
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
