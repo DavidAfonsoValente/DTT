@@ -37,7 +37,7 @@ class DTTModel(nn.Module):
         self.continue_token_id = continue_token_id
         self.eos_token_id = eos_token_id
         self.config = config
-        self.config._name_or_path = base_causallm.config._name_or_path
+        self.name_or_path = base_causallm.config.name_or_path
 
         # Access the embedding layer from the base model
         self.embedding = base_causallm.get_input_embeddings()
