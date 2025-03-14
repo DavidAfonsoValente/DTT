@@ -44,11 +44,6 @@ class DTTModel(nn.Module):
         new_model._ddp_params_and_buffers_to_ignore = []
         return new_model
 
-    def __getattr__(self, name):
-        if hasattr(self.base_causallm, name):
-            return getattr(self.base_causallm, name)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
     def forward(self, input_ids, attention_mask, labels=None, position_ids=None, **kwargs):
         """
         Forward pass to compute logits and loss, handling latent reasoning with <continue> tokens.
