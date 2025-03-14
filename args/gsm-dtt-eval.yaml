@@ -14,9 +14,9 @@ resume: 15
 bf16: False
 train_path: data/gsm_train.json
 val_path: data/gsm_test.json
-per_device_train_batch_size: 16
+per_device_train_batch_size: 32
 debug: False
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 1
 num_train_epochs: 25
 lr: !!float "1e-4"
 weight_decay: 0.01
