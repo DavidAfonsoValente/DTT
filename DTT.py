@@ -28,6 +28,7 @@ class DTTModel(nn.Module):
             eot_token_id (int): Token ID for <eot>, marking the end of latent mode.
             continue_token_id (int): Token ID for <continue>, used during latent mode.
             eos_token_id (int): Token ID for end-of-sequence.
+            config: Configuration object.
         """
         super(DTTModel, self).__init__()
         self.base_causallm = base_causallm
@@ -44,6 +45,9 @@ class DTTModel(nn.Module):
         # Storage for hidden states and logits during generation
         self.last_hidden_states = []  # List of lists: [batch_size, num_latent_steps, hidden_dim]
         self.last_logits = []  # List of lists: [batch_size, num_tokens, vocab_size]
+
+        # Add the warnings_issued attribute to satisfy GRPOTrainer requirements
+        self.warnings_issued = {}
 
     def forward(self, input_ids, attention_mask, labels=None, position_ids=None, **kwargs):
         """
