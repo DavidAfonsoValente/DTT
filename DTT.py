@@ -24,6 +24,7 @@ class DTTModel(nn.Module):
         self.last_hidden_states = []
         self.last_logits = []
         self.warnings_issued = {}
+        self._ddp_params_and_buffers_to_ignore = []
 
     def __getattr__(self, name):
         return getattr(self.base_causallm, name)
