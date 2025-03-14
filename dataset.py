@@ -56,17 +56,14 @@ def get_dataset(path, tokenizer, max_size=1000000000, mode='cot'):
 
     # Tokenization function for DTT mode
     def tokenize_sample_dtt(sample):
-        prompt = tokenizer.encode(
-            sample["question"] + "\n", add_special_tokens=True
-        )
+        prompt = sample["question"] + "\n"  # Keep as text
         answer_tokenized = tokenizer.encode(
             "### " + sample["answer"], add_special_tokens=False
         ) + [tokenizer.eos_token_id]
         return {
-            "question": sample["question"],
-            "prompt": prompt,
+            "prompt": prompt,  # Text, not tokenized
             "answer_tokenized": answer_tokenized,
-            "answer": sample["answer"],  # Answer remains a string
+            "answer": sample["answer"],
             "idx": sample["idx"],
         }
 
