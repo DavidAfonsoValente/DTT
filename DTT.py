@@ -29,14 +29,21 @@ class DTTModel(nn.Module):
         print(f"\n\n\n\nType of base_causallm: {type(base_causallm)}\n\n\n\n", flush=True)
 
     def __deepcopy__(self, memo):
-        # Create a new instance of DTTModel
         new_model = DTTModel.__new__(DTTModel)
-        # Copy all attributes except 'base_causallm' to avoid recursion
-        new_model.__dict__ = {k: copy.deepcopy(v, memo) for k, v in self.__dict__.items() if k != 'base_causallm'}
-        # Deep copy the base_causallm separately
         new_model.base_causallm = copy.deepcopy(self.base_causallm, memo)
+        new_model.bot_token_id = self.bot_token_id
+        new_model.eot_token_id = self.eot_token_id
+        new_model.continue_token_id = self.continue_token_id
+        new_model.eos_token_id = self.eos_token_id
+        new_model.config = new_model.base_causallm.config
+        new_model.name_or_path = self.name_or_path
+        new_model.embedding = new_model.base_causallm.get_input_embeddings()
+        new_model.last_hidden_states = []
+        new_model.last_logits = []
+        new_model.warnings_issued = {}
+        new_model._ddp_params_and_buffers_to_ignore = []
         return new_model
-    
+
     def __getattr__(self, name):
         if hasattr(self.base_causallm, name):
             return getattr(self.base_causallm, name)
