@@ -26,18 +26,17 @@ class DTTModel(nn.Module):
         self.last_logits = []
         self.warnings_issued = {}
         self._ddp_params_and_buffers_to_ignore = []
-        print(f"\n\n\n\nType of base_causallm: {type(base_causallm)}\n\n\n\n", flush=True)
 
     def __deepcopy__(self, memo):
-        new_model = DTTModel.__new__(DTTModel)
-        new_model.base_causallm = copy.deepcopy(self.base_causallm, memo)
-        new_model.bot_token_id = self.bot_token_id
-        new_model.eot_token_id = self.eot_token_id
-        new_model.continue_token_id = self.continue_token_id
-        new_model.eos_token_id = self.eos_token_id
-        new_model.config = new_model.base_causallm.config
-        new_model.name_or_path = self.name_or_path
-        new_model.embedding = new_model.base_causallm.get_input_embeddings()
+        new_base_causallm = copy.deepcopy(self.base_causallm, memo)
+        new_model = DTTModel(
+            base_causallm=new_base_causallm,
+            bot_token_id=self.bot_token_id,
+            eot_token_id=self.eot_token_id,
+            continue_token_id=self.continue_token_id,
+            eos_token_id=self.eos_token_id,
+            config=self.config
+        )
         new_model.last_hidden_states = []
         new_model.last_logits = []
         new_model.warnings_issued = {}
