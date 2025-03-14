@@ -207,6 +207,9 @@ def main():
         # Log data table for first batch (simplified for RL)
         if wandb_run and rank == 0:
             sample_batch = next(iter(base_dataset_train))
+            # print components of sample batch
+            for k, v in sample_batch.items():
+                print(f"{k}: {v}", flush=True)
             text_str = f"Prompt: {sample_batch['question']}\nAnswer: {sample_batch['answer']}"
             text_table.add_data(0, text_str)
             wandb_run.log({"data_table": copy(text_table)})
