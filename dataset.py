@@ -59,8 +59,13 @@ def get_dataset(path, tokenizer, max_size=1000000000, mode='cot'):
         input_ids = tokenizer.encode(
             sample["question"] + "\n", add_special_tokens=True
         )
+        answer_tokenized = tokenizer.encode(
+            "### " + sample["answer"], add_special_tokens=False
+        ) + [tokenizer.eos_token_id]
         return {
+            "question": sample["question"],
             "input_ids": input_ids,
+            "answer_tokenized": answer_tokenized,
             "answer": sample["answer"],  # Answer remains a string
             "idx": sample["idx"],
         }
