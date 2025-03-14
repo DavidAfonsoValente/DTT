@@ -9,11 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 from trl.models.modeling_base import create_reference_model
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data.distributed import DistributedSampler
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 import wandb
 import os
 import sys
@@ -21,7 +17,6 @@ import yaml
 import json
 import gc
 import argparse
-import functools
 from tqdm import tqdm
 from copy import copy
 from utils import Config, set_seed
@@ -129,16 +124,8 @@ def main():
     if configs.bf16:
         model.to(torch.bfloat16)
 
-    # Prepare model for distributed training
-    llama_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={LlamaDecoderLayer, GPT2Block}
-    )
-
-    if configs.only_eval:
-        parallel_model = DDP(model, device_ids=[rank])
-    else:
-        parallel_model = FSDP(model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank)
+    # Prepare model for distributed training with DDP
+    parallel_model = DDP(model, device_ids=[rank])
 
     del model  # Clean up the original model
 
@@ -174,9 +161,14 @@ def main():
     if not configs.only_eval:
         total_train_steps = (len(base_dataset_train) // (configs.per_device_train_batch_size * world_size)) * configs.num_train_epochs
         phased_reward = reward.PhasedReward(
-            model=parallel_model.module if isinstance(parallel_model, (FSDP, DDP)) else parallel_model,
+            model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
             total_steps=total_train_steps,
-            tokenizer=tokenizer
+            tokenizer=tokenizer,
+            enable_binary=True,   # Toggle as needed
+            enable_crs=False,     # Disable CRS for ablation
+            enable_lcr=False,     # Disable LCR for ablation
+            enable_ede=False,     # Disable EDE for ablation
+            enable_eff=True
         )
 
     # Configure and initialize GRPOTrainer for training
@@ -204,7 +196,7 @@ def main():
         )
 
         trainer = GRPOTrainer(
-            model=parallel_model.module if isinstance(parallel_model, (FSDP, DDP)) else parallel_model,
+            model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
             reward_funcs=phased_reward,
             args=training_args,
             train_dataset=base_dataset_train,
@@ -287,7 +279,6 @@ def main():
             outputs = parallel_model.generate(
                 **batch,
                 max_new_tokens=max_new_tokens,
-                synced_gpus=not configs.only_eval,
             )
 
             text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)

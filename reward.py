@@ -11,9 +11,14 @@ class PhasedReward:
         gamma: float = 0.98,
         lambda_eff: float = 0.1,
         G: int = 8,
+        enable_binary: bool = True,
+        enable_crs: bool = True,
+        enable_lcr: bool = True,
+        enable_ede: bool = True,
+        enable_eff: bool = True,
     ):
         """
-        Initialize the PhasedReward class with access to the model for internal states.
+        Initialize the PhasedReward class with access to the model and toggleable reward components.
 
         Args:
             model: The DTTModel instance to access hidden states and logits.
@@ -22,6 +27,11 @@ class PhasedReward:
             gamma (float): Discount factor for efficiency reward.
             lambda_eff (float): Weight for efficiency reward.
             G (int): Number of generations per prompt.
+            enable_binary (bool): Flag to enable/disable binary reward.
+            enable_crs (bool): Flag to enable/disable CRS reward.
+            enable_lcr (bool): Flag to enable/disable LCR reward.
+            enable_ede (bool): Flag to enable/disable EDE reward.
+            enable_eff (bool): Flag to enable/disable efficiency reward.
         """
         self.model = model
         self.total_steps = total_steps
@@ -29,6 +39,11 @@ class PhasedReward:
         self.gamma = gamma
         self.lambda_eff = lambda_eff
         self.G = G
+        self.enable_binary = enable_binary
+        self.enable_crs = enable_crs
+        self.enable_lcr = enable_lcr
+        self.enable_ede = enable_ede
+        self.enable_eff = enable_eff
         self.current_step = 0
 
     def __call__(
@@ -39,7 +54,7 @@ class PhasedReward:
         **kwargs,
     ) -> List[float]:
         """
-        Compute the total rewards for the completions based on the current training phase.
+        Compute the total rewards for the completions based on the current training phase and enabled components.
 
         Args:
             prompts (List[List[int]]): List of prompt token IDs (size B).
@@ -50,72 +65,100 @@ class PhasedReward:
         Returns:
             List[float]: List of total rewards for each completion (size B*G).
         """
-        # Determine the current phase based on training progress
+        # Determine the current phase and set default weights
         progress = self.current_step / self.total_steps
         if progress <= 0.2:  # Warmup Phase (0-20%)
             phase = "Warmup"
-            w_binary = 0.7
-            w_crs = 0.2
-            w_lcr = 0.1
-            w_ede = 0.0
+            w_binary_default = 0.7
+            w_crs_default = 0.2
+            w_lcr_default = 0.1
+            w_ede_default = 0.0
         elif progress <= 0.9:  # Core Phase (20-90%)
             phase = "Core"
-            w_binary = 0.8
-            w_crs = 0.15
-            w_lcr = 0.0
-            w_ede = 0.05
+            w_binary_default = 0.8
+            w_crs_default = 0.15
+            w_lcr_default = 0.0
+            w_ede_default = 0.05
         else:  # Final Phase (90-100%)
             phase = "Final"
-            w_binary = 1.0
-            w_crs = 0.0
-            w_lcr = 0.0
-            w_ede = 0.0
+            w_binary_default = 1.0
+            w_crs_default = 0.0
+            w_lcr_default = 0.0
+            w_ede_default = 0.0
 
-        # Number of prompts in the batch
+        # Adjust weights based on enabled flags
+        w_binary = w_binary_default if self.enable_binary else 0.0
+        w_crs = w_crs_default if self.enable_crs else 0.0
+        w_lcr = w_lcr_default if self.enable_lcr else 0.0
+        w_ede = w_ede_default if self.enable_ede else 0.0
+
+        # Normalize weights of enabled components (excluding efficiency)
+        sum_weights = w_binary + w_crs + w_lcr + w_ede
+        if sum_weights > 0:
+            w_binary /= sum_weights
+            w_crs /= sum_weights
+            w_lcr /= sum_weights
+            w_ede /= sum_weights
+        # If sum_weights == 0, weights remain 0, and only efficiency reward (if enabled) contributes
+
         B = len(prompts)
         total_rewards = []
 
-        # Process completions in groups of G per prompt
         for i in range(B):
             group_completions = completions[i * self.G : (i + 1) * self.G]
             actual_answer = answer[i]
 
-            # Compute binary rewards for the group
-            binary_rewards = [
-                self.compute_binary_reward(comp, actual_answer)
-                for comp in group_completions
-            ]
+            # Compute binary rewards if needed for binary or CRS
+            if self.enable_binary or self.enable_crs:
+                binary_rewards = [
+                    self.compute_binary_reward(comp, actual_answer)
+                    for comp in group_completions
+                ]
+            else:
+                binary_rewards = [0.0] * self.G
 
-            # Compute CRS rewards
-            r_crs = self.compute_crs(binary_rewards)
+            # Compute CRS rewards if enabled
+            if self.enable_crs:
+                r_crs = self.compute_crs(binary_rewards)
+            else:
+                r_crs = [0.0] * self.G
 
-            # Compute efficiency rewards
-            r_eff = [
-                self.gamma ** self.compute_n_lt(comp) for comp in group_completions
-            ]
+            # Compute efficiency rewards if enabled
+            if self.enable_eff:
+                r_eff = [
+                    self.gamma ** self.compute_n_lt(comp)
+                    for comp in group_completions
+                ]
+            else:
+                r_eff = [0.0] * self.G
 
-            # Compute LCR rewards (Warmup phase only)
-            r_lcr = [
-                self.compute_lcr(self.model.last_hidden_states[j])
-                for j in range(i * self.G, (i + 1) * self.G)
-            ] if phase == "Warmup" else [0.0] * self.G
+            # Compute LCR rewards if enabled
+            if self.enable_lcr:
+                r_lcr = [
+                    self.compute_lcr(self.model.last_hidden_states[j])
+                    for j in range(i * self.G, (i + 1) * self.G)
+                ]
+            else:
+                r_lcr = [0.0] * self.G
 
-            # Compute EDE rewards (Core phase only)
-            r_ede = [
-                self.compute_ede(self.model.last_logits[j], progress)
-                for j in range(i * self.G, (i + 1) * self.G)
-            ] if phase == "Core" else [0.0] * self.G
+            # Compute EDE rewards if enabled
+            if self.enable_ede:
+                r_ede = [
+                    self.compute_ede(self.model.last_logits[j], progress)
+                    for j in range(i * self.G, (i + 1) * self.G)
+                ]
+            else:
+                r_ede = [0.0] * self.G
 
-            # Combine rewards according to phase-specific weights
+            # Combine rewards with adjusted weights
             r_total_group = [
-                (w_binary * br + w_crs * crs + w_lcr * lcr + w_ede * ede +
-                 self.lambda_eff * eff)
+                (w_binary * br + w_crs * crs + w_lcr * lcr + w_ede * ede) +
+                (self.lambda_eff * eff if self.enable_eff else 0)
                 for br, crs, lcr, ede, eff in zip(binary_rewards, r_crs, r_lcr, r_ede, r_eff)
             ]
 
             total_rewards.extend(r_total_group)
 
-        # Increment the step counter
         self.current_step += 1
         return total_rewards
 
