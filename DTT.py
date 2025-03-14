@@ -11,16 +11,15 @@ from collections import namedtuple
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 
 class DTTModel(nn.Module):
-    def __init__(self, base_causallm, bot_token_id, eot_token_id, continue_token_id, eos_token_id, config):
+    def __init__(self, base_causallm, bot_token_id, eot_token_id, continue_token_id, eos_token_id):
         super(DTTModel, self).__init__()
         self.base_causallm = base_causallm
         self.bot_token_id = bot_token_id
         self.eot_token_id = eot_token_id
         self.continue_token_id = continue_token_id
         self.eos_token_id = eos_token_id
-        self.config = config
+        self.config = base_causallm.config
         self.name_or_path = base_causallm.config.name_or_path
-        self.config._name_or_path = base_causallm.config._name_or_path
         self.embedding = base_causallm.get_input_embeddings()
         self.last_hidden_states = []
         self.last_logits = []
