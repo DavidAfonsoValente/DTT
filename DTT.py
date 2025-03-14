@@ -10,26 +10,7 @@ from collections import namedtuple
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 
 class DTTModel(nn.Module):
-    def __init__(
-        self,
-        base_causallm,
-        bot_token_id,
-        eot_token_id,
-        continue_token_id,
-        eos_token_id,
-        config,
-    ):
-        """
-        Initialize the DTTModel with the base causal language model and special token IDs.
-
-        Args:
-            base_causallm: The base causal language model (e.g., from transformers).
-            bot_token_id (int): Token ID for <bot>, marking the start of latent mode.
-            eot_token_id (int): Token ID for <eot>, marking the end of latent mode.
-            continue_token_id (int): Token ID for <continue>, used during latent mode.
-            eos_token_id (int): Token ID for end-of-sequence.
-            config: Configuration object.
-        """
+    def __init__(self, base_causallm, bot_token_id, eot_token_id, continue_token_id, eos_token_id, config):
         super(DTTModel, self).__init__()
         self.base_causallm = base_causallm
         self.bot_token_id = bot_token_id
@@ -39,16 +20,13 @@ class DTTModel(nn.Module):
         self.config = config
         self.name_or_path = base_causallm.config.name_or_path
         self.config._name_or_path = base_causallm.config._name_or_path
-
-        # Access the embedding layer from the base model
         self.embedding = base_causallm.get_input_embeddings()
-
-        # Storage for hidden states and logits during generation
-        self.last_hidden_states = []  # List of lists: [batch_size, num_latent_steps, hidden_dim]
-        self.last_logits = []  # List of lists: [batch_size, num_tokens, vocab_size]
-
-        # Add the warnings_issued attribute to satisfy GRPOTrainer requirements
+        self.last_hidden_states = []
+        self.last_logits = []
         self.warnings_issued = {}
+
+    def __getattr__(self, name):
+        return getattr(self.base_causallm, name)
 
     def forward(self, input_ids, attention_mask, labels=None, position_ids=None, **kwargs):
         """
