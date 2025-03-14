@@ -26,7 +26,7 @@ class DTTModel(nn.Module):
         self.last_logits = []
         self.warnings_issued = {}
         self._ddp_params_and_buffers_to_ignore = []
-        print(f"Type of base_causallm: {type(self.base_causallm)}")
+        print(f"\n\n\n\nType of base_causallm: {type(self.base_causallm)}\n\n\n\n", flush=True)
 
     def __deepcopy__(self, memo):
         # Create a new instance of DTTModel
