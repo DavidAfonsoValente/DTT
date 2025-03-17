@@ -35,7 +35,6 @@ class DTTModel(nn.Module):
             eot_token_id=self.eot_token_id,
             continue_token_id=self.continue_token_id,
             eos_token_id=self.eos_token_id,
-            config=self.config
         )
         new_model.last_hidden_states = []
         new_model.last_logits = []
