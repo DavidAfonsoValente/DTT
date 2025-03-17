@@ -182,7 +182,7 @@ def main():
             num_generations=8,  # G=8 as per DTT specification
             beta=0.04,  # KL coefficient
             #epsilon=0.2,  # Clipping parameter
-            logging_steps=500,
+            logging_steps=1,
             save_steps=500,
             save_strategy="steps",
             evaluation_strategy="steps",
