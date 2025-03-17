@@ -113,6 +113,7 @@ def main():
         eot_token_id=end_latent_id,
         continue_token_id=latent_id,
         eos_token_id=eos_id,
+        tokenizer=tokenizer,  # Add the tokenizer here
     )
 
     if configs.load_model_path != "None" and not loaded:
