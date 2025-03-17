@@ -7,7 +7,13 @@ import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from collections import namedtuple
-import sys
+import os
+
+# Set environment variable for synchronous CUDA error reporting
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+# Enable anomaly detection for detailed error traces
+torch.autograd.set_detect_anomaly(True)
 
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 
@@ -206,30 +212,28 @@ class DTTModel(nn.Module):
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=50, **kwargs):
         """
-        Custom generation method implementing DTT inference with latent mode, collecting hidden states and logits.
+        Generate sequences using the DTTModel, with debugging logs to track tensor shapes and states.
 
         Args:
-            input_ids (torch.Tensor): Input token IDs of shape (batch_size, sequence_length).
-            attention_mask (torch.Tensor, optional): Attention mask for the input.
+            input_ids (torch.Tensor): Input token IDs of shape [batch_size, seq_len].
+            attention_mask (torch.Tensor, optional): Attention mask of shape [batch_size, seq_len].
             max_new_tokens (int): Maximum number of new tokens to generate.
-            max_latent_steps (int): Maximum number of latent steps per <bot><eot> pair.
-            **kwargs: Additional arguments passed to the base model.
+            max_latent_steps (int): Maximum latent steps per sequence.
+            **kwargs: Additional arguments for the base model.
 
         Returns:
-            dict: Dictionary containing:
-                - 'sequences': Generated sequences (batch_size, final_length).
-                - 'latent_steps': List of latent step counts per sequence.
+            dict: Dictionary containing generated sequences and total latent steps per sequence.
         """
         print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}", flush=True)
         print(f"[DEBUG] Input shape: {input_ids.shape}", flush=True)
         
+        # Extract batch size, sequence length, and device
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         print(f"[DEBUG] Batch size: {batch_size}, Sequence length: {seq_len}, Device: {device}", flush=True)
 
-        # Initialize sequences as a list of tensors
+        # Initialize sequences and generation state
         sequences = [input_ids[b].clone() for b in range(batch_size)]
-        
         modes = ["token"] * batch_size
         latent_steps_counters = [0] * batch_size
         latent_steps_list = [[] for _ in range(batch_size)]
@@ -237,46 +241,53 @@ class DTTModel(nn.Module):
         
         print(f"[DEBUG] Initial modes: {modes}", flush=True)
 
+        # Compute initial embeddings
         inputs_embeds = self.embedding(input_ids)
         print(f"[DEBUG] Initial inputs_embeds shape: {inputs_embeds.shape}", flush=True)
         
+        # Handle attention mask
         if attention_mask is None:
             print(f"[DEBUG] No attention mask provided, creating default mask", flush=True)
             attention_mask = torch.ones_like(input_ids, device=device)
         current_attention_mask = attention_mask.clone()
         print(f"[DEBUG] Current attention mask shape: {current_attention_mask.shape}", flush=True)
 
+        # Initialize storage for hidden states and logits
         self.last_hidden_states = [[] for _ in range(batch_size)]
         self.last_logits = [[] for _ in range(batch_size)]
 
-        past_key_values = None
-
+        # Generation loop
         for step in range(max_new_tokens):
             print(f"[DEBUG] Generation step {step+1}/{max_new_tokens}", flush=True)
             print(f"[DEBUG] Current modes: {modes}", flush=True)
             print(f"[DEBUG] Latent steps counters: {latent_steps_counters}", flush=True)
             print(f"[DEBUG] Finished statuses: {finished}", flush=True)
             
+            # Call base model with past_key_values=None to avoid sequence length mismatches
             outputs = self.base_causallm(
                 inputs_embeds=inputs_embeds,
                 attention_mask=current_attention_mask,
-                past_key_values=past_key_values,
+                past_key_values=None,  # Process full sequence each time
                 output_hidden_states=True,
             )
-            past_key_values = outputs.past_key_values
-            logits = outputs.logits[:, -1, :]  # (batch_size, vocab_size)
-            hidden_states = outputs.hidden_states[-1][:, -1, :]  # (batch_size, hidden_size)
+            
+            # Extract logits and hidden states for the last token
+            logits = outputs.logits[:, -1, :]  # Shape: [batch_size, vocab_size]
+            hidden_states = outputs.hidden_states[-1][:, -1, :]  # Shape: [batch_size, hidden_size]
             
             print(f"[DEBUG] Logits shape: {logits.shape}", flush=True)
             print(f"[DEBUG] Hidden states shape: {hidden_states.shape}", flush=True)
 
-            next_tokens = torch.argmax(logits, dim=-1)  # (batch_size,)
+            # Sample next tokens
+            next_tokens = torch.argmax(logits, dim=-1)  # Shape: [batch_size]
             print(f"[DEBUG] Sampled next tokens: {next_tokens}", flush=True)
 
+            # Store logits for unfinished sequences
             for b in range(batch_size):
                 if not finished[b]:
                     self.last_logits[b].append(logits[b].clone())
 
+            # Process each sequence
             new_embeds = []
             for b in range(batch_size):
                 if finished[b]:
@@ -308,7 +319,6 @@ class DTTModel(nn.Module):
 
                 new_embeds.append(embed)
                 if not finished[b]:
-                    # Update the sequence in the list
                     sequences[b] = torch.cat((sequences[b], next_tokens[b:b+1].to(sequences[b].device)))
                     print(f"[DEBUG] Sequence {b} updated, current length: {sequences[b].shape[0]}", flush=True)
 
@@ -319,6 +329,7 @@ class DTTModel(nn.Module):
                         latent_steps_list[b].append(latent_steps_counters[b])
                         print(f"[DEBUG] Added final latent steps count {latent_steps_counters[b]} to sequence {b}", flush=True)
 
+            # Update inputs_embeds and attention_mask
             new_embeds = torch.cat(new_embeds, dim=0).unsqueeze(1)
             print(f"[DEBUG] New embeddings shape: {new_embeds.shape}", flush=True)
             
@@ -330,14 +341,17 @@ class DTTModel(nn.Module):
             )
             print(f"[DEBUG] Updated attention mask shape: {current_attention_mask.shape}", flush=True)
 
+            # Check if all sequences are finished
             if all(finished):
                 print(f"[DEBUG] All sequences finished, stopping generation at step {step+1}", flush=True)
                 break
 
+        # Compute total latent steps
         total_latent_steps = [sum(steps) for steps in latent_steps_list]
         print(f"[DEBUG] Latent steps per sequence: {latent_steps_list}", flush=True)
         print(f"[DEBUG] Total latent steps per sequence: {total_latent_steps}", flush=True)
 
+        # Stack logits for each sequence
         for b in range(batch_size):
             if self.last_logits[b]:
                 self.last_logits[b] = torch.stack(self.last_logits[b])
@@ -346,7 +360,7 @@ class DTTModel(nn.Module):
                 self.last_logits[b] = torch.tensor([], device=device)
                 print(f"[DEBUG] Sequence {b} has no logits", flush=True)
 
-        # Pad sequences to the same length and stack into a tensor
+        # Pad sequences to uniform length
         max_len = max([seq.size(0) for seq in sequences])
         padded_sequences = torch.stack([
             torch.nn.functional.pad(seq, (0, max_len - seq.size(0)), value=self.tokenizer.pad_token_id)
