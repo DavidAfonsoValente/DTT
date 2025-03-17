@@ -192,7 +192,6 @@ def main():
             bf16=configs.bf16,
             use_vllm=True,  # Optional acceleration
             report_to=["wandb"] if wandb_run else [],
-            enforce_eager=True,
         )
 
         trainer = GRPOTrainer(
