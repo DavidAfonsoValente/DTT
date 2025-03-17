@@ -227,16 +227,16 @@ class DTTModel(nn.Module):
         device = input_ids.device
         print(f"[DEBUG] Batch size: {batch_size}, Sequence length: {seq_len}, Device: {device}", flush=True)
 
-        # Initialize modes and counters for each sequence
+        # Initialize sequences as a list of tensors
+        sequences = [input_ids[b].clone() for b in range(batch_size)]
+        
         modes = ["token"] * batch_size
         latent_steps_counters = [0] * batch_size
-        latent_steps_list = [[] for _ in range(batch_size)]  # List of latent steps per <bot><eot> pair per sequence
+        latent_steps_list = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
-        sequences = input_ids.clone()
         
         print(f"[DEBUG] Initial modes: {modes}", flush=True)
 
-        # Prepare initial inputs_embeds and attention_mask
         inputs_embeds = self.embedding(input_ids)
         print(f"[DEBUG] Initial inputs_embeds shape: {inputs_embeds.shape}", flush=True)
         
@@ -246,7 +246,6 @@ class DTTModel(nn.Module):
         current_attention_mask = attention_mask.clone()
         print(f"[DEBUG] Current attention mask shape: {current_attention_mask.shape}", flush=True)
 
-        # Initialize storage for hidden states and logits
         self.last_hidden_states = [[] for _ in range(batch_size)]
         self.last_logits = [[] for _ in range(batch_size)]
 
@@ -258,7 +257,6 @@ class DTTModel(nn.Module):
             print(f"[DEBUG] Latent steps counters: {latent_steps_counters}", flush=True)
             print(f"[DEBUG] Finished statuses: {finished}", flush=True)
             
-            # Compute outputs
             outputs = self.base_causallm(
                 inputs_embeds=inputs_embeds,
                 attention_mask=current_attention_mask,
@@ -272,20 +270,16 @@ class DTTModel(nn.Module):
             print(f"[DEBUG] Logits shape: {logits.shape}", flush=True)
             print(f"[DEBUG] Hidden states shape: {hidden_states.shape}", flush=True)
 
-            # Sample next tokens
             next_tokens = torch.argmax(logits, dim=-1)  # (batch_size,)
             print(f"[DEBUG] Sampled next tokens: {next_tokens}", flush=True)
 
-            # Store logits for each generated token
             for b in range(batch_size):
                 if not finished[b]:
                     self.last_logits[b].append(logits[b].clone())
 
-            # Process each sequence in the batch
             new_embeds = []
             for b in range(batch_size):
                 if finished[b]:
-                    # Append padding token embedding for finished sequences
                     new_embeds.append(torch.zeros(1, self.embedding.embedding_dim, device=device))
                     print(f"[DEBUG] Sequence {b} already finished, adding padding", flush=True)
                     continue
@@ -298,7 +292,6 @@ class DTTModel(nn.Module):
                         modes[b] = "latent"
                         latent_steps_counters[b] = 0
                         print(f"[DEBUG] Sequence {b} switching to latent mode", flush=True)
-                    # Append the embedding of the predicted token
                     embed = self.embedding(torch.tensor([next_token], device=device))
                     print(f"[DEBUG] Sequence {b} in token mode, embedding token {next_token}", flush=True)
                 elif modes[b] == "latent":
@@ -308,17 +301,17 @@ class DTTModel(nn.Module):
                         print(f"[DEBUG] Sequence {b} switching to token mode after {latent_steps_counters[b]} latent steps", flush=True)
                         embed = self.embedding(torch.tensor([self.eot_token_id], device=device))
                     else:
-                        # Use the hidden state as the next input embedding
-                        embed = hidden_states[b:b+1].unsqueeze(0)  # (1, hidden_size)
+                        embed = hidden_states[b:b+1].unsqueeze(0)
                         self.last_hidden_states[b].append(hidden_states[b].clone())
                         latent_steps_counters[b] += 1
                         print(f"[DEBUG] Sequence {b} in latent mode, step {latent_steps_counters[b]}, using hidden state", flush=True)
 
                 new_embeds.append(embed)
-                sequences[b] = torch.cat((sequences[b], next_tokens[b:b+1]))
-                print(f"[DEBUG] Sequence {b} updated, current length: {sequences[b].shape[0]}", flush=True)
+                if not finished[b]:
+                    # Update the sequence in the list
+                    sequences[b] = torch.cat((sequences[b], next_tokens[b:b+1].to(sequences[b].device)))
+                    print(f"[DEBUG] Sequence {b} updated, current length: {sequences[b].shape[0]}", flush=True)
 
-                # Check if sequence is finished
                 if next_token == self.eos_token_id:
                     finished[b] = True
                     print(f"[DEBUG] Sequence {b} finished with EOS token", flush=True)
@@ -326,8 +319,7 @@ class DTTModel(nn.Module):
                         latent_steps_list[b].append(latent_steps_counters[b])
                         print(f"[DEBUG] Added final latent steps count {latent_steps_counters[b]} to sequence {b}", flush=True)
 
-            # Concatenate new embeddings
-            new_embeds = torch.cat(new_embeds, dim=0).unsqueeze(1)  # (batch_size, 1, hidden_size)
+            new_embeds = torch.cat(new_embeds, dim=0).unsqueeze(1)
             print(f"[DEBUG] New embeddings shape: {new_embeds.shape}", flush=True)
             
             inputs_embeds = torch.cat((inputs_embeds, new_embeds), dim=1)
@@ -338,17 +330,14 @@ class DTTModel(nn.Module):
             )
             print(f"[DEBUG] Updated attention mask shape: {current_attention_mask.shape}", flush=True)
 
-            # Check if all sequences are finished
             if all(finished):
                 print(f"[DEBUG] All sequences finished, stopping generation at step {step+1}", flush=True)
                 break
 
-        # Compute total latent steps per sequence
         total_latent_steps = [sum(steps) for steps in latent_steps_list]
         print(f"[DEBUG] Latent steps per sequence: {latent_steps_list}", flush=True)
         print(f"[DEBUG] Total latent steps per sequence: {total_latent_steps}", flush=True)
 
-        # Convert logits lists to tensors for reward computation
         for b in range(batch_size):
             if self.last_logits[b]:
                 self.last_logits[b] = torch.stack(self.last_logits[b])
@@ -357,8 +346,16 @@ class DTTModel(nn.Module):
                 self.last_logits[b] = torch.tensor([], device=device)
                 print(f"[DEBUG] Sequence {b} has no logits", flush=True)
 
-        print(f"[DEBUG] Generation completed. Final sequences shape: {sequences.shape}", flush=True)
+        # Pad sequences to the same length and stack into a tensor
+        max_len = max([seq.size(0) for seq in sequences])
+        padded_sequences = torch.stack([
+            torch.nn.functional.pad(seq, (0, max_len - seq.size(0)), value=self.tokenizer.pad_token_id)
+            for seq in sequences
+        ])
+        print(f"[DEBUG] Padded sequences shape: {padded_sequences.shape}", flush=True)
+
+        print(f"[DEBUG] Generation completed.", flush=True)
         return {
-            'sequences': sequences,
+            'sequences': padded_sequences,
             'latent_steps': total_latent_steps
         }
