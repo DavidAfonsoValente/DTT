@@ -190,7 +190,7 @@ def main():
             max_prompt_length=512,
             max_completion_length=256,
             bf16=configs.bf16,
-            use_vllm=True,  # Optional acceleration
+            use_vllm=False,  # Optional acceleration
             report_to=["wandb"] if wandb_run else [],
         )
 
