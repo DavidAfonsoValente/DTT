@@ -281,13 +281,13 @@ def main():
                 max_new_tokens=max_new_tokens,
             )
 
-            text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            text_output = tokenizer.decode(outputs, skip_special_tokens=True)
             answer_output = text_output.split("#")[-1].replace(",", "").strip()
             cot_output = ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
 
             if idx < 5 and rank == 0:
                 print(f"Question {test_idx}: Answer = '{answer}'")
-                print(f"Full output: '{tokenizer.decode(outputs[0])}'")
+                print(f"Full output: '{tokenizer.decode(outputs)}'")
                 print(f"Extracted Output: '{answer_output}'")
 
             cor += answer_output == answer

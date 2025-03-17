@@ -371,7 +371,4 @@ class DTTModel(nn.Module):
         print(f"[DEBUG] Padded sequences shape: {padded_sequences.shape}", flush=True)
 
         print(f"[DEBUG] Generation completed.", flush=True)
-        return {
-            'sequences': padded_sequences,
-            'latent_steps': total_latent_steps
-        }
+        return padded_sequences
