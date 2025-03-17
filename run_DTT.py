@@ -23,6 +23,7 @@ from utils import Config, set_seed
 from dataset import get_dataset, MyCollator
 from DTT import DTTModel
 import reward  # For PhasedReward
+from custom_trainer import CustomGRPOTrainer
 
 def main():
     # Parse command-line arguments
@@ -180,9 +181,8 @@ def main():
             learning_rate=configs.lr,
             weight_decay=configs.weight_decay,
             gradient_accumulation_steps=configs.gradient_accumulation_steps,
-            num_generations=8,  # G=8 as per DTT specification
-            beta=0.04,  # KL coefficient
-            #epsilon=0.2,  # Clipping parameter
+            num_generations=8,
+            beta=0.04,
             logging_steps=1,
             save_steps=500,
             save_strategy="steps",
@@ -191,11 +191,11 @@ def main():
             max_prompt_length=512,
             max_completion_length=256,
             bf16=configs.bf16,
-            use_vllm=False,  # Optional acceleration
+            use_vllm=False,
             report_to=["wandb"] if wandb_run else [],
         )
 
-        trainer = GRPOTrainer(
+        trainer = CustomGRPOTrainer(  # Changed from GRPOTrainer
             model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
             reward_funcs=phased_reward,
             args=training_args,
@@ -281,13 +281,13 @@ def main():
                 max_new_tokens=max_new_tokens,
             )
 
-            text_output = tokenizer.decode(outputs, skip_special_tokens=True)
+            text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
             answer_output = text_output.split("#")[-1].replace(",", "").strip()
             cot_output = ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
 
             if idx < 5 and rank == 0:
                 print(f"Question {test_idx}: Answer = '{answer}'")
-                print(f"Full output: '{tokenizer.decode(outputs)}'")
+                print(f"Full output: '{tokenizer.decode(outputs[0])}'")
                 print(f"Extracted Output: '{answer_output}'")
 
             cor += answer_output == answer
