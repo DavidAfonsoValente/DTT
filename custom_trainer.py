@@ -2,9 +2,10 @@ from trl import GRPOTrainer
 from transformers import PreTrainedModel
 from accelerate import Accelerator
 import torch
+from typing import Union, Any, List, Dict  # Added import for type hints
 
 class CustomGRPOTrainer(GRPOTrainer):
-    def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+    def _generate_and_score_completions(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
         """
         Generate completions and compute scores, handling the DTTModel's dictionary output with sequences and latent steps.
 
