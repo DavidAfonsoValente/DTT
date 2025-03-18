@@ -2,7 +2,7 @@ from trl import GRPOTrainer
 from transformers import PreTrainedModel
 from accelerate import Accelerator
 import torch
-from typing import Union, Any, List, Dict  # Added import for type hints
+from typing import Union, Any, List, Dict
 
 class CustomGRPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
@@ -144,6 +144,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         self._metrics[mode]["latent_steps"].append(sum(total_latent_steps) / len(total_latent_steps))
 
         return {
+            "prompt_completion_ids": prompt_completion_ids,  # Added key to fix TypeError
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
@@ -151,5 +152,5 @@ class CustomGRPOTrainer(GRPOTrainer):
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
-            "latent_steps": total_latent_steps  # Pass latent steps for potential use in compute_loss if needed
+            "latent_steps": total_latent_steps  # Pass latent steps for potential use in compute_loss
         }
