@@ -110,6 +110,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         self._metrics[mode]["latent_steps"].append(sum(total_latent_steps) / len(total_latent_steps))
 
         return {
+            "prompt_completion_ids": prompt_completion_ids,
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
