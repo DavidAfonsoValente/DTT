@@ -285,10 +285,15 @@ class DTTModel(nn.Module):
             logits = outputs.logits[:, -1, :]  # Logits for the last token [batch_size, vocab_size]
             hidden_states = outputs.hidden_states[-1][:, -1, :]  # Last hidden state [batch_size, hidden_size]
 
-            # Sample next tokens using argmax
-            next_tokens = torch.argmax(logits, dim=-1)  # [batch_size]
-            if is_rank_zero:
-                print(f"[DEBUG] Sampled next tokens: {next_tokens.tolist()}")
+            # **Key Modification**: Force the first token to be bot_token_id to start latent mode
+            if step == 0:
+                next_tokens = torch.full((batch_size,), self.bot_token_id, device=device)
+                if is_rank_zero:
+                    print(f"[DEBUG] Forced first token to bot_token_id ({self.bot_token_id}) to start latent mode")
+            else:
+                next_tokens = torch.argmax(logits, dim=-1)  # [batch_size]
+                if is_rank_zero:
+                    print(f"[DEBUG] Sampled next tokens: {next_tokens.tolist()}")
 
             # Process each sequence in the batch
             new_embeds_list = []
@@ -362,9 +367,6 @@ class DTTModel(nn.Module):
             generated_text = self.tokenizer.batch_decode(padded_sequences, skip_special_tokens=False)
             print(f"[DEBUG] Actual outputs (generated sequences): {generated_text}")
             print(f"[DEBUG] Total latent steps per sequence: {total_latent_steps}")
-            # Optional: Add expected outputs for comparison if available
-            # expected_text = ["expected sequence 1", "expected sequence 2"]
-            # print(f"[DEBUG] Expected outputs: {expected_text}")
 
         return {
             'sequences': padded_sequences,
