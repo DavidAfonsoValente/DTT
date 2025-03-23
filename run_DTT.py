@@ -190,7 +190,6 @@ def main():
             eval_steps=500,
             max_prompt_length=512,
             max_completion_length=128,
-            max_new_tokens=max_new_tokens,
             bf16=configs.bf16,
             use_vllm=False,
             report_to=["wandb"] if wandb_run else [],
