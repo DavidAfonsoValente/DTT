@@ -175,8 +175,6 @@ class PhasedReward:
         Returns:
             float: 1.0 if correct, 0.0 otherwise.
         """
-        print(completion)
-        print(actual_answer, flush=True)
         text = self.tokenizer.decode(completion, skip_special_tokens=False)
         if "###" in text:
             answer_part = text.split("###")[-1].strip()
