@@ -14,9 +14,9 @@ resume: 40
 bf16: False
 train_path: data/prosqa_train.json
 val_path: data/prosqa_test.json
-per_device_train_batch_size: 2
+per_device_train_batch_size: 1
 debug: False
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 32
 num_train_epochs: 50
 lr: !!float "1e-4"
 weight_decay: 0.01
