@@ -212,164 +212,161 @@ class DTTModel(nn.Module):
         print(f"[DEBUG] Forward pass completed", flush=True)
         return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
 
-    import os
-import torch
+    def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=50, **kwargs):
+        """
+        Generate sequences using the model with debugging logs to inspect inputs, outputs, and latent steps.
 
-def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=50, **kwargs):
-    """
-    Generate sequences using the model with debugging logs to inspect inputs, outputs, and latent steps.
+        Args:
+            input_ids (torch.Tensor): Input token IDs of shape [batch_size, seq_len].
+            attention_mask (torch.Tensor, optional): Attention mask of shape [batch_size, seq_len].
+            max_new_tokens (int): Maximum number of new tokens to generate.
+            max_latent_steps (int): Maximum latent steps per sequence in latent mode.
+            **kwargs: Additional arguments passed to the base model.
 
-    Args:
-        input_ids (torch.Tensor): Input token IDs of shape [batch_size, seq_len].
-        attention_mask (torch.Tensor, optional): Attention mask of shape [batch_size, seq_len].
-        max_new_tokens (int): Maximum number of new tokens to generate.
-        max_latent_steps (int): Maximum latent steps per sequence in latent mode.
-        **kwargs: Additional arguments passed to the base model.
+        Returns:
+            dict: Dictionary containing:
+                - 'sequences': Padded generated token IDs [batch_size, max_len].
+                - 'latent_steps': Total latent steps taken per sequence [batch_size].
+        """
+        # Determine rank for distributed training (default to 0 if not distributed)
+        rank = int(os.environ.get("RANK", 0))
+        is_rank_zero = rank == 0
 
-    Returns:
-        dict: Dictionary containing:
-            - 'sequences': Padded generated token IDs [batch_size, max_len].
-            - 'latent_steps': Total latent steps taken per sequence [batch_size].
-    """
-    # Determine rank for distributed training (default to 0 if not distributed)
-    rank = int(os.environ.get("RANK", 0))
-    is_rank_zero = rank == 0
-
-    # --- Log Input Details ---
-    if is_rank_zero:
-        print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}")
-        print(f"[DEBUG] Input shape: {input_ids.shape}")
-        print(f"[DEBUG] Sample input tokens (first sequence): {input_ids[0][:10].tolist()}")
-        decoded_input = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
-        print(f"[DEBUG] Decoded input (first sequence): {decoded_input}")
-        if attention_mask is not None:
-            print(f"[DEBUG] Attention mask shape: {attention_mask.shape}")
-
-    # Extract batch size, sequence length, and device
-    batch_size, seq_len = input_ids.shape
-    device = input_ids.device
-
-    # Initialize generation state
-    sequences = [input_ids[b].clone() for b in range(batch_size)]  # List of sequences
-    modes = ["token"] * batch_size  # "token" or "latent" mode per sequence
-    latent_steps_counters = [0] * batch_size  # Current latent steps per sequence
-    latent_steps_list = [[] for _ in range(batch_size)]  # List of latent step counts per phase
-    finished = [False] * batch_size  # Whether each sequence is finished
-
-    # Handle attention mask
-    if attention_mask is None:
-        attention_mask = torch.ones_like(input_ids, device=device)
-    current_attention_mask = attention_mask.clone()
-
-    # Compute initial embeddings
-    inputs_embeds = self.embedding(input_ids)
-
-    # --- Generation Loop ---
-    for step in range(max_new_tokens):
+        # --- Log Input Details ---
         if is_rank_zero:
-            print(f"[DEBUG] Generation step {step+1}/{max_new_tokens}")
-            print(f"[DEBUG] Current modes: {modes}")
-            print(f"[DEBUG] Latent steps counters: {latent_steps_counters}")
-            print(f"[DEBUG] Finished statuses: {finished}")
+            print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}")
+            print(f"[DEBUG] Input shape: {input_ids.shape}")
+            print(f"[DEBUG] Sample input tokens (first sequence): {input_ids[0][:10].tolist()}")
+            decoded_input = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
+            print(f"[DEBUG] Decoded input (first sequence): {decoded_input}")
+            if attention_mask is not None:
+                print(f"[DEBUG] Attention mask shape: {attention_mask.shape}")
 
-        # Prepare inputs for the model
-        if step == 0:
-            current_inputs_embeds = inputs_embeds  # Full initial sequence
-        else:
-            current_inputs_embeds = new_embeds  # New token or hidden state
+        # Extract batch size, sequence length, and device
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
 
-        # Forward pass through the base causal language model
-        outputs = self.base_causallm(
-            inputs_embeds=current_inputs_embeds,
-            attention_mask=current_attention_mask,
-            past_key_values=None,  # Reprocess entire sequence each step
-            output_hidden_states=True,
-        )
-        logits = outputs.logits[:, -1, :]  # Logits for the last token [batch_size, vocab_size]
-        hidden_states = outputs.hidden_states[-1][:, -1, :]  # Last hidden state [batch_size, hidden_size]
+        # Initialize generation state
+        sequences = [input_ids[b].clone() for b in range(batch_size)]  # List of sequences
+        modes = ["token"] * batch_size  # "token" or "latent" mode per sequence
+        latent_steps_counters = [0] * batch_size  # Current latent steps per sequence
+        latent_steps_list = [[] for _ in range(batch_size)]  # List of latent step counts per phase
+        finished = [False] * batch_size  # Whether each sequence is finished
 
-        # Sample next tokens using argmax
-        next_tokens = torch.argmax(logits, dim=-1)  # [batch_size]
-        if is_rank_zero:
-            print(f"[DEBUG] Sampled next tokens: {next_tokens.tolist()}")
+        # Handle attention mask
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device=device)
+        current_attention_mask = attention_mask.clone()
 
-        # Process each sequence in the batch
-        new_embeds_list = []
-        for b in range(batch_size):
-            if finished[b]:
-                # Append zero embedding for finished sequences
-                new_embeds_list.append(torch.zeros(1, self.embedding.embedding_dim, device=device))
-                continue
+        # Compute initial embeddings
+        inputs_embeds = self.embedding(input_ids)
 
-            next_token = next_tokens[b].item()
-            if modes[b] == "token":
-                # In token mode, check for start of latent reasoning
-                if next_token == self.bot_token_id:
-                    modes[b] = "latent"
-                    latent_steps_counters[b] = 0
-                    if is_rank_zero:
-                        print(f"[DEBUG] Sequence {b} switched to latent mode")
-                embed = self.embedding(torch.tensor([next_token], device=device))
-            elif modes[b] == "latent":
-                # In latent mode, check for end conditions
-                if next_token == self.eot_token_id or latent_steps_counters[b] >= max_latent_steps:
-                    modes[b] = "token"
-                    latent_steps_list[b].append(latent_steps_counters[b])
-                    if is_rank_zero:
-                        print(f"[DEBUG] Sequence {b} switched to token mode after {latent_steps_counters[b]} latent steps")
-                    embed = self.embedding(torch.tensor([self.eot_token_id], device=device))
-                else:
-                    # Use hidden state as embedding in latent mode
-                    embed = hidden_states[b:b+1]
-                    latent_steps_counters[b] += 1
-                    if is_rank_zero:
-                        print(f"[DEBUG] Sequence {b} in latent mode, step {latent_steps_counters[b]}")
-
-            # Update sequence and embeddings
-            sequences[b] = torch.cat((sequences[b], next_tokens[b:b+1]))
-            new_embeds_list.append(embed)
-
-            # Check for end of sequence
-            if next_token == self.eos_token_id:
-                finished[b] = True
-                if is_rank_zero:
-                    print(f"[DEBUG] Sequence {b} finished with EOS")
-                if modes[b] == "latent":
-                    latent_steps_list[b].append(latent_steps_counters[b])
-
-        # Prepare embeddings for next step
-        new_embeds = torch.cat(new_embeds_list, dim=0).unsqueeze(1)
-        # Extend attention mask
-        current_attention_mask = torch.cat(
-            (current_attention_mask, torch.ones(batch_size, 1, device=device)), dim=1
-        )
-
-        # Early exit if all sequences are finished
-        if all(finished):
+        # --- Generation Loop ---
+        for step in range(max_new_tokens):
             if is_rank_zero:
-                print(f"[DEBUG] All sequences finished at step {step+1}")
-            break
+                print(f"[DEBUG] Generation step {step+1}/{max_new_tokens}")
+                print(f"[DEBUG] Current modes: {modes}")
+                print(f"[DEBUG] Latent steps counters: {latent_steps_counters}")
+                print(f"[DEBUG] Finished statuses: {finished}")
 
-    # Compute total latent steps per sequence
-    total_latent_steps = [sum(steps) for steps in latent_steps_list]
+            # Prepare inputs for the model
+            if step == 0:
+                current_inputs_embeds = inputs_embeds  # Full initial sequence
+            else:
+                current_inputs_embeds = new_embeds  # New token or hidden state
 
-    # Pad sequences to uniform length
-    max_len = max([seq.size(0) for seq in sequences])
-    padded_sequences = torch.stack([
-        torch.nn.functional.pad(seq, (0, max_len - seq.size(0)), value=self.tokenizer.pad_token_id)
-        for seq in sequences
-    ])
+            # Forward pass through the base causal language model
+            outputs = self.base_causallm(
+                inputs_embeds=current_inputs_embeds,
+                attention_mask=current_attention_mask,
+                past_key_values=None,  # Reprocess entire sequence each step
+                output_hidden_states=True,
+            )
+            logits = outputs.logits[:, -1, :]  # Logits for the last token [batch_size, vocab_size]
+            hidden_states = outputs.hidden_states[-1][:, -1, :]  # Last hidden state [batch_size, hidden_size]
 
-    # --- Log Output Details ---
-    if is_rank_zero:
-        generated_text = self.tokenizer.batch_decode(padded_sequences, skip_special_tokens=False)
-        print(f"[DEBUG] Actual outputs (generated sequences): {generated_text}")
-        print(f"[DEBUG] Total latent steps per sequence: {total_latent_steps}")
-        # Optional: Add expected outputs for comparison if available
-        # expected_text = ["expected sequence 1", "expected sequence 2"]
-        # print(f"[DEBUG] Expected outputs: {expected_text}")
+            # Sample next tokens using argmax
+            next_tokens = torch.argmax(logits, dim=-1)  # [batch_size]
+            if is_rank_zero:
+                print(f"[DEBUG] Sampled next tokens: {next_tokens.tolist()}")
 
-    return {
-        'sequences': padded_sequences,
-        'latent_steps': total_latent_steps
-    }
+            # Process each sequence in the batch
+            new_embeds_list = []
+            for b in range(batch_size):
+                if finished[b]:
+                    # Append zero embedding for finished sequences
+                    new_embeds_list.append(torch.zeros(1, self.embedding.embedding_dim, device=device))
+                    continue
+
+                next_token = next_tokens[b].item()
+                if modes[b] == "token":
+                    # In token mode, check for start of latent reasoning
+                    if next_token == self.bot_token_id:
+                        modes[b] = "latent"
+                        latent_steps_counters[b] = 0
+                        if is_rank_zero:
+                            print(f"[DEBUG] Sequence {b} switched to latent mode")
+                    embed = self.embedding(torch.tensor([next_token], device=device))
+                elif modes[b] == "latent":
+                    # In latent mode, check for end conditions
+                    if next_token == self.eot_token_id or latent_steps_counters[b] >= max_latent_steps:
+                        modes[b] = "token"
+                        latent_steps_list[b].append(latent_steps_counters[b])
+                        if is_rank_zero:
+                            print(f"[DEBUG] Sequence {b} switched to token mode after {latent_steps_counters[b]} latent steps")
+                        embed = self.embedding(torch.tensor([self.eot_token_id], device=device))
+                    else:
+                        # Use hidden state as embedding in latent mode
+                        embed = hidden_states[b:b+1]
+                        latent_steps_counters[b] += 1
+                        if is_rank_zero:
+                            print(f"[DEBUG] Sequence {b} in latent mode, step {latent_steps_counters[b]}")
+
+                # Update sequence and embeddings
+                sequences[b] = torch.cat((sequences[b], next_tokens[b:b+1]))
+                new_embeds_list.append(embed)
+
+                # Check for end of sequence
+                if next_token == self.eos_token_id:
+                    finished[b] = True
+                    if is_rank_zero:
+                        print(f"[DEBUG] Sequence {b} finished with EOS")
+                    if modes[b] == "latent":
+                        latent_steps_list[b].append(latent_steps_counters[b])
+
+            # Prepare embeddings for next step
+            new_embeds = torch.cat(new_embeds_list, dim=0).unsqueeze(1)
+            # Extend attention mask
+            current_attention_mask = torch.cat(
+                (current_attention_mask, torch.ones(batch_size, 1, device=device)), dim=1
+            )
+
+            # Early exit if all sequences are finished
+            if all(finished):
+                if is_rank_zero:
+                    print(f"[DEBUG] All sequences finished at step {step+1}")
+                break
+
+        # Compute total latent steps per sequence
+        total_latent_steps = [sum(steps) for steps in latent_steps_list]
+
+        # Pad sequences to uniform length
+        max_len = max([seq.size(0) for seq in sequences])
+        padded_sequences = torch.stack([
+            torch.nn.functional.pad(seq, (0, max_len - seq.size(0)), value=self.tokenizer.pad_token_id)
+            for seq in sequences
+        ])
+
+        # --- Log Output Details ---
+        if is_rank_zero:
+            generated_text = self.tokenizer.batch_decode(padded_sequences, skip_special_tokens=False)
+            print(f"[DEBUG] Actual outputs (generated sequences): {generated_text}")
+            print(f"[DEBUG] Total latent steps per sequence: {total_latent_steps}")
+            # Optional: Add expected outputs for comparison if available
+            # expected_text = ["expected sequence 1", "expected sequence 2"]
+            # print(f"[DEBUG] Expected outputs: {expected_text}")
+
+        return {
+            'sequences': padded_sequences,
+            'latent_steps': total_latent_steps
+        }
