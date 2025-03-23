@@ -3,7 +3,9 @@ from transformers import PreTrainedModel
 from accelerate import Accelerator
 import torch
 from typing import Union, Any, List, Dict
-from trl.trainer.utils import gather, unwrap_model_for_generation, is_conversational, maybe_apply_chat_template
+from accelerate.utils import gather
+from trl.models import unwrap_model_for_generation
+from trl.data_utils import is_conversational, maybe_apply_chat_template
 
 class CustomGRPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
