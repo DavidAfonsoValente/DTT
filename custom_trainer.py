@@ -26,7 +26,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_inputs = super(GRPOTrainer, self)._prepare_inputs(prompt_inputs)  # Fix applied here
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         # Truncate prompts if max_prompt_length is set
