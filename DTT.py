@@ -214,7 +214,7 @@ class DTTModel(nn.Module):
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=50, **kwargs):
         """
-        Generate sequences using the model with debugging logs to inspect inputs, outputs, and latent steps.
+        Generate sequences using the model, ensuring latent steps use the last hidden layer's output as input.
 
         Args:
             input_ids (torch.Tensor): Input token IDs of shape [batch_size, seq_len].
@@ -260,6 +260,9 @@ class DTTModel(nn.Module):
 
         # Compute initial embeddings
         inputs_embeds = self.embedding(input_ids)
+        if is_rank_zero:
+            print(f"[DEBUG] Initial inputs_embeds shape: {inputs_embeds.shape}")
+            print(f"[DEBUG] Embedding dimension: {self.embedding.embedding_dim}")
 
         # --- Generation Loop ---
         for step in range(max_new_tokens):
@@ -274,6 +277,8 @@ class DTTModel(nn.Module):
                 current_inputs_embeds = inputs_embeds  # Full initial sequence
             else:
                 current_inputs_embeds = new_embeds  # New token or hidden state
+            if is_rank_zero:
+                print(f"[DEBUG] Current inputs_embeds shape: {current_inputs_embeds.shape}")
 
             # Forward pass through the base causal language model
             outputs = self.base_causallm(
@@ -283,9 +288,16 @@ class DTTModel(nn.Module):
                 output_hidden_states=True,
             )
             logits = outputs.logits[:, -1, :]  # Logits for the last token [batch_size, vocab_size]
-            hidden_states = outputs.hidden_states[-1][:, -1, :]  # Last hidden state [batch_size, hidden_size]
+            hidden_states = outputs.hidden_states[-1][:, -1, :]  # Last hidden state of last layer [batch_size, hidden_size]
+            if is_rank_zero:
+                print(f"[DEBUG] Logits shape: {logits.shape}")
+                print(f"[DEBUG] Last hidden states shape: {hidden_states.shape}")
 
-            # **Key Modification**: Force the first token to be bot_token_id to start latent mode
+            # Verify hidden state matches embedding dimension
+            assert hidden_states.shape[1] == self.embedding.embedding_dim, \
+                f"Hidden state dim {hidden_states.shape[1]} does not match embedding dim {self.embedding.embedding_dim}"
+
+            # Force the first token to be bot_token_id to start latent mode
             if step == 0:
                 next_tokens = torch.full((batch_size,), self.bot_token_id, device=device)
                 if is_rank_zero:
@@ -312,6 +324,8 @@ class DTTModel(nn.Module):
                         if is_rank_zero:
                             print(f"[DEBUG] Sequence {b} switched to latent mode")
                     embed = self.embedding(torch.tensor([next_token], device=device))
+                    if is_rank_zero:
+                        print(f"[DEBUG] Token mode - Embedding shape for token {next_token}: {embed.shape}")
                 elif modes[b] == "latent":
                     # In latent mode, check for end conditions
                     if next_token == self.eot_token_id or latent_steps_counters[b] >= max_latent_steps:
@@ -321,11 +335,12 @@ class DTTModel(nn.Module):
                             print(f"[DEBUG] Sequence {b} switched to token mode after {latent_steps_counters[b]} latent steps")
                         embed = self.embedding(torch.tensor([self.eot_token_id], device=device))
                     else:
-                        # Use hidden state as embedding in latent mode
-                        embed = hidden_states[b:b+1]
+                        # Use last hidden state as embedding for the next latent step
+                        embed = hidden_states[b:b+1]  # Shape: [1, hidden_size]
                         latent_steps_counters[b] += 1
                         if is_rank_zero:
                             print(f"[DEBUG] Sequence {b} in latent mode, step {latent_steps_counters[b]}")
+                            print(f"[DEBUG] Using last hidden state as input embedding, shape: {embed.shape}")
 
                 # Update sequence and embeddings
                 sequences[b] = torch.cat((sequences[b], next_tokens[b:b+1]))
@@ -340,7 +355,9 @@ class DTTModel(nn.Module):
                         latent_steps_list[b].append(latent_steps_counters[b])
 
             # Prepare embeddings for next step
-            new_embeds = torch.cat(new_embeds_list, dim=0).unsqueeze(1)
+            new_embeds = torch.cat(new_embeds_list, dim=0).unsqueeze(1)  # Shape: [batch_size, 1, hidden_size]
+            if is_rank_zero:
+                print(f"[DEBUG] New embeddings shape: {new_embeds.shape}")
             # Extend attention mask
             current_attention_mask = torch.cat(
                 (current_attention_mask, torch.ones(batch_size, 1, device=device)), dim=1
