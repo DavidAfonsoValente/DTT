@@ -22,6 +22,9 @@ class CustomGRPOTrainer(GRPOTrainer):
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
 
+        print(f"[DEBUG] Type of prompts: {type(prompts)}")
+        print(f"[DEBUG] Prompts: {prompts}")
+
         # Tokenize prompts
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False

@@ -101,7 +101,7 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
     embeddings = model.get_input_embeddings()
     target_id = tokenizer.convert_tokens_to_ids("<<")
-    for token_id in [latent_id, start_latent_id, end_latent_id]:
+    for token_id in [start_latent_id, end_latent_id]:
         target_embedding = embeddings.weight.data[target_id]
         embeddings.weight.data[token_id] = target_embedding
         lm_head = model.lm_head
@@ -112,7 +112,6 @@ def main():
         base_causallm=model,
         bot_token_id=start_latent_id,
         eot_token_id=end_latent_id,
-        continue_token_id=latent_id,
         eos_token_id=eos_id,
         tokenizer=tokenizer,  # Add the tokenizer here
     )
