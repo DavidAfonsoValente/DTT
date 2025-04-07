@@ -1,3 +1,4 @@
+# custom_trainer.py
 from trl import GRPOTrainer
 from transformers import PreTrainedModel
 from accelerate import Accelerator
@@ -9,15 +10,6 @@ from trl.data_utils import is_conversational, maybe_apply_chat_template
 
 class CustomGRPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
-        """
-        Generate completions and compute scores using the custom DTTModel and PhasedReward.
-
-        Args:
-            inputs (Dict[str, Union[torch.Tensor, Any]]): Input dictionary containing prompts and answers.
-
-        Returns:
-            Dict[str, Union[torch.Tensor, Any]]: Dictionary with generated IDs, masks, log probabilities, advantages, and latent steps.
-        """
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
@@ -29,7 +21,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
-        prompt_inputs = super(GRPOTrainer, self)._prepare_inputs(prompt_inputs)  # Fix applied here
+        prompt_inputs = super(GRPOTrainer, self)._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         # Truncate prompts if max_prompt_length is set
@@ -44,14 +36,12 @@ class CustomGRPOTrainer(GRPOTrainer):
                 attention_mask=prompt_mask,
                 generation_config=self.generation_config,
                 max_new_tokens=self.max_completion_length,
-                max_latent_steps=50  # Custom parameter for DTTModel
+                max_latent_steps=50
             )
 
-        # Extract sequences (tensor) and latent steps
-        prompt_completion_ids = generate_output['sequences']  # Tensor of shape [batch_size * num_generations, seq_length]
-        total_latent_steps = generate_output['latent_steps']  # List of latent steps per sequence
+        prompt_completion_ids = generate_output['sequences']
+        total_latent_steps = generate_output['latent_steps']
 
-        # Debug prints to confirm tensor properties
         print(f"[DEBUG] Type of prompt_completion_ids: {type(prompt_completion_ids)}")
         assert isinstance(prompt_completion_ids, torch.Tensor), f"prompt_completion_ids is not a tensor, got {type(prompt_completion_ids)}"
         print(f"[DEBUG] Shape of prompt_completion_ids: {prompt_completion_ids.shape}")
@@ -107,11 +97,10 @@ class CustomGRPOTrainer(GRPOTrainer):
         # Compute rewards using PhasedReward
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, reward_func in enumerate(self.reward_funcs):
-            # Assuming PhasedReward is the only reward function
             rewards = reward_func(
                 prompts=prompts,
                 completions=completions,
-                answer=[x["answer"] for x in inputs],  # Ground truth answers from dataset
+                answer=[x["answer"] for x in inputs],
                 latent_steps=total_latent_steps,
             )
             rewards_per_func[:, i] = torch.tensor(rewards, device=device)
@@ -139,9 +128,8 @@ class CustomGRPOTrainer(GRPOTrainer):
         mode = "eval" if self.control.should_evaluate else "train"
         self._metrics[mode]["latent_steps"].append(sum(total_latent_steps) / len(total_latent_steps))
 
-        # Return dictionary with all required tensors
         return {
-            "prompt_completion_ids": prompt_completion_ids,  # Tensor for base _prepare_inputs slicing
+            "prompt_completion_ids": prompt_completion_ids,
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,

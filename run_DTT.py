@@ -26,19 +26,16 @@ import reward  # For PhasedReward
 from custom_trainer import CustomGRPOTrainer
 
 def main():
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(description="DTT Training")
     parser.add_argument("config_file", help="Path to the YAML configuration file")
     args = parser.parse_args()
 
-    # Initialize distributed environment
     dist.init_process_group("nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
 
-    # Load configuration file
     with open(args.config_file) as f:
         config_dict = yaml.safe_load(f)
 
@@ -49,14 +46,12 @@ def main():
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
-    # Create save directory if it doesn't exist (only on rank 0)
     if not os.path.exists(save_dir) and rank == 0:
         os.makedirs(save_dir)
 
     torch.distributed.barrier()
     cur_ckpts = os.listdir(save_dir)
 
-    # Handle resuming from checkpoints
     if len(cur_ckpts) > 0 and not configs.only_eval:
         if rank == 0:
             print("Warning: Found previous run; resuming from latest checkpoint. Ignoring `resume` argument!")
@@ -72,32 +67,28 @@ def main():
             print(f"Warning: Resuming from epoch {configs.resume} without loading a checkpoint!")
         print(f"Loading from {configs.load_model_path} and skipping first {configs.resume} epochs")
 
-    # Initialize base model and tokenizer
     model = AutoModelForCausalLM.from_pretrained(configs.model_id)
     tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>", "<|latent|>"])
     start_latent_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_latent_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
-    latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
     eos_id = tokenizer.eos_token_id
 
     loaded = False
 
-    # Load pre-trained weights if specified
     if configs.load_model_path != "None":
         saved_weights = torch.load(configs.load_model_path, map_location=torch.device(rank))
         if not any(k.startswith("base_causallm") for k in saved_weights.keys()):
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
         elif any(k.startswith("base_causallm") for k in saved_weights.keys()):
-            pass  # Loading from a pre-empted DTT run
+            pass
         else:
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
         configs._name_or_path = configs.load_model_path
 
-    # Resize token embeddings if new tokens are added
     model.resize_token_embeddings(len(tokenizer))
     embeddings = model.get_input_embeddings()
     target_id = tokenizer.convert_tokens_to_ids("<<")
@@ -107,41 +98,35 @@ def main():
         lm_head = model.lm_head
         lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
 
-    # Initialize DTTModel with special tokens
     model = DTTModel(
         base_causallm=model,
         bot_token_id=start_latent_id,
         eot_token_id=end_latent_id,
         eos_token_id=eos_id,
-        tokenizer=tokenizer,  # Add the tokenizer here
+        tokenizer=tokenizer,
     )
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
 
-    # Move model to device and apply bfloat16 if needed
     model = model.to(rank)
     if configs.bf16:
         model.to(torch.bfloat16)
 
-    # Prepare model for distributed training with DDP
     parallel_model = DDP(model, device_ids=[rank])
 
-    del model  # Clean up the original model
+    del model
 
     if rank == 0:
         print(parallel_model)
 
-    # Prepare datasets
     base_dataset_valid = get_dataset(configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000, mode='dtt')
     if not configs.only_eval:
         base_dataset_train = get_dataset(configs.train_path, tokenizer, max_size=5000 if configs.debug else 100000000, mode='dtt')
 
-    # Extract ground truth for evaluation
     question_val = [d["question"] for d in json.load(open(configs.val_path))]
     answers_val = [d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))]
 
-    # Initialize wandb logging
     if not configs.debug and rank == 0:
         wandb_run = wandb.init(project=configs.project, name=configs.name)
         wandb_run.config.update(configs, allow_val_change=True)
@@ -149,7 +134,6 @@ def main():
     else:
         wandb_run = None
 
-    # Set max_new_tokens based on dataset
     if "gsm" in configs.val_path:
         max_new_tokens = 64
     else:
@@ -157,21 +141,19 @@ def main():
 
     total_train_steps = 0
 
-    # Initialize phased reward system with model access
     if not configs.only_eval:
         total_train_steps = (len(base_dataset_train) // (configs.per_device_train_batch_size * world_size)) * configs.num_train_epochs
         phased_reward = reward.PhasedReward(
             model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
             total_steps=total_train_steps,
             tokenizer=tokenizer,
-            enable_binary=True,   # Toggle as needed
-            enable_crs=False,     # Disable CRS for ablation
-            enable_lcr=False,     # Disable LCR for ablation
-            enable_ede=False,     # Disable EDE for ablation
+            enable_binary=True,
+            enable_crs=False,
+            enable_lcr=False,
+            enable_ede=False,
             enable_eff=True
         )
 
-    # Configure and initialize GRPOTrainer for training
     if not configs.only_eval:
         training_args = GRPOConfig(
             output_dir=os.path.join(configs.save_path, configs.name),
@@ -194,7 +176,7 @@ def main():
             report_to=["wandb"] if wandb_run else [],
         )
 
-        trainer = CustomGRPOTrainer(  # Changed from GRPOTrainer
+        trainer = CustomGRPOTrainer(
             model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
             reward_funcs=phased_reward,
             args=training_args,
@@ -203,7 +185,6 @@ def main():
             processing_class=tokenizer,
         )
 
-        # Log data table for first batch (simplified for RL)
         if wandb_run and rank == 0:
             sample_batch = next(iter(base_dataset_train))
             text_str = f"Prompt: {sample_batch['prompt']}\nAnswer: {sample_batch['answer']}"
@@ -213,8 +194,7 @@ def main():
         trainer.train()
         total_train_steps = trainer.state.global_step
 
-    # Evaluation setup
-    collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
+    collator = MyCollator(tokenizer, latent_id=start_latent_id, label_pad_token_id=-100)
     valid_dataloader = torch.utils.data.DataLoader(
         base_dataset_valid,
         num_workers=1,
@@ -224,7 +204,6 @@ def main():
         sampler=DistributedSampler(base_dataset_valid, shuffle=False),
     )
 
-    # Compute validation loss (optional for RL, included for completeness)
     if not configs.only_eval:
         valid_loss_dataloader = torch.utils.data.DataLoader(
             base_dataset_valid,
@@ -249,7 +228,6 @@ def main():
             if wandb_run:
                 wandb_run.log({"eval/loss": total_loss / len(valid_loss_dataloader)})
 
-    # Evaluation loop with progress bar
     pbar = tqdm(
         colour="blue",
         desc="Test Accuracy",
@@ -280,13 +258,13 @@ def main():
                 max_new_tokens=max_new_tokens,
             )
 
-            text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            text_output = tokenizer.decode(outputs['sequences'][0], skip_special_tokens=True)
             answer_output = text_output.split("#")[-1].replace(",", "").strip()
             cot_output = ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
 
             if idx < 5 and rank == 0:
                 print(f"Question {test_idx}: Answer = '{answer}'")
-                print(f"Full output: '{tokenizer.decode(outputs[0])}'")
+                print(f"Full output: '{tokenizer.decode(outputs['sequences'][0])}'")
                 print(f"Extracted Output: '{answer_output}'")
 
             cor += answer_output == answer
@@ -298,7 +276,6 @@ def main():
         if rank == 0:
             print(f"Device {rank}: Cor={cor}, Total={total}")
 
-    # Aggregate metrics across ranks
     dist.all_reduce(cor, op=dist.ReduceOp.SUM)
     dist.all_reduce(total, op=dist.ReduceOp.SUM)
 
@@ -312,7 +289,6 @@ def main():
     if wandb_run and rank == 0:
         wandb_run.log({"eval/acc": cor / total})
 
-    # Save checkpoint if accuracy improves
     if not configs.only_eval and not configs.debug:
         if cor / total > best_acc and configs.save_only_improve:
             states = parallel_model.state_dict()
