@@ -29,6 +29,10 @@ class CustomGRPOTrainer(GRPOTrainer):
             prompt_ids = prompt_ids[:, -self.max_prompt_length:]
             prompt_mask = prompt_mask[:, -self.max_prompt_length:]
 
+        # Repeat prompts for multiple generations
+        prompt_ids = prompt_ids.repeat_interleave(self.num_generations, dim=0)
+        prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
+
         # Generate completions using DTTModel
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generate_output = unwrapped_model.generate(
@@ -45,7 +49,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         print(f"[DEBUG] Type of prompt_completion_ids: {type(prompt_completion_ids)}")
         assert isinstance(prompt_completion_ids, torch.Tensor), f"prompt_completion_ids is not a tensor, got {type(prompt_completion_ids)}"
         print(f"[DEBUG] Shape of prompt_completion_ids: {prompt_completion_ids.shape}")
-        prompt_length = prompt_ids.size(1)
+        prompt_length = prompt_inputs["input_ids"].size(1)
         print(f"[DEBUG] prompt_length: {prompt_length}")
         if prompt_completion_ids.size(1) < prompt_length:
             raise ValueError(f"Generated sequences length {prompt_completion_ids.size(1)} is shorter than prompt_length {prompt_length}")
@@ -86,22 +90,17 @@ class CustomGRPOTrainer(GRPOTrainer):
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
 
-        # Decode completions
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        completions = (
-            [[{"role": "assistant", "content": (prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else "") + c}]
-            for prompt, c in zip(prompts, completions_text)]
-            if is_conversational(inputs[0]) else completions_text
-        )
+        # Prepare completions as token IDs (List[List[int]])
+        completions = [seq.tolist() for seq in completion_ids]
 
         # Compute rewards using PhasedReward
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        rewards_per_func = torch.zeros(len(prompts) * self.num_generations, len(self.reward_funcs), device=device)
         for i, reward_func in enumerate(self.reward_funcs):
             rewards = reward_func(
-                prompts=prompts,
-                completions=completions,
-                answer=[x["answer"] for x in inputs],
-                latent_steps=total_latent_steps,
+                prompts=prompts,  # List of original prompt strings
+                completions=completions,  # List of completion token ID lists
+                answer=[x["answer"] for x in inputs],  # List of expected answers
+                latent_steps=total_latent_steps,  # List of latent steps per completion
             )
             rewards_per_func[:, i] = torch.tensor(rewards, device=device)
 
@@ -118,11 +117,14 @@ class CustomGRPOTrainer(GRPOTrainer):
 
         # Slice for local process
         process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts)
+            self.accelerator.process_index * len(prompts) * self.num_generations,
+            (self.accelerator.process_index + 1) * len(prompts) * self.num_generations
         )
         advantages = advantages[process_slice]
-        total_latent_steps = total_latent_steps[self.accelerator.process_index * len(prompts):(self.accelerator.process_index + 1) * len(prompts)]
+        total_latent_steps = total_latent_steps[
+            self.accelerator.process_index * len(prompts) * self.num_generations:
+            (self.accelerator.process_index + 1) * len(prompts) * self.num_generations
+        ]
 
         # Log metrics
         mode = "eval" if self.control.should_evaluate else "train"
