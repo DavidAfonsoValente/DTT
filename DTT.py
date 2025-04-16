@@ -19,7 +19,7 @@ torch.autograd.set_detect_anomaly(True)
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 
 class DTTModel(nn.Module):
-    def __init__(self, base_causallm, bot_token_id, eot_token_id, eos_token_id, tokenizer, num_generations=8):
+    def __init__(self, base_causallm, bot_token_id, eot_token_id, eos_token_id, tokenizer, num_generations=4):
         super(DTTModel, self).__init__()
         self.base_causallm = base_causallm
         self.bot_token_id = bot_token_id  # <start_latent>
