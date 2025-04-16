@@ -166,7 +166,7 @@ def main():
             evaluation_strategy="steps",
             eval_steps=500,
             max_prompt_length=512,
-            max_completion_length=128,
+            max_completion_length=16,
             bf16=configs.bf16,
             use_vllm=False,
             report_to=["wandb"] if wandb_run else [],
