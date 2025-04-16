@@ -158,7 +158,7 @@ def main():
             learning_rate=configs.lr,
             weight_decay=configs.weight_decay,
             gradient_accumulation_steps=configs.gradient_accumulation_steps,
-            num_generations=8,
+            num_generations=1,
             beta=0.04,
             logging_steps=1,
             save_steps=500,
