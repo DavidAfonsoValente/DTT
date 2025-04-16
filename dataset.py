@@ -117,25 +117,23 @@ def get_dataset(path, tokenizer, max_size=1000000000, mode='cot'):
 
 @dataclass
 class MyCollator:
-
     tokenizer: PreTrainedTokenizerBase
-    latent_id: Optional[int] = None
+    latent_id: Optional[int] = None  # Refers to <start-latent> token ID
     label_pad_token_id: Optional[int] = -100
 
     def __call__(self, features, return_tensors=None):
-
         assert self.tokenizer.padding_side == "right"
 
         """
         Pad the batch like this to maximize the reuse of kv cache.
         E.g.,
         
-        xxxxxxxxxx<latent><latent>xxxxx--
-        -----xxxxx<latent>xxxxxxxx-------
-        ---xxxxxxx<latent><latent>xxxxxxx
-
+        xxxxxxxxxx<start-latent><end-latent>xxxxx--
+        -----xxxxx<start-latent>xxxxxxxx-------
+        ---xxxxxxx<start-latent><end-latent>xxxxxxx
 
         ("x" is word token, "-" is pad token)
+        Note: No <latent> token is used; latent steps are handled by DTTModel using hidden state embeddings.
         """
 
         earliest_latent = [
@@ -144,7 +142,7 @@ class MyCollator:
             if self.latent_id in feature["input_ids"]
         ]
 
-        if len(earliest_latent) > 0:  # if there are continuous thoughts in the sequence
+        if len(earliest_latent) > 0:  # if there are <start-latent> tokens in the sequence
             latest_earliest_latent = max(earliest_latent)
             for feature in features:
                 if self.latent_id in feature["input_ids"]:
@@ -229,13 +227,11 @@ def get_question_latent_dataset(
     base_dataset_valid,
     configs,
     start_id,
-    latent_id,
+    latent_id,  # Kept for compatibility, but not used for multiple tokens
     end_id,
     no_special_marker=False,
 ):
-
     def process_dataset(sample):
-
         if configs.pad_latent_to_max:
             max_latent_stage = configs.max_latent_stage
         else:
@@ -243,14 +239,12 @@ def get_question_latent_dataset(
                 configs.max_latent_stage, len(sample["steps_tokenized"])
             )
 
-        k = min(max_latent_stage, scheduled_stage)
+        k = min(max_latent_stage, scheduled_stage) * configs.c_thought  # Number of latent steps, not tokens
 
-        k *= configs.c_thought
-
+        # Only include start and end markers; latent steps are implicit
         tokens = (
             sample["question_tokenized"]
             + ([] if no_special_marker else [start_id])
-            + [latent_id] * k
             + ([] if no_special_marker else [end_id])
         )
 
@@ -265,22 +259,19 @@ def get_question_latent_dataset(
         process_dataset, remove_columns=list(base_dataset_valid.features), num_proc=32
     )
 
-
 def get_cot_latent_dataset(
     scheduled_stage,
     base_dataset,
     configs,
     start_id,
-    latent_id,
+    latent_id,  # Kept for compatibility, but not used for multiple tokens
     end_id,
     no_special_marker=False,
     shuffle=False,
 ):
-
     n_additional_tokens = 0 if no_special_marker else 2
 
     def process_dataset(sample):
-
         if (
             random.random() < configs.uniform_prob
         ):  # with some prob, randomly sample stage
@@ -298,7 +289,6 @@ def get_cot_latent_dataset(
                 n_latent_tokens = min(
                     len(sample["steps_tokenized"]), configs.max_latent_stage
                 )
-
         else:
             n_skip_steps, n_latent_tokens = (
                 scheduled_stage_to_train,
@@ -309,12 +299,12 @@ def get_cot_latent_dataset(
             n_skip_steps = 100  # skip all step
             n_latent_tokens = 0
 
-        n_latent_tokens *= configs.c_thought
+        n_latent_tokens *= configs.c_thought  # Number of latent steps, not tokens
 
+        # Only include start and end markers; latent steps are implicit
         tokens = (
             sample["question_tokenized"]
             + ([] if no_special_marker else [start_id])
-            + [latent_id] * n_latent_tokens
             + ([] if no_special_marker else [end_id])
             + list(
                 itertools.chain.from_iterable(sample["steps_tokenized"][n_skip_steps:])
@@ -327,13 +317,10 @@ def get_cot_latent_dataset(
             "labels": [-100]
             * (
                 len(sample["question_tokenized"])
-                + n_latent_tokens
                 + n_additional_tokens
             )
             + tokens[
-                n_latent_tokens
-                + n_additional_tokens
-                + len(sample["question_tokenized"]) :
+                n_additional_tokens + len(sample["question_tokenized"]) :
             ],
             "attention_mask": [1] * len(tokens),
             "idx": sample["idx"],
@@ -352,7 +339,6 @@ def get_cot_latent_dataset(
             processed_dataset = [None]
         dist.broadcast_object_list(processed_dataset, src=0)
         dataset = processed_dataset[0]
-
     else:
         processed_dataset = base_dataset.map(
             process_dataset, remove_columns=list(base_dataset.features), num_proc=32

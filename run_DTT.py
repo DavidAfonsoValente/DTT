@@ -1,13 +1,9 @@
-# run_DTT.py
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
 import torch
 import torch.distributed as dist
 import torch.optim as optim
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
-from trl.models.modeling_base import create_reference_model
+from trl.models import create_reference_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import wandb
@@ -70,7 +66,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(configs.model_id)
     tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>", "<|latent|>"])
+    tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>"])  # Removed <|latent|>
     start_latent_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_latent_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
     eos_id = tokenizer.eos_token_id

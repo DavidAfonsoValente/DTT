@@ -33,7 +33,7 @@ class PhasedReward:
 
     def __call__(
         self,
-        prompts: List[List[int]],
+        prompts: List[str],
         completions: List[List[int]],
         answer: List[str],
         latent_steps: List[int],
