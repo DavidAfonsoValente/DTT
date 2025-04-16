@@ -104,8 +104,8 @@ class DTTModel(nn.Module):
         assert world_size == 4, "This implementation assumes 4 GPUs."
 
         if rank == 0:
-            print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}")
-            print(f"[DEBUG] Input shape: {input_ids.shape}")
+            print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}", flush=True)
+            print(f"[DEBUG] Input shape: {input_ids.shape}", flush=True)
 
         batch_size, seq_len = input_ids.shape  # batch_size should be 1
         device = input_ids.device
@@ -125,8 +125,14 @@ class DTTModel(nn.Module):
         sub_input_ids = input_ids  # Shape: [1, seq_len]
         sub_attention_mask = attention_mask  # Shape: [1, seq_len]
 
-        # Generate one completion for this GPU
+        # Print initial memory usage
+        print(f"[DEBUG Rank {rank}] Before generation: Memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB, Reserved: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB", flush=True)
+
         sub_outputs = self._generate_sub_batch(sub_input_ids, sub_attention_mask, max_new_tokens, max_latent_steps)
+
+        # Print memory usage after generation
+        print(f"[DEBUG Rank {rank}] After generation: Memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB, Reserved: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB", flush=True)
+
         sub_sequences = sub_outputs['sequences']  # List of 1 tensor
         sub_latent_steps = sub_outputs['latent_steps']  # List of 1 int
 
@@ -151,7 +157,7 @@ class DTTModel(nn.Module):
         padded_sequences = padded_sequences.view(batch_size, total_generations, -1)
 
         if rank == 0:
-            print(f"[DEBUG] Generated sequences shape: {padded_sequences.shape}")
+            print(f"[DEBUG] Generated sequences shape: {padded_sequences.shape}", flush=True)
 
         return {
             'sequences': padded_sequences,  # Shape: [1, 4, max_len]
@@ -201,6 +207,10 @@ class DTTModel(nn.Module):
                 (current_attention_mask, (~torch.tensor(finished, device=device)).int().unsqueeze(1)),
                 dim=1
             )
+
+            # Print current sequence lengths and memory usage
+            seq_lengths = [seq.size(0) for seq in sequences]
+            print(f"[DEBUG Rank {dist.get_rank()}] Step {step}: Sequence lengths: {seq_lengths}, Memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB", flush=True)
 
             outputs = self.base_causallm(
                 inputs_embeds=input_embeds,
