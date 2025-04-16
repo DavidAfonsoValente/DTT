@@ -222,6 +222,11 @@ class DTTModel(nn.Module):
             last_hidden_states = outputs.hidden_states[-1][:, -1, :]
             past_key_values = outputs.past_key_values
 
+            # Force the first token to be bot_token_id
+            if step == 0:
+                logits[:, :] = -float('inf')
+                logits[:, self.bot_token_id] = 0
+
             for b in range(batch_size):
                 if finished[b]:
                     continue
