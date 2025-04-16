@@ -131,9 +131,9 @@ def main():
         wandb_run = None
 
     if "gsm" in configs.val_path:
-        max_new_tokens = 64
+        max_new_tokens = 16
     else:
-        max_new_tokens = 128
+        max_new_tokens = 16
 
     total_train_steps = 0
 
