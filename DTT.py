@@ -94,8 +94,8 @@ class DTTModel(nn.Module):
         print(f"[DEBUG] Forward pass completed", flush=True)
         return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
 
-    def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=50, **kwargs):
-        """Generate completions distributed across multiple GPUs."""
+    def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=10, **kwargs):
+        """Generate completions distributed across multiple GPUs, one sequence per GPU."""
         if not dist.is_initialized():
             raise RuntimeError("Distributed process group is not initialized.")
 
@@ -107,51 +107,55 @@ class DTTModel(nn.Module):
             print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}")
             print(f"[DEBUG] Input shape: {input_ids.shape}")
 
-        batch_size, seq_len = input_ids.shape  # batch_size is per_device_train_batch_size
+        batch_size, seq_len = input_ids.shape  # batch_size should be 1
         device = input_ids.device
 
-        # Number of completions per GPU (8 generations / 4 GPUs = 2 per GPU per prompt)
-        generations_per_gpu = self.num_generations // world_size
-
-        # Each GPU generates its subset of completions for its prompts
-        sub_input_ids = input_ids.repeat_interleave(generations_per_gpu, dim=0)
+        # Broadcast input_ids and attention_mask from rank 0 to all ranks
+        dist.broadcast(input_ids, src=0)
         if attention_mask is not None:
-            sub_attention_mask = attention_mask.repeat_interleave(generations_per_gpu, dim=0)
+            dist.broadcast(attention_mask, src=0)
         else:
-            sub_attention_mask = torch.ones_like(sub_input_ids, device=device)
+            attention_mask = torch.ones_like(input_ids, device=device)
 
-        # Generate completions for this GPU's subset
+        # Each GPU generates exactly one sequence
+        generations_per_gpu = 1  # Override to 1 sequence per GPU
+        total_generations = world_size * generations_per_gpu  # 4 sequences total
+
+        # No need to repeat since each GPU generates one sequence
+        sub_input_ids = input_ids  # Shape: [1, seq_len]
+        sub_attention_mask = attention_mask  # Shape: [1, seq_len]
+
+        # Generate one completion for this GPU
         sub_outputs = self._generate_sub_batch(sub_input_ids, sub_attention_mask, max_new_tokens, max_latent_steps)
-        sub_sequences = sub_outputs['sequences']  # List of tensors
-        sub_latent_steps = sub_outputs['latent_steps']
+        sub_sequences = sub_outputs['sequences']  # List of 1 tensor
+        sub_latent_steps = sub_outputs['latent_steps']  # List of 1 int
 
         # Gather sequences from all GPUs
         all_sequences_list = [None] * world_size
         dist.all_gather_object(all_sequences_list, sub_sequences)
-        all_sequences = [seq for gpu_seqs in all_sequences_list for seq in gpu_seqs]  # Flatten list
+        all_sequences = [seq for gpu_seqs in all_sequences_list for seq in gpu_seqs]  # Flatten to 4 sequences
 
         # Gather latent steps from all GPUs
         all_latent_steps_list = [None] * world_size
         dist.all_gather_object(all_latent_steps_list, sub_latent_steps)
-        all_latent_steps = [step for gpu_steps in all_latent_steps_list for step in gpu_steps]  # Flatten list
+        all_latent_steps = [step for gpu_steps in all_latent_steps_list for step in gpu_steps]  # Flatten to 4 steps
 
-        # Ensure all sequences are padded to the same length
+        # Pad sequences to the same length
         max_len = max(seq.size(0) for seq in all_sequences)
         padded_sequences = torch.stack([
             torch.nn.functional.pad(seq, (0, max_len - seq.size(0)), value=self.tokenizer.pad_token_id)
             for seq in all_sequences
         ])
 
-        # Reshape to [batch_size, num_generations, max_len]
-        total_generations = batch_size * self.num_generations
-        padded_sequences = padded_sequences.view(batch_size, self.num_generations, -1)
+        # Reshape to [batch_size, num_generations, max_len], where num_generations=4
+        padded_sequences = padded_sequences.view(batch_size, total_generations, -1)
 
         if rank == 0:
             print(f"[DEBUG] Generated sequences shape: {padded_sequences.shape}")
 
         return {
-            'sequences': padded_sequences,
-            'latent_steps': all_latent_steps
+            'sequences': padded_sequences,  # Shape: [1, 4, max_len]
+            'latent_steps': all_latent_steps  # List of 4 ints
         }
 
     def _generate_sub_batch(self, input_ids, attention_mask, max_new_tokens, max_latent_steps):

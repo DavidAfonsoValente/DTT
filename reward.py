@@ -11,7 +11,7 @@ class PhasedReward:
         tokenizer,
         gamma: float = 0.98,
         lambda_eff: float = 0.1,
-        G: int = 8,
+        G: int = 4,  # Changed from 8 to 4
         enable_binary: bool = True,
         enable_crs: bool = True,
         enable_lcr: bool = True,
