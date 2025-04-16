@@ -40,7 +40,7 @@ class CustomGRPOTrainer(GRPOTrainer):
                 attention_mask=prompt_mask,
                 generation_config=self.generation_config,
                 max_new_tokens=self.max_completion_length,
-                max_latent_steps=50
+                max_latent_steps=10
             )
 
         prompt_completion_ids = generate_output['sequences']
