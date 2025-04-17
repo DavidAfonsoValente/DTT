@@ -121,18 +121,11 @@ class DTTModel(nn.Module):
         generations_per_gpu = 1  # Override to 1 sequence per GPU
         total_generations = world_size * generations_per_gpu  # 4 sequences total
 
-        # No need to repeat since each GPU generates one sequence
         sub_input_ids = input_ids  # Shape: [1, seq_len]
         sub_attention_mask = attention_mask  # Shape: [1, seq_len]
 
-        # Print initial memory usage
-        print(f"[DEBUG Rank {rank}] Before generation: Memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB, Reserved: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB", flush=True)
-
+        # Generate sequences on this GPU
         sub_outputs = self._generate_sub_batch(sub_input_ids, sub_attention_mask, max_new_tokens, max_latent_steps)
-
-        # Print memory usage after generation
-        print(f"[DEBUG Rank {rank}] After generation: Memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB, Reserved: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB", flush=True)
-
         sub_sequences = sub_outputs['sequences']  # List of 1 tensor
         sub_latent_steps = sub_outputs['latent_steps']  # List of 1 int
 
@@ -140,6 +133,10 @@ class DTTModel(nn.Module):
         all_sequences_list = [None] * world_size
         dist.all_gather_object(all_sequences_list, sub_sequences)
         all_sequences = [seq for gpu_seqs in all_sequences_list for seq in gpu_seqs]  # Flatten to 4 sequences
+
+        # Move all sequences to the current device
+        device = input_ids.device  # Current rank's device (e.g., cuda:0 for rank 0)
+        all_sequences = [seq.to(device) for seq in all_sequences]
 
         # Gather latent steps from all GPUs
         all_latent_steps_list = [None] * world_size
