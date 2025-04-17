@@ -147,7 +147,7 @@ class DTTModel(nn.Module):
         ])
 
         # Reshape to [world_size * generations_per_gpu, max_len] = [64, max_len]
-        padded_sequences = padded_sequences.view(world_size * generations_per_gpu, -1)
+        padded_sequences = padded_sequences.view(total_generations, -1)
 
         if rank == 0:
             print(f"[DEBUG] Generated sequences shape: {padded_sequences.shape}", flush=True)

@@ -1,4 +1,3 @@
-# custom_trainer.py
 from trl import GRPOTrainer
 from transformers import PreTrainedModel
 from accelerate import Accelerator
@@ -29,22 +28,18 @@ class CustomGRPOTrainer(GRPOTrainer):
             prompt_ids = prompt_ids[:, -self.max_prompt_length:]
             prompt_mask = prompt_mask[:, -self.max_prompt_length:]
 
-        # Repeat prompts for multiple generations
-        prompt_ids = prompt_ids.repeat_interleave(self.num_generations, dim=0)
-        prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
-
-        # Generate completions using DTTModel
+        # Generate completions using DTTModel (no manual repetition)
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generate_output = unwrapped_model.generate(
                 prompt_ids,
                 attention_mask=prompt_mask,
-                generation_config=self.generation_config,
                 max_new_tokens=self.max_completion_length,
-                max_latent_steps=10
+                max_latent_steps=10,
+                temperature=self.temperature,
             )
 
-        prompt_completion_ids = generate_output['sequences']
-        total_latent_steps = generate_output['latent_steps']
+        prompt_completion_ids = generate_output['sequences']  # [64, max_len]
+        total_latent_steps = generate_output['latent_steps']  # List of 64 ints
 
         print(f"[DEBUG] Type of prompt_completion_ids: {type(prompt_completion_ids)}")
         assert isinstance(prompt_completion_ids, torch.Tensor), f"prompt_completion_ids is not a tensor, got {type(prompt_completion_ids)}"
@@ -94,7 +89,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         completions = [seq.tolist() for seq in completion_ids]
 
         # Compute rewards using PhasedReward
-        rewards_per_func = torch.zeros(len(prompts) * self.num_generations, len(self.reward_funcs), device=device)
+        rewards_per_func = torch.zeros(len(prompts) * 64, len(self.reward_funcs), device=device)  # 64 completions per prompt
         for i, reward_func in enumerate(self.reward_funcs):
             rewards = reward_func(
                 prompts=prompts,  # List of original prompt strings
@@ -109,21 +104,21 @@ class CustomGRPOTrainer(GRPOTrainer):
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
         # Compute advantages
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        mean_grouped_rewards = rewards.view(-1, 64).mean(dim=1)  # 64 completions per prompt
+        std_grouped_rewards = rewards.view(-1, 64).std(dim=1)
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(64, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(64, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
-        # Slice for local process
+        # Slice for local process (16 completions per GPU)
         process_slice = slice(
-            self.accelerator.process_index * len(prompts) * self.num_generations,
-            (self.accelerator.process_index + 1) * len(prompts) * self.num_generations
+            self.accelerator.process_index * len(prompts) * 16,
+            (self.accelerator.process_index + 1) * len(prompts) * 16
         )
         advantages = advantages[process_slice]
         total_latent_steps = total_latent_steps[
-            self.accelerator.process_index * len(prompts) * self.num_generations:
-            (self.accelerator.process_index + 1) * len(prompts) * self.num_generations
+            self.accelerator.process_index * len(prompts) * 16:
+            (self.accelerator.process_index + 1) * len(prompts) * 16
         ]
 
         # Log metrics

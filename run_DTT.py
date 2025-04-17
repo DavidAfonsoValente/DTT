@@ -66,7 +66,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(configs.model_id)
     tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>"])  # Removed <|latent|>
+    tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>"])
     start_latent_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_latent_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
     eos_id = tokenizer.eos_token_id
@@ -143,7 +143,7 @@ def main():
             model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
             total_steps=total_train_steps,
             tokenizer=tokenizer,
-            G=16,  # Updated from 4
+            G=configs.num_generations,  # Use YAML value (set to 64)
             enable_binary=True,
             enable_crs=False,
             enable_lcr=False,
@@ -159,7 +159,7 @@ def main():
             learning_rate=configs.lr,
             weight_decay=configs.weight_decay,
             gradient_accumulation_steps=configs.gradient_accumulation_steps,
-            num_generations=configs.num_generations,
+            num_generations=64,  # Total completions per prompt
             beta=0.04,
             logging_steps=1,
             save_steps=configs.save_steps,
@@ -175,7 +175,7 @@ def main():
 
         trainer = CustomGRPOTrainer(
             model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
-            reward_funcs=phased_reward,
+            reward_funcs=[phased_reward],  # Wrap in list as expected
             args=training_args,
             train_dataset=base_dataset_train,
             eval_dataset=base_dataset_valid,
