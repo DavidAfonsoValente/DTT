@@ -15,7 +15,7 @@ torch.autograd.set_detect_anomaly(True)
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 
 class DTTModel(nn.Module):
-    def __init__(self, base_causallm, bot_token_id, eot_token_id, eos_token_id, tokenizer, num_generations=4):
+    def __init__(self, base_causallm, bot_token_id, eot_token_id, eos_token_id, tokenizer):
         super(DTTModel, self).__init__()
         self.base_causallm = base_causallm
         self.bot_token_id = bot_token_id  # <start_latent>
@@ -30,11 +30,9 @@ class DTTModel(nn.Module):
         self.warnings_issued = {}
         self._ddp_params_and_buffers_to_ignore = []
         self._model_tags = []
-        self.num_generations = num_generations  # Total generations per prompt
 
         print(f"[DEBUG] DTTModel initialized with config: {self.config}", flush=True)
         print(f"[DEBUG] Special tokens: bot={bot_token_id}, eot={eot_token_id}, eos={eos_token_id}", flush=True)
-        print(f"[DEBUG] Number of generations: {self.num_generations}", flush=True)
 
     def __deepcopy__(self, memo):
         print(f"[DEBUG] Creating deep copy of DTTModel", flush=True)
@@ -45,7 +43,6 @@ class DTTModel(nn.Module):
             eot_token_id=self.eot_token_id,
             eos_token_id=self.eos_token_id,
             tokenizer=self.tokenizer,
-            num_generations=self.num_generations,
         )
         new_model.last_hidden_states = []
         new_model.last_logits = []
