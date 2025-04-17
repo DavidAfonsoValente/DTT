@@ -159,7 +159,7 @@ def main():
             learning_rate=configs.lr,
             weight_decay=configs.weight_decay,
             gradient_accumulation_steps=configs.gradient_accumulation_steps,
-            num_generations=64,  # Total completions per prompt
+            num_generations=configs.num_generations,
             beta=0.04,
             logging_steps=1,
             save_steps=configs.save_steps,
