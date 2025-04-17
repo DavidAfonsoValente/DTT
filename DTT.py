@@ -194,9 +194,9 @@ class DTTModel(nn.Module):
                 input_embeds = embed.unsqueeze(0)  # [1,1,embedding_dim]
 
                 current_attention_mask = torch.cat(
-                    (current_attention_mask, torch.ones(1, device=device)),
-                    dim=0
-                )
+                    (current_attention_mask.unsqueeze(0), torch.ones((1, 1), device=device)),  # [1, seq_len] and [1, 1]
+                    dim=1
+                ).squeeze(0)  # Back to [seq_len + 1]
 
                 outputs = self.base_causallm(
                     inputs_embeds=input_embeds,
