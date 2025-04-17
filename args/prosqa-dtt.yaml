@@ -15,9 +15,9 @@ bf16: False
 train_path: data/prosqa_train.json
 val_path: data/prosqa_valid.json
 debug: False
-per_device_train_batch_size: 4    # Each GPU processes 1 input per step
-gradient_accumulation_steps: 2    # Accumulate over 8 steps 
-num_generations: 16               # Generate 16 trajectories per input
+per_device_train_batch_size: 1 
+gradient_accumulation_steps: 8    
+num_generations: 16               
 num_train_epochs: 50
 lr: !!float "1e-4"
 weight_decay: 0.01
