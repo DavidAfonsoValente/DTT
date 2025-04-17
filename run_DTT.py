@@ -143,6 +143,7 @@ def main():
             model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
             total_steps=total_train_steps,
             tokenizer=tokenizer,
+            G=16,  # Updated from 4
             enable_binary=True,
             enable_crs=False,
             enable_lcr=False,
@@ -153,12 +154,12 @@ def main():
     if not configs.only_eval:
         training_args = GRPOConfig(
             output_dir=os.path.join(configs.save_path, configs.name),
-            per_device_train_batch_size=configs.per_device_train_batch_size,  # Now 1
+            per_device_train_batch_size=configs.per_device_train_batch_size,  # Remains 1
             num_train_epochs=configs.num_train_epochs,
             learning_rate=configs.lr,
             weight_decay=configs.weight_decay,
-            gradient_accumulation_steps=configs.gradient_accumulation_steps,
-            num_generations=4,
+            gradient_accumulation_steps=8,  # Updated from 32
+            num_generations=16,  # Updated from 4
             beta=0.04,
             logging_steps=1,
             save_steps=500,
