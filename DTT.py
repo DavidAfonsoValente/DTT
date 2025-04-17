@@ -88,7 +88,7 @@ class DTTModel(nn.Module):
         return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=10, temperature=1.0, **kwargs):
-        """Generate 16 completions per GPU for its unique input, distributed across 4 GPUs."""
+        """Generate completions for each prompt in the batch, distributed across GPUs."""
         if not dist.is_initialized():
             raise RuntimeError("Distributed process group is not initialized.")
 
@@ -100,44 +100,29 @@ class DTTModel(nn.Module):
             print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}, temperature={temperature}", flush=True)
             print(f"[DEBUG] Input shape: {input_ids.shape}", flush=True)
 
-        batch_size, seq_len = input_ids.shape  # batch_size=1 per GPU
+        batch_size, seq_len = input_ids.shape  # batch_size can be > 1 (e.g., 4)
         device = input_ids.device
-
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=device)
 
-        # Each GPU processes its own input (batch_size=1), generating 16 trajectories
-        generations_per_gpu = 16
-        total_generations = world_size * generations_per_gpu  # 4 * 16 = 64
+        generations_per_prompt = 16  # Number of completions per prompt per GPU
+        all_sequences = []
+        all_latent_steps = []
 
-        # Subset input for this GPU (already handled by DDP data distribution)
-        sub_input_ids = input_ids  # [1, seq_len]
-        sub_attention_mask = attention_mask  # [1, seq_len]
-
-        # Generate 16 sequences for this GPU's input with sampling
-        sub_outputs = self._generate_sub_batch(
-            sub_input_ids,
-            sub_attention_mask,
-            max_new_tokens,
-            max_latent_steps,
-            temperature,
-            generations_per_gpu
-        )
-        sub_sequences = sub_outputs['sequences']  # List of 16 tensors
-        sub_latent_steps = sub_outputs['latent_steps']  # List of 16 ints
-
-        # Gather sequences from all GPUs
-        all_sequences_list = [None] * world_size
-        dist.all_gather_object(all_sequences_list, sub_sequences)
-        all_sequences = [seq for gpu_seqs in all_sequences_list for seq in gpu_seqs]  # Flatten to 64 sequences
-
-        # Move sequences to current device
-        all_sequences = [seq.to(device) for seq in all_sequences]
-
-        # Gather latent steps from all GPUs
-        all_latent_steps_list = [None] * world_size
-        dist.all_gather_object(all_latent_steps_list, sub_latent_steps)
-        all_latent_steps = [step for gpu_steps in all_latent_steps_list for step in gpu_steps]  # Flatten to 64 steps
+        # Process each prompt in the batch individually
+        for b in range(batch_size):
+            sub_input_ids = input_ids[b:b+1]  # [1, seq_len]
+            sub_attention_mask = attention_mask[b:b+1]  # [1, seq_len]
+            sub_outputs = self._generate_sub_batch(
+                sub_input_ids,
+                sub_attention_mask,
+                max_new_tokens,
+                max_latent_steps,
+                temperature,
+                generations_per_input=generations_per_prompt
+            )
+            all_sequences.extend(sub_outputs['sequences'])
+            all_latent_steps.extend(sub_outputs['latent_steps'])
 
         # Pad sequences to the same length
         max_len = max(seq.size(0) for seq in all_sequences)
@@ -146,20 +131,21 @@ class DTTModel(nn.Module):
             for seq in all_sequences
         ])
 
-        # Reshape to [world_size * generations_per_gpu, max_len] = [64, max_len]
-        padded_sequences = padded_sequences.view(total_generations, -1)
+        # Reshape to [batch_size * generations_per_prompt, max_len]
+        padded_sequences = padded_sequences.view(batch_size * generations_per_prompt, -1)
 
         if rank == 0:
             print(f"[DEBUG] Generated sequences shape: {padded_sequences.shape}", flush=True)
 
         return {
-            'sequences': padded_sequences,  # [64, max_len]
-            'latent_steps': all_latent_steps  # List of 64 ints
+            'sequences': padded_sequences,  # [batch_size * 16, max_len], e.g., [64, max_len] for batch_size=4
+            'latent_steps': all_latent_steps  # List of batch_size * 16 ints
         }
 
     def _generate_sub_batch(self, input_ids, attention_mask, max_new_tokens, max_latent_steps, temperature, generations_per_input):
         """Generate multiple completions for a single input with sampling."""
-        batch_size, seq_len = input_ids.shape
+        batch_size, seq_len = input_ids.shape  # Should be [1, seq_len]
+        assert batch_size == 1, "Expected batch_size=1 for sub_batch"
         device = input_ids.device
         sequences = []
         latent_steps_list = []
@@ -193,14 +179,15 @@ class DTTModel(nn.Module):
 
                 input_embeds = embed.unsqueeze(0)  # [1,1,embedding_dim]
 
+                # Ensure current_attention_mask is 1D
                 current_attention_mask = torch.cat(
-                    (current_attention_mask.unsqueeze(0), torch.ones((1, 1), device=device)),  # [1, seq_len] and [1, 1]
-                    dim=1
-                ).squeeze(0)  # Back to [seq_len + 1]
+                    (current_attention_mask, torch.ones(1, device=device)),
+                    dim=0
+                )
 
                 outputs = self.base_causallm(
                     inputs_embeds=input_embeds,
-                    attention_mask=current_attention_mask.unsqueeze(0),
+                    attention_mask=current_attention_mask.unsqueeze(0),  # [1, seq_len + step + 1]
                     past_key_values=past_key_values,
                     output_hidden_states=True,
                 )
