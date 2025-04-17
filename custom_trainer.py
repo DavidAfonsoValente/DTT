@@ -33,7 +33,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         prompt_ids = prompt_ids.repeat_interleave(self.num_generations, dim=0)
         prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
 
-        # Generate completions using DTTModel
+        # Generate completions
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generate_output = unwrapped_model.generate(
                 prompt_ids,
@@ -43,18 +43,23 @@ class CustomGRPOTrainer(GRPOTrainer):
                 max_latent_steps=10
             )
 
-        prompt_completion_ids = generate_output['sequences']
+        prompt_completion_ids = generate_output['sequences']  # Shape: [batch_size, num_generations, sequence_length]
         total_latent_steps = generate_output['latent_steps']
 
-        print(f"[DEBUG] Type of prompt_completion_ids: {type(prompt_completion_ids)}")
-        assert isinstance(prompt_completion_ids, torch.Tensor), f"prompt_completion_ids is not a tensor, got {type(prompt_completion_ids)}"
         print(f"[DEBUG] Shape of prompt_completion_ids: {prompt_completion_ids.shape}")
+        batch_size, num_generations, sequence_length = prompt_completion_ids.shape
         prompt_length = prompt_inputs["input_ids"].size(1)
         print(f"[DEBUG] prompt_length: {prompt_length}")
-        if prompt_completion_ids.size(1) < prompt_length:
-            raise ValueError(f"Generated sequences length {prompt_completion_ids.size(1)} is shorter than prompt_length {prompt_length}")
 
-        # Slice the tensor into prompt and completion parts
+        # Check sequence length correctly
+        if sequence_length < prompt_length:
+            raise ValueError(f"Generated sequences length {sequence_length} is shorter than prompt_length {prompt_length}")
+
+        # Flatten batch and generation dimensions
+        prompt_completion_ids = prompt_completion_ids.view(batch_size * num_generations, sequence_length)
+        print(f"[DEBUG] Flattened shape of prompt_completion_ids: {prompt_completion_ids.shape}")
+
+        # Slice into prompt and completion parts
         prompt_ids = prompt_completion_ids[:, :prompt_length]
         completion_ids = prompt_completion_ids[:, prompt_length:]
 
@@ -69,7 +74,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
 
-        # Compute log probabilities
+        # Compute log probabilities (remaining code unchanged)
         with torch.no_grad():
             if self.num_iterations > 1:
                 old_per_token_logps = self._get_per_token_logps(
@@ -90,21 +95,20 @@ class CustomGRPOTrainer(GRPOTrainer):
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
 
-        # Prepare completions as token IDs (List[List[int]])
+        # Prepare completions as token IDs
         completions = [seq.tolist() for seq in completion_ids]
 
-        # Compute rewards using PhasedReward
+        # Compute rewards (remaining code unchanged)
         rewards_per_func = torch.zeros(len(prompts) * self.num_generations, len(self.reward_funcs), device=device)
         for i, reward_func in enumerate(self.reward_funcs):
             rewards = reward_func(
-                prompts=prompts,  # List of original prompt strings
-                completions=completions,  # List of completion token ID lists
-                answer=[x["answer"] for x in inputs],  # List of expected answers
-                latent_steps=total_latent_steps,  # List of latent steps per completion
+                prompts=prompts,
+                completions=completions,
+                answer=[x["answer"] for x in inputs],
+                latent_steps=total_latent_steps,
             )
             rewards_per_func[:, i] = torch.tensor(rewards, device=device)
 
-        # Gather rewards across processes
         rewards_per_func = gather(rewards_per_func)
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
