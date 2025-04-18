@@ -150,8 +150,13 @@ class DTTModel(nn.Module):
         device = input_ids.device
         sequences = []
         latent_steps_list = []
+        rank = self.accelerator.local_rank if hasattr(self, 'accelerator') else dist.get_rank()  # Fallback to dist.get_rank()
 
-        for _ in range(generations_per_input):
+        print(f"[rank {rank}] Starting _generate_sub_batch: input_ids.shape={input_ids.shape}, seq_len={seq_len}", flush=True)
+        print_memory_usage(rank)
+
+        for gen_idx in range(generations_per_input):
+            print(f"[rank {rank}] Generating completion {gen_idx + 1}/{generations_per_input}", flush=True)
             sequence = input_ids.clone().squeeze(0)  # [seq_len]
             mode = "token"
             latent_counter = 0
@@ -159,14 +164,22 @@ class DTTModel(nn.Module):
             self.last_hidden_states.append([])  # Per generation
             self.last_logits.append([])  # Per generation
             current_attention_mask = attention_mask.clone().squeeze(0)  # [seq_len]
+            print(f"[rank {rank}] Initial sequence.shape={sequence.shape}, mode={mode}", flush=True)
+            print_memory_usage(rank)
 
+            # Initial forward pass
+            print(f"[rank {rank}] Initial forward pass for prompt", flush=True)
             outputs = self.base_causallm(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
+            print(f"[rank {rank}] Initial outputs.hidden_states[-1].shape={outputs.hidden_states[-1].shape}, logits.shape={outputs.logits.shape}", flush=True)
+            print_memory_usage(rank)
+
             last_hidden_state = outputs.hidden_states[-1][:, -1, :]
             past_key_values = outputs.past_key_values
+            print(f"[rank {rank}] Initial last_hidden_state.shape={last_hidden_state.shape}, past_key_values length={len(past_key_values)}", flush=True)
 
             for step in range(max_new_tokens):
                 if finished:
@@ -181,23 +194,30 @@ class DTTModel(nn.Module):
                         noise = torch.randn_like(embed) * self.noise_scale
                         embed = embed + noise
 
-                input_embeds = embed
+                input_embeds = embed  # [1,1,hidden_size]
+                print(f"[rank {rank}] Step {step}: input_embeds.shape={input_embeds.shape}, mode={mode}", flush=True)
 
-                # Ensure current_attention_mask is 1D
+                # Extend attention mask
                 current_attention_mask = torch.cat(
                     (current_attention_mask, torch.ones(1, device=device)),
                     dim=0
                 )
+                print(f"[rank {rank}] Step {step}: current_attention_mask.shape={current_attention_mask.shape}", flush=True)
 
+                # Forward pass
                 outputs = self.base_causallm(
                     inputs_embeds=input_embeds,
                     attention_mask=current_attention_mask.unsqueeze(0),  # [1, seq_len + step + 1]
                     past_key_values=past_key_values,
                     output_hidden_states=True,
                 )
+                print(f"[rank {rank}] Step {step}: outputs.hidden_states[-1].shape={outputs.hidden_states[-1].shape}, logits.shape={outputs.logits.shape}", flush=True)
+                print_memory_usage(rank)
+
                 logits = outputs.logits[:, -1, :]  # [1, vocab_size]
                 last_hidden_state = outputs.hidden_states[-1][:, -1, :]
                 past_key_values = outputs.past_key_values
+                print(f"[rank {rank}] Step {step}: logits.shape={logits.shape}, last_hidden_state.shape={last_hidden_state.shape}", flush=True)
 
                 if step == 0:
                     # Force first token to be bot_token_id
@@ -219,6 +239,7 @@ class DTTModel(nn.Module):
                             continue
 
                 sequence = torch.cat((sequence, next_token), dim=0)
+                print(f"[rank {rank}] Step {step}: next_token={next_token.item()}, sequence.shape={sequence.shape}", flush=True)
                 if mode == "token":
                     if next_token.item() == self.bot_token_id:
                         mode = "latent"
@@ -228,8 +249,18 @@ class DTTModel(nn.Module):
 
             sequences.append(sequence)
             latent_steps_list.append(latent_counter)
+            print(f"[rank {rank}] Completion {gen_idx + 1} finished: sequence.shape={sequence.shape}, latent_steps={latent_counter}", flush=True)
+            print_memory_usage(rank)
+
+        print(f"[rank {rank}] Finished _generate_sub_batch: {len(sequences)} sequences generated", flush=True)
+        print_memory_usage(rank)
 
         return {
             'sequences': sequences,
             'latent_steps': latent_steps_list
         }
+
+def print_memory_usage(rank):
+    allocated = torch.cuda.memory_allocated(rank) / (1024 ** 3)  # in GB
+    reserved = torch.cuda.memory_reserved(rank) / (1024 ** 3)    # in GB
+    print(f"[rank {rank}] Memory Allocated: {allocated:.3f} GB, Reserved: {reserved:.3f} GB", flush=True)
