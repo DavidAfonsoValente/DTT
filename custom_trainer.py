@@ -1,20 +1,17 @@
-from trl import GRPOTrainer
-from transformers import PreTrainedModel
-from accelerate import Accelerator
 import torch
-from typing import Union, Any, List, Dict
-from accelerate.utils import gather
-from trl.models import unwrap_model_for_generation
-from trl.data_utils import is_conversational, maybe_apply_chat_template
+from torch.nn import Module
+from typing import Dict, Union, Any, List
+from accelerate import Accelerator
 
 class CustomGRPOTrainer(GRPOTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_generations = kwargs.get('num_generations', 16)  # Default to 16 if not specified
+
     def _generate_and_score_completions(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-
-        print(f"[DEBUG] Type of prompts: {type(prompts)}")
-        print(f"[DEBUG] Prompts: {prompts}")
 
         # Tokenize prompts
         prompt_inputs = self.processing_class(
@@ -28,7 +25,7 @@ class CustomGRPOTrainer(GRPOTrainer):
             prompt_ids = prompt_ids[:, -self.max_prompt_length:]
             prompt_mask = prompt_mask[:, -self.max_prompt_length:]
 
-        # Generate completions using DTTModel (no manual repetition)
+        # Generate completions using DTTModel
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generate_output = unwrapped_model.generate(
                 prompt_ids,
@@ -36,20 +33,13 @@ class CustomGRPOTrainer(GRPOTrainer):
                 max_new_tokens=self.max_completion_length,
                 max_latent_steps=10,
                 temperature=self.temperature,
+                generations_per_prompt=self.num_generations // self.accelerator.num_processes,  # 4 completions per GPU
             )
 
-        prompt_completion_ids = generate_output['sequences']  # [64, max_len]
-        total_latent_steps = generate_output['latent_steps']  # List of 64 ints
+        prompt_completion_ids = generate_output['sequences']  # [batch_size * generations_per_prompt, max_len]
+        total_latent_steps = generate_output['latent_steps']  # List of ints
 
-        print(f"[DEBUG] Type of prompt_completion_ids: {type(prompt_completion_ids)}")
-        assert isinstance(prompt_completion_ids, torch.Tensor), f"prompt_completion_ids is not a tensor, got {type(prompt_completion_ids)}"
-        print(f"[DEBUG] Shape of prompt_completion_ids: {prompt_completion_ids.shape}")
         prompt_length = prompt_inputs["input_ids"].size(1)
-        print(f"[DEBUG] prompt_length: {prompt_length}")
-        if prompt_completion_ids.size(1) < prompt_length:
-            raise ValueError(f"Generated sequences length {prompt_completion_ids.size(1)} is shorter than prompt_length {prompt_length}")
-
-        # Slice the tensor into prompt and completion parts
         prompt_ids = prompt_completion_ids[:, :prompt_length]
         completion_ids = prompt_completion_ids[:, prompt_length:]
 
@@ -89,7 +79,8 @@ class CustomGRPOTrainer(GRPOTrainer):
         completions = [seq.tolist() for seq in completion_ids]
 
         # Compute rewards using PhasedReward
-        rewards_per_func = torch.zeros(len(prompts) * 64, len(self.reward_funcs), device=device)  # 64 completions per prompt
+        num_completions = len(completions)
+        rewards_per_func = torch.zeros(num_completions, len(self.reward_funcs), device=device)
         for i, reward_func in enumerate(self.reward_funcs):
             rewards = reward_func(
                 prompts=prompts,  # List of original prompt strings
@@ -103,22 +94,24 @@ class CustomGRPOTrainer(GRPOTrainer):
         rewards_per_func = gather(rewards_per_func)
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
-        # Compute advantages
-        mean_grouped_rewards = rewards.view(-1, 64).mean(dim=1)  # 64 completions per prompt
-        std_grouped_rewards = rewards.view(-1, 64).std(dim=1)
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(64, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(64, dim=0)
+        # Compute advantages with proper grouping
+        global_batch_size = self.accelerator.num_processes * len(prompts)
+        rewards_grouped = rewards.view(global_batch_size, self.num_generations)
+        mean_grouped_rewards = rewards_grouped.mean(dim=1)
+        std_grouped_rewards = rewards_grouped.std(dim=1)
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
-        # Slice for local process (16 completions per GPU)
+        # Slice for local process
         process_slice = slice(
-            self.accelerator.process_index * len(prompts) * 16,
-            (self.accelerator.process_index + 1) * len(prompts) * 16
+            self.accelerator.process_index * num_completions,
+            (self.accelerator.process_index + 1) * num_completions
         )
         advantages = advantages[process_slice]
         total_latent_steps = total_latent_steps[
-            self.accelerator.process_index * len(prompts) * 16:
-            (self.accelerator.process_index + 1) * len(prompts) * 16
+            self.accelerator.process_index * num_completions:
+            (self.accelerator.process_index + 1) * num_completions
         ]
 
         # Log metrics
@@ -136,3 +129,19 @@ class CustomGRPOTrainer(GRPOTrainer):
             "advantages": advantages,
             "latent_steps": total_latent_steps
         }
+
+# Placeholder for helper functions assumed to exist in GRPOTrainer
+def maybe_apply_chat_template(example, processing_class):
+    return {"prompt": example["prompt"]}  # Simplified for demonstration
+
+def unwrap_model_for_generation(model_wrapped, accelerator):
+    class ContextManager:
+        def __enter__(self):
+            return accelerator.unwrap_model(model_wrapped)
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+    return ContextManager()
+
+def gather(tensor):
+    # Simplified gather for demonstration; actual implementation depends on accelerate
+    return tensor

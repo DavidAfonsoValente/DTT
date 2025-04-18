@@ -1,151 +1,67 @@
-import copy
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.distributed as dist
-from torch.nn import CrossEntropyLoss
-from collections import namedtuple
-import os
-
-# Set environment variable for synchronous CUDA error reporting
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
-# Enable anomaly detection for detailed error traces
-torch.autograd.set_detect_anomaly(True)
-
-Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 
 class DTTModel(nn.Module):
     def __init__(self, base_causallm, bot_token_id, eot_token_id, eos_token_id, tokenizer):
-        super(DTTModel, self).__init__()
+        super().__init__()
         self.base_causallm = base_causallm
-        self.bot_token_id = bot_token_id  # <start_latent>
-        self.eot_token_id = eot_token_id  # <end_latent>
+        self.embedding = base_causallm.get_input_embeddings()
+        self.bot_token_id = bot_token_id
+        self.eot_token_id = eot_token_id
         self.eos_token_id = eos_token_id
         self.tokenizer = tokenizer
-        self.config = base_causallm.config
-        self.name_or_path = base_causallm.config.name_or_path
-        self.embedding = base_causallm.get_input_embeddings()
-        self.last_hidden_states = []  # List of lists for latent hidden states per sequence
-        self.last_logits = []  # List of lists for latent logits per sequence
-        self.warnings_issued = {}
-        self._ddp_params_and_buffers_to_ignore = []
-        self._model_tags = []
+        self.last_logits = []
+        self.last_hidden_states = []
+        self.epsilon_explore = 0.1  # Probability of adding noise
+        self.noise_scale = 0.1     # Scale of Gaussian noise
 
-        print(f"[DEBUG] DTTModel initialized with config: {self.config}", flush=True)
-        print(f"[DEBUG] Special tokens: bot={bot_token_id}, eot={eot_token_id}, eos={eos_token_id}", flush=True)
+    def forward(self, *args, **kwargs):
+        return self.base_causallm(*args, **kwargs)
 
-    def __deepcopy__(self, memo):
-        print(f"[DEBUG] Creating deep copy of DTTModel", flush=True)
-        new_base_causallm = copy.deepcopy(self.base_causallm, memo)
-        new_model = DTTModel(
-            base_causallm=new_base_causallm,
-            bot_token_id=self.bot_token_id,
-            eot_token_id=self.eot_token_id,
-            eos_token_id=self.eos_token_id,
-            tokenizer=self.tokenizer,
-        )
-        new_model.last_hidden_states = []
-        new_model.last_logits = []
-        new_model.warnings_issued = {}
-        new_model._ddp_params_and_buffers_to_ignore = []
-        print(f"[DEBUG] Deep copy created successfully", flush=True)
-        return new_model
-
-    def add_model_tags(self, tags):
-        print(f"[DEBUG] Adding model tags: {tags}", flush=True)
-        self._model_tags = tags
-
-    def forward(self, input_ids, attention_mask, labels=None, position_ids=None, **kwargs):
-        print(f"[DEBUG] Forward pass started with input shape: {input_ids.shape}", flush=True)
-        if labels is not None:
-            print(f"[DEBUG] Labels provided with shape: {labels.shape}", flush=True)
-
-        inputs_embeds = self.embedding(input_ids)
-        print(f"[DEBUG] Initial inputs_embeds shape: {inputs_embeds.shape}", flush=True)
-
-        outputs = self.base_causallm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_hidden_states=True,
-        )
-        logits = outputs.logits
-        print(f"[DEBUG] Base model output logits shape: {logits.shape}", flush=True)
-
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            print(f"[DEBUG] Shifted logits shape: {shift_logits.shape}", flush=True)
-            print(f"[DEBUG] Shifted labels shape: {shift_labels.shape}", flush=True)
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            print(f"[DEBUG] Computed loss: {loss.item()}", flush=True)
-        else:
-            loss = None
-            print(f"[DEBUG] No labels provided, skipping loss computation", flush=True)
-
-        print(f"[DEBUG] Forward pass completed", flush=True)
-        return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
-
-    def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=10, temperature=1.0, **kwargs):
-        """Generate completions for each prompt in the batch, distributed across GPUs."""
-        if not dist.is_initialized():
-            raise RuntimeError("Distributed process group is not initialized.")
-
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        assert world_size == 4, "This implementation assumes 4 GPUs."
-
-        if rank == 0:
-            print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}, temperature={temperature}", flush=True)
-            print(f"[DEBUG] Input shape: {input_ids.shape}", flush=True)
-
-        batch_size, seq_len = input_ids.shape  # batch_size can be > 1 (e.g., 4)
-        device = input_ids.device
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=device)
-
-        generations_per_prompt = 16  # Number of completions per prompt per GPU
+    def generate(
+        self,
+        input_ids,
+        attention_mask,
+        max_new_tokens,
+        max_latent_steps,
+        temperature,
+        generations_per_prompt=4,  # Adjusted for 4 completions per GPU
+    ):
+        batch_size = input_ids.size(0)
         all_sequences = []
         all_latent_steps = []
 
-        # Process each prompt in the batch individually
-        for b in range(batch_size):
-            sub_input_ids = input_ids[b:b+1]  # [1, seq_len]
-            sub_attention_mask = attention_mask[b:b+1]  # [1, seq_len]
-            sub_outputs = self._generate_sub_batch(
-                sub_input_ids,
-                sub_attention_mask,
+        # Process each input in the batch
+        for i in range(batch_size):
+            sub_batch_input_ids = input_ids[i:i+1]  # [1, seq_len]
+            sub_batch_attention_mask = attention_mask[i:i+1]  # [1, seq_len]
+            sub_batch_output = self._generate_sub_batch(
+                sub_batch_input_ids,
+                sub_batch_attention_mask,
                 max_new_tokens,
                 max_latent_steps,
                 temperature,
-                generations_per_input=generations_per_prompt
+                generations_per_prompt,
             )
-            all_sequences.extend(sub_outputs['sequences'])
-            all_latent_steps.extend(sub_outputs['latent_steps'])
+            all_sequences.extend(sub_batch_output['sequences'])
+            all_latent_steps.extend(sub_batch_output['latent_steps'])
 
-        # Pad sequences to the same length
-        max_len = max(seq.size(0) for seq in all_sequences)
-        padded_sequences = torch.stack([
-            torch.nn.functional.pad(seq, (0, max_len - seq.size(0)), value=self.tokenizer.pad_token_id)
-            for seq in all_sequences
-        ])
-
-        # Reshape to [batch_size * generations_per_prompt, max_len]
-        padded_sequences = padded_sequences.view(batch_size * generations_per_prompt, -1)
-
-        if rank == 0:
-            print(f"[DEBUG] Generated sequences shape: {padded_sequences.shape}", flush=True)
+        # Stack sequences into a tensor
+        max_len = max(len(seq) for seq in all_sequences)
+        padded_sequences = []
+        for seq in all_sequences:
+            padding = [self.eos_token_id] * (max_len - len(seq))
+            padded_seq = torch.cat((seq, torch.tensor(padding, device=input_ids.device)))
+            padded_sequences.append(padded_seq)
+        sequences_tensor = torch.stack(padded_sequences)
 
         return {
-            'sequences': padded_sequences,  # [batch_size * 16, max_len], e.g., [64, max_len] for batch_size=4
-            'latent_steps': all_latent_steps  # List of batch_size * 16 ints
+            'sequences': sequences_tensor,  # [batch_size * generations_per_prompt, max_len]
+            'latent_steps': all_latent_steps  # List of ints
         }
 
     def _generate_sub_batch(self, input_ids, attention_mask, max_new_tokens, max_latent_steps, temperature, generations_per_input):
-        """Generate multiple completions for a single input with sampling."""
-        batch_size, seq_len = input_ids.shape  # Should be [1, seq_len]
-        assert batch_size == 1, "Expected batch_size=1 for sub_batch"
         device = input_ids.device
         sequences = []
         latent_steps_list = []
@@ -176,10 +92,12 @@ class DTTModel(nn.Module):
                     embed = self.embedding(last_token)
                 else:  # latent mode
                     embed = last_hidden_state.unsqueeze(0)  # [1, embedding_dim]
+                    if torch.rand(1, device=device).item() < self.epsilon_explore:
+                        noise = torch.randn_like(embed) * self.noise_scale
+                        embed = embed + noise
 
                 input_embeds = embed.unsqueeze(0)  # [1,1,embedding_dim]
 
-                # Ensure current_attention_mask is 1D
                 current_attention_mask = torch.cat(
                     (current_attention_mask, torch.ones(1, device=device)),
                     dim=0
@@ -187,7 +105,7 @@ class DTTModel(nn.Module):
 
                 outputs = self.base_causallm(
                     inputs_embeds=input_embeds,
-                    attention_mask=current_attention_mask.unsqueeze(0),  # [1, seq_len + step + 1]
+                    attention_mask=current_attention_mask.unsqueeze(0),
                     past_key_values=past_key_values,
                     output_hidden_states=True,
                 )
@@ -196,7 +114,6 @@ class DTTModel(nn.Module):
                 past_key_values = outputs.past_key_values
 
                 if step == 0:
-                    # Force first token to be bot_token_id
                     next_token = torch.tensor([self.bot_token_id], device=device)
                 else:
                     if mode == "token":
