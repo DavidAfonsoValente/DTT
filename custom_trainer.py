@@ -1,17 +1,25 @@
-import torch
-from torch.nn import Module
-from typing import Dict, Union, Any, List
+from trl import GRPOTrainer
+from transformers import PreTrainedModel
 from accelerate import Accelerator
+import torch
+from typing import Union, Any, List, Dict
+from accelerate.utils import gather
+from trl.models import unwrap_model_for_generation
+from trl.data_utils import is_conversational, maybe_apply_chat_template
 
 class CustomGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.num_generations = kwargs.get('num_generations', 16)  # Default to 16 if not specified
+        self.num_generations = kwargs.get('num_generations', 16)  # Total completions per prompt
+        self.generations_per_gpu = self.num_generations // self.accelerator.num_processes  # 4 per GPU with 4 GPUs
 
     def _generate_and_score_completions(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+
+        print(f"[DEBUG] Type of prompts: {type(prompts)}")
+        print(f"[DEBUG] Prompts: {prompts}")
 
         # Tokenize prompts
         prompt_inputs = self.processing_class(
@@ -33,13 +41,21 @@ class CustomGRPOTrainer(GRPOTrainer):
                 max_new_tokens=self.max_completion_length,
                 max_latent_steps=10,
                 temperature=self.temperature,
-                generations_per_prompt=self.num_generations // self.accelerator.num_processes,  # 4 completions per GPU
+                generations_per_prompt=self.generations_per_gpu,  # 4 completions per GPU
             )
 
-        prompt_completion_ids = generate_output['sequences']  # [batch_size * generations_per_prompt, max_len]
-        total_latent_steps = generate_output['latent_steps']  # List of ints
+        prompt_completion_ids = generate_output['sequences']  # [batch_size * generations_per_gpu, max_len]
+        total_latent_steps = generate_output['latent_steps']  # List of batch_size * generations_per_gpu ints
 
+        print(f"[DEBUG] Type of prompt_completion_ids: {type(prompt_completion_ids)}")
+        assert isinstance(prompt_completion_ids, torch.Tensor), f"prompt_completion_ids is not a tensor, got {type(prompt_completion_ids)}"
+        print(f"[DEBUG] Shape of prompt_completion_ids: {prompt_completion_ids.shape}")
         prompt_length = prompt_inputs["input_ids"].size(1)
+        print(f"[DEBUG] prompt_length: {prompt_length}")
+        if prompt_completion_ids.size(1) < prompt_length:
+            raise ValueError(f"Generated sequences length {prompt_completion_ids.size(1)} is shorter than prompt_length {prompt_length}")
+
+        # Slice the tensor into prompt and completion parts
         prompt_ids = prompt_completion_ids[:, :prompt_length]
         completion_ids = prompt_completion_ids[:, prompt_length:]
 
@@ -79,7 +95,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         completions = [seq.tolist() for seq in completion_ids]
 
         # Compute rewards using PhasedReward
-        num_completions = len(completions)
+        num_completions = len(prompts) * self.generations_per_gpu
         rewards_per_func = torch.zeros(num_completions, len(self.reward_funcs), device=device)
         for i, reward_func in enumerate(self.reward_funcs):
             rewards = reward_func(
@@ -129,19 +145,3 @@ class CustomGRPOTrainer(GRPOTrainer):
             "advantages": advantages,
             "latent_steps": total_latent_steps
         }
-
-# Placeholder for helper functions assumed to exist in GRPOTrainer
-def maybe_apply_chat_template(example, processing_class):
-    return {"prompt": example["prompt"]}  # Simplified for demonstration
-
-def unwrap_model_for_generation(model_wrapped, accelerator):
-    class ContextManager:
-        def __enter__(self):
-            return accelerator.unwrap_model(model_wrapped)
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            pass
-    return ContextManager()
-
-def gather(tensor):
-    # Simplified gather for demonstration; actual implementation depends on accelerate
-    return tensor
