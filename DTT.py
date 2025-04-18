@@ -164,7 +164,6 @@ class DTTModel(nn.Module):
             self.last_hidden_states.append([])  # Per generation
             self.last_logits.append([])  # Per generation
             current_attention_mask = attention_mask.clone().squeeze(0)  # [seq_len]
-            #print(f"[rank {rank}] Initial sequence.shape={sequence.shape}, mode={mode}", flush=True)
             print_memory_usage(rank)
 
             # Initial forward pass
@@ -174,12 +173,9 @@ class DTTModel(nn.Module):
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-            #print(f"[rank {rank}] Initial outputs.hidden_states[-1].shape={outputs.hidden_states[-1].shape}, logits.shape={outputs.logits.shape}", flush=True)
-            #print_memory_usage(rank)
-
             last_hidden_state = outputs.hidden_states[-1][:, -1, :]
             past_key_values = outputs.past_key_values
-            #print(f"[rank {rank}] Initial last_hidden_state.shape={last_hidden_state.shape}, past_key_values length={len(past_key_values)}", flush=True)
+            del outputs  # Free memory immediately
 
             for step in range(max_new_tokens):
                 if finished:
@@ -195,14 +191,12 @@ class DTTModel(nn.Module):
                         embed = embed + noise
 
                 input_embeds = embed  # [1,1,hidden_size]
-                #print(f"[rank {rank}] Step {step}: input_embeds.shape={input_embeds.shape}, mode={mode}", flush=True)
 
                 # Extend attention mask
                 current_attention_mask = torch.cat(
                     (current_attention_mask, torch.ones(1, device=device)),
                     dim=0
                 )
-                #print(f"[rank {rank}] Step {step}: current_attention_mask.shape={current_attention_mask.shape}", flush=True)
 
                 # Forward pass
                 outputs = self.base_causallm(
@@ -211,13 +205,10 @@ class DTTModel(nn.Module):
                     past_key_values=past_key_values,
                     output_hidden_states=True,
                 )
-                #print(f"[rank {rank}] Step {step}: outputs.hidden_states[-1].shape={outputs.hidden_states[-1].shape}, logits.shape={outputs.logits.shape}", flush=True)
-                #print_memory_usage(rank)
-
                 logits = outputs.logits[:, -1, :]  # [1, vocab_size]
                 last_hidden_state = outputs.hidden_states[-1][:, -1, :]
                 past_key_values = outputs.past_key_values
-                #print(f"[rank {rank}] Step {step}: logits.shape={logits.shape}, last_hidden_state.shape={last_hidden_state.shape}", flush=True)
+                del outputs  # Free memory after extraction
 
                 if step == 0:
                     # Force first token to be bot_token_id
@@ -234,12 +225,13 @@ class DTTModel(nn.Module):
                             mode = "token"
                         else:
                             latent_counter += 1
-                            self.last_hidden_states[-1].append(last_hidden_state.clone())
-                            self.last_logits[-1].append(logits.clone())
+                            # Store hidden states selectively (e.g., every other step)
+                            if latent_counter % 2 == 0:
+                                self.last_hidden_states[-1].append(last_hidden_state.clone())
+                                self.last_logits[-1].append(logits.clone())
                             continue
 
                 sequence = torch.cat((sequence, next_token), dim=0)
-                #print(f"[rank {rank}] Step {step}: next_token={next_token.item()}, sequence.shape={sequence.shape}", flush=True)
                 if mode == "token":
                     if next_token.item() == self.bot_token_id:
                         mode = "latent"
@@ -251,6 +243,10 @@ class DTTModel(nn.Module):
             latent_steps_list.append(latent_counter)
             print(f"[rank {rank}] Completion {gen_idx + 1} finished: sequence.shape={sequence.shape}, latent_steps={latent_counter}", flush=True)
             print_memory_usage(rank)
+
+            # Clear memory after each completion
+            del sequence, last_hidden_state, past_key_values
+            torch.cuda.empty_cache()
 
         print(f"[rank {rank}] Finished _generate_sub_batch: {len(sequences)} sequences generated", flush=True)
         print_memory_usage(rank)
