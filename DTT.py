@@ -95,8 +95,6 @@ class DTTModel(nn.Module):
             raise RuntimeError("Distributed process group is not initialized.")
 
         rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        assert world_size == 4, "This implementation assumes 4 GPUs."
 
         if rank == 0:
             print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}, temperature={temperature}", flush=True)
@@ -120,7 +118,7 @@ class DTTModel(nn.Module):
                 max_new_tokens,
                 max_latent_steps,
                 temperature,
-                generations_per_input=generations_per_prompt  # 4 completions per GPU
+                generations_per_input=generations_per_prompt  
             )
             all_sequences.extend(sub_outputs['sequences'])
             all_latent_steps.extend(sub_outputs['latent_steps'])
