@@ -181,7 +181,7 @@ class DTTModel(nn.Module):
                         noise = torch.randn_like(embed) * self.noise_scale
                         embed = embed + noise
 
-                input_embeds = embed.unsqueeze(0)  # [1,1,embedding_dim]
+                input_embeds = embed
 
                 # Ensure current_attention_mask is 1D
                 current_attention_mask = torch.cat(
