@@ -16,7 +16,7 @@ from tqdm import tqdm
 from copy import copy
 from utils import Config, set_seed
 from dataset import get_dataset, MyCollator
-from dtt_model import DTTModel
+from DTT import DTTModel
 import reward  # For PhasedReward
 from custom_trainer import CustomGRPOTrainer
 
