@@ -2,8 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.optim as optim
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import GRPOConfig, GRPOTrainer
-from trl.models import create_reference_model
+from trl import GRPOConfig
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import wandb
@@ -17,7 +16,7 @@ from tqdm import tqdm
 from copy import copy
 from utils import Config, set_seed
 from dataset import get_dataset, MyCollator
-from DTT import DTTModel
+from dtt_model import DTTModel
 import reward  # For PhasedReward
 from custom_trainer import CustomGRPOTrainer
 
@@ -143,7 +142,7 @@ def main():
             model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
             total_steps=total_train_steps,
             tokenizer=tokenizer,
-            G=configs.num_generations,  # Use YAML value (set to 64)
+            G=configs.num_generations,
             enable_binary=True,
             enable_crs=False,
             enable_lcr=False,
@@ -175,7 +174,7 @@ def main():
 
         trainer = CustomGRPOTrainer(
             model=parallel_model.module if isinstance(parallel_model, DDP) else parallel_model,
-            reward_funcs=[phased_reward],  # Wrap in list as expected
+            reward_funcs=[phased_reward],
             args=training_args,
             train_dataset=base_dataset_train,
             eval_dataset=base_dataset_valid,
@@ -232,8 +231,7 @@ def main():
         dynamic_ncols=True,
         disable=rank != 0,
     )
-    cor, cor_cot, total = (
-        torch.tensor(0, device=rank),
+    cor, total = (
         torch.tensor(0, device=rank),
         torch.tensor(0, device=rank),
     )
@@ -251,13 +249,13 @@ def main():
             total += 1
 
             outputs = parallel_model.generate(
-                **batch,
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
                 max_new_tokens=max_new_tokens,
             )
 
             text_output = tokenizer.decode(outputs['sequences'][0], skip_special_tokens=True)
             answer_output = text_output.split("#")[-1].replace(",", "").strip()
-            cot_output = ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
 
             if idx < 5 and rank == 0:
                 print(f"Question {test_idx}: Answer = '{answer}'")

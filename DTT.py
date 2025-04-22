@@ -1,10 +1,8 @@
-import copy
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from torch.nn import CrossEntropyLoss
-from collections import namedtuple
 import os
+import torch.distributed as dist
 
 # Set environment variable for synchronous CUDA error reporting
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -12,7 +10,18 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # Enable anomaly detection for detailed error traces
 torch.autograd.set_detect_anomaly(True)
 
-Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
+# Utility function to print memory usage
+def print_memory_usage(rank):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        reserved = torch.cuda.memory_reserved() / 1024**2
+        print(f"[rank {rank}] GPU Memory - Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB", flush=True)
+
+class Outputs:
+    def __init__(self, loss, inputs_embeds, logits):
+        self.loss = loss
+        self.inputs_embeds = inputs_embeds
+        self.logits = logits
 
 class DTTModel(nn.Module):
     def __init__(self, base_causallm, bot_token_id, eot_token_id, eos_token_id, tokenizer):
@@ -35,23 +44,6 @@ class DTTModel(nn.Module):
 
         print(f"[DEBUG] DTTModel initialized with config: {self.config}", flush=True)
         print(f"[DEBUG] Special tokens: bot={bot_token_id}, eot={eot_token_id}, eos={eos_token_id}", flush=True)
-
-    def __deepcopy__(self, memo):
-        print(f"[DEBUG] Creating deep copy of DTTModel", flush=True)
-        new_base_causallm = copy.deepcopy(self.base_causallm, memo)
-        new_model = DTTModel(
-            base_causallm=new_base_causallm,
-            bot_token_id=self.bot_token_id,
-            eot_token_id=self.eot_token_id,
-            eos_token_id=self.eos_token_id,
-            tokenizer=self.tokenizer,
-        )
-        new_model.last_hidden_states = []
-        new_model.last_logits = []
-        new_model.warnings_issued = {}
-        new_model._ddp_params_and_buffers_to_ignore = []
-        print(f"[DEBUG] Deep copy created successfully", flush=True)
-        return new_model
 
     def add_model_tags(self, tags):
         print(f"[DEBUG] Adding model tags: {tags}", flush=True)
@@ -90,171 +82,177 @@ class DTTModel(nn.Module):
         return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens=16, max_latent_steps=10, temperature=1.0, generations_per_prompt=4, **kwargs):
-        """Generate completions for each prompt in the batch, distributed across GPUs."""
+        """Generate completions for each prompt in the batch, with batched generation."""
         if not dist.is_initialized():
             raise RuntimeError("Distributed process group is not initialized.")
 
         rank = dist.get_rank()
-
-        if rank == 0:
-            print(f"[DEBUG] Starting generation with max_new_tokens={max_new_tokens}, max_latent_steps={max_latent_steps}, temperature={temperature}", flush=True)
-            print(f"[DEBUG] Input shape: {input_ids.shape}", flush=True)
-
-        batch_size, seq_len = input_ids.shape  # batch_size can be > 1 (e.g., 4)
+        batch_size, seq_len = input_ids.shape
         device = input_ids.device
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=device)
 
-        all_sequences = []
-        all_latent_steps = []
+        # Repeat each prompt generations_per_prompt times to create a batch
+        repeated_input_ids = input_ids.repeat_interleave(generations_per_prompt, dim=0)
+        repeated_attention_mask = attention_mask.repeat_interleave(generations_per_prompt, dim=0)
 
-        # Process each prompt in the batch individually
-        for b in range(batch_size):
-            sub_input_ids = input_ids[b:b+1]  # [1, seq_len]
-            sub_attention_mask = attention_mask[b:b+1]  # [1, seq_len]
-            sub_outputs = self._generate_sub_batch(
-                sub_input_ids,
-                sub_attention_mask,
-                max_new_tokens,
-                max_latent_steps,
-                temperature,
-                generations_per_input=generations_per_prompt  
-            )
-            all_sequences.extend(sub_outputs['sequences'])
-            all_latent_steps.extend(sub_outputs['latent_steps'])
+        print(f"[rank {rank}] Repeated input_ids shape: {repeated_input_ids.shape}", flush=True)
 
-        # Pad sequences to the same length
-        max_len = max(seq.size(0) for seq in all_sequences)
+        # Generate all completions in parallel
+        outputs = self._generate_sub_batch(
+            repeated_input_ids,
+            repeated_attention_mask,
+            max_new_tokens,
+            max_latent_steps,
+            temperature
+        )
+
+        sequences = outputs['sequences']
+        latent_steps = outputs['latent_steps']
+
+        # Convert list of sequences to tensor with padding
+        max_len = max(seq.size(0) for seq in sequences)
         padded_sequences = torch.stack([
             torch.nn.functional.pad(seq, (0, max_len - seq.size(0)), value=self.tokenizer.pad_token_id)
-            for seq in all_sequences
+            for seq in sequences
         ])
 
         # Reshape to [batch_size * generations_per_prompt, max_len]
-        padded_sequences = padded_sequences.view(batch_size * generations_per_prompt, -1)
+        padded_sequences = padded_sequences.view(batch_size * generations_per_prompt, max_len)
 
         if rank == 0:
             print(f"[DEBUG] Generated sequences shape: {padded_sequences.shape}", flush=True)
 
         return {
-            'sequences': padded_sequences,  # [batch_size * 4, max_len], e.g., [16, max_len] for batch_size=4
-            'latent_steps': all_latent_steps  # List of batch_size * 4 ints
+            'sequences': padded_sequences,
+            'latent_steps': latent_steps
         }
 
-    def _generate_sub_batch(self, input_ids, attention_mask, max_new_tokens, max_latent_steps, temperature, generations_per_input):
-        """Generate multiple completions for a single input with sampling."""
-        batch_size, seq_len = input_ids.shape  # Should be [1, seq_len]
-        assert batch_size == 1, "Expected batch_size=1 for sub_batch"
+    def _generate_sub_batch(self, input_ids, attention_mask, max_new_tokens, max_latent_steps, temperature):
+        """Generate multiple completions for a batch of inputs in parallel."""
+        batch_size, seq_len = input_ids.shape
         device = input_ids.device
-        sequences = []
-        latent_steps_list = []
-        rank = self.accelerator.local_rank if hasattr(self, 'accelerator') else dist.get_rank()  # Fallback to dist.get_rank()
+        rank = dist.get_rank()
 
-        print(f"[rank {rank}] Starting _generate_sub_batch: input_ids.shape={input_ids.shape}, seq_len={seq_len}", flush=True)
+        print(f"[rank {rank}] Starting _generate_sub_batch: input_ids.shape={input_ids.shape}", flush=True)
         print_memory_usage(rank)
 
-        for gen_idx in range(generations_per_input):
-            print(f"[rank {rank}] Generating completion {gen_idx + 1}/{generations_per_input}", flush=True)
-            sequence = input_ids.clone().squeeze(0)  # [seq_len]
-            mode = "token"
-            latent_counter = 0
-            finished = False
-            self.last_hidden_states.append([])  # Per generation
-            self.last_logits.append([])  # Per generation
-            current_attention_mask = attention_mask.clone().squeeze(0)  # [seq_len]
-            print_memory_usage(rank)
+        # Initialize sequences with the prompts
+        sequences = input_ids.clone()
+        current_attention_mask = attention_mask.clone()
 
-            # Initial forward pass
-            print(f"[rank {rank}] Initial forward pass for prompt", flush=True)
-            outputs = self.base_causallm(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
+        # Initialize states
+        modes = torch.zeros(batch_size, device=device, dtype=torch.long)  # 0: token, 1: latent
+        finished = torch.zeros(batch_size, device=device, dtype=torch.bool)
+        latent_counters = torch.zeros(batch_size, device=device, dtype=torch.long)
+
+        # Initialize past_key_values for efficient generation
+        past_key_values = None
+
+        for step in range(max_new_tokens):
+            if finished.all():
+                break
+
+            # Identify active sequences
+            active_indices = ~finished
+
+            # Prepare embeddings for token mode sequences
+            token_mode_indices = (modes == 0) & active_indices
+            if token_mode_indices.any():
+                last_tokens = sequences[token_mode_indices, -1].unsqueeze(1)
+                token_embeds = self.embedding(last_tokens)
+            else:
+                token_embeds = torch.empty((0, 1, self.config.hidden_size), device=device)
+
+            # Prepare embeddings for latent mode sequences
+            latent_mode_indices = (modes == 1) & active_indices
+            if latent_mode_indices.any() and past_key_values is not None:
+                # Use last layer's value states
+                last_hidden_states = past_key_values[-1][1][-1, latent_mode_indices, :, -1, :]  # [num_latent_mode, num_heads, head_dim]
+                latent_embeds = last_hidden_states.mean(dim=1)  # [num_latent_mode, head_dim]
+                # Project to embedding space if dimensions don't match
+                if latent_embeds.size(-1) != self.config.hidden_size:
+                    latent_embeds = self.base_causallm.lm_head.weight.new_zeros(latent_embeds.size(0), self.config.hidden_size)
+            else:
+                latent_embeds = torch.empty((0, 1, self.config.hidden_size), device=device)
+
+            # Combine embeddings
+            input_embeds = torch.zeros((batch_size, 1, self.config.hidden_size), device=device)
+            if token_mode_indices.any():
+                input_embeds[token_mode_indices] = token_embeds
+            if latent_mode_indices.any():
+                input_embeds[latent_mode_indices] = latent_embeds.unsqueeze(1)
+
+            # Extend attention mask
+            current_attention_mask = torch.cat(
+                (current_attention_mask, torch.ones(batch_size, 1, device=device)),
+                dim=1
             )
-            last_hidden_state = outputs.hidden_states[-1][:, -1, :]
+
+            # Model forward pass
+            outputs = self.base_causallm(
+                inputs_embeds=input_embeds,
+                attention_mask=current_attention_mask,
+                past_key_values=past_key_values,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
             past_key_values = outputs.past_key_values
-            del outputs  # Free memory immediately
 
-            for step in range(max_new_tokens):
-                if finished:
-                    break
+            # Process token mode sequences
+            if token_mode_indices.any():
+                token_logits = logits[token_mode_indices] / temperature
+                probs = torch.softmax(token_logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.tensor([], device=device, dtype=torch.long)
 
-                if mode == "token":
-                    last_token = sequence[-1].unsqueeze(0).unsqueeze(0)  # [1,1]
-                    embed = self.embedding(last_token)
-                else:  # latent mode
-                    embed = last_hidden_state.unsqueeze(0)  # [1, embedding_dim]
-                    if torch.rand(1, device=device).item() < self.epsilon_explore:
-                        noise = torch.randn_like(embed) * self.noise_scale
-                        embed = embed + noise
+            # Process latent mode sequences
+            if latent_mode_indices.any():
+                latent_logits = logits[latent_mode_indices]
+                virtual_tokens = torch.argmax(latent_logits, dim=-1)
+            else:
+                virtual_tokens = torch.tensor([], device=device, dtype=torch.long)
 
-                input_embeds = embed  # [1,1,hidden_size]
+            # Update sequences
+            next_tokens_full = torch.full((batch_size,), self.tokenizer.pad_token_id, device=device)
+            if token_mode_indices.any():
+                next_tokens_full[token_mode_indices] = next_tokens
 
-                # Extend attention mask
-                current_attention_mask = torch.cat(
-                    (current_attention_mask, torch.ones(1, device=device)),
-                    dim=0
-                )
+            sequences = torch.cat((sequences, next_tokens_full.unsqueeze(1)), dim=1)
 
-                # Forward pass
-                outputs = self.base_causallm(
-                    inputs_embeds=input_embeds,
-                    attention_mask=current_attention_mask.unsqueeze(0),  # [1, seq_len + step + 1]
-                    past_key_values=past_key_values,
-                    output_hidden_states=True,
-                )
-                logits = outputs.logits[:, -1, :]  # [1, vocab_size]
-                last_hidden_state = outputs.hidden_states[-1][:, -1, :]
-                past_key_values = outputs.past_key_values
-                del outputs  # Free memory after extraction
-
-                if step == 0:
-                    # Force first token to be bot_token_id
-                    next_token = torch.tensor([self.bot_token_id], device=device)
-                else:
-                    if mode == "token":
-                        logits = logits / temperature
-                        probs = torch.softmax(logits, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            # Update states
+            for i in range(batch_size):
+                if finished[i]:
+                    continue
+                if modes[i] == 0:  # Token mode
+                    if next_tokens_full[i] == self.bot_token_id:
+                        modes[i] = 1
+                        latent_counters[i] = 0
+                    elif next_tokens_full[i] == self.eos_token_id:
+                        finished[i] = True
+                else:  # Latent mode
+                    if (latent_mode_indices.any() and virtual_tokens[latent_mode_indices][i] == self.eot_token_id) or \
+                       latent_counters[i] >= max_latent_steps:
+                        modes[i] = 0
+                        sequences[i, -1] = self.eot_token_id
                     else:
-                        virtual_token = torch.argmax(logits).item()
-                        if virtual_token == self.eot_token_id or latent_counter >= max_latent_steps:
-                            next_token = torch.tensor([self.eot_token_id], device=device)
-                            mode = "token"
-                        else:
-                            latent_counter += 1
-                            # Store hidden states selectively (e.g., every other step)
-                            if latent_counter % 2 == 0:
-                                self.last_hidden_states[-1].append(last_hidden_state.clone())
-                                self.last_logits[-1].append(logits.clone())
-                            continue
+                        latent_counters[i] += 1
 
-                sequence = torch.cat((sequence, next_token), dim=0)
-                if mode == "token":
-                    if next_token.item() == self.bot_token_id:
-                        mode = "latent"
-                        latent_counter = 0
-                    elif next_token.item() == self.eos_token_id:
-                        finished = True
+        # Collect results
+        final_sequences = []
+        final_latent_steps = []
+        for i in range(batch_size):
+            seq = sequences[i]
+            seq = seq[seq != self.tokenizer.pad_token_id]
+            final_sequences.append(seq)
+            final_latent_steps.append(latent_counters[i].item())
 
-            sequences.append(sequence)
-            latent_steps_list.append(latent_counter)
-            print(f"[rank {rank}] Completion {gen_idx + 1} finished: sequence.shape={sequence.shape}, latent_steps={latent_counter}", flush=True)
-            print_memory_usage(rank)
-
-            # Clear memory after each completion
-            del sequence, last_hidden_state, past_key_values
-            torch.cuda.empty_cache()
-
-        print(f"[rank {rank}] Finished _generate_sub_batch: {len(sequences)} sequences generated", flush=True)
+        print(f"[rank {rank}] Finished _generate_sub_batch: {len(final_sequences)} sequences generated", flush=True)
         print_memory_usage(rank)
 
         return {
-            'sequences': sequences,
-            'latent_steps': latent_steps_list
+            'sequences': final_sequences,
+            'latent_steps': final_latent_steps
         }
-
-def print_memory_usage(rank):
-    allocated = torch.cuda.memory_allocated(rank) / (1024 ** 3)  # in GB
-    reserved = torch.cuda.memory_reserved(rank) / (1024 ** 3)    # in GB
-    print(f"[rank {rank}] Memory Allocated: {allocated:.3f} GB, Reserved: {reserved:.3f} GB", flush=True)
