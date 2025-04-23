@@ -90,6 +90,8 @@ def main():
         print(f"Hidden states list length: {len(outputs.hidden_states_list)}")
         for i, hidden_state in enumerate(outputs.hidden_states_list):
             print(f"  Hidden state {i} shape: {hidden_state.shape}")
+    else:
+        print("No hidden states list returned.")
     
     # Test generation
     print("\nTesting generation...")
