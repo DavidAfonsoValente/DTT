@@ -18,6 +18,7 @@ class Outputs:
     logits: Optional[torch.Tensor] = None
     rewards: Optional[torch.Tensor] = None
     advantages: Optional[torch.Tensor] = None
+    hidden_states_list: Optional[List[torch.Tensor]] = None
 
 class DTT(nn.Module):
     """
@@ -129,7 +130,7 @@ class DTT(nn.Module):
         outputs = self.base_causallm(
             inputs_embeds=inputs_embeds[:, next_compute_range[0]:next_compute_range[1], :],
             attention_mask=attention_mask[:, :next_compute_range[1]],
-            position_ids=position_ids[:, next_compute_range[0]:next_compute_range[1]],
+            position_ids=position_ids[:, next_compute_range[0]:next_compute_range[1]] if position_ids is not None else None,
             past_key_values=past_key_values,
             output_hidden_states=True,
         )
@@ -137,10 +138,6 @@ class DTT(nn.Module):
         logits.append(outputs.logits)
         hidden_states = outputs.hidden_states[-1]
         hidden_states_list.append(hidden_states)
-        
-        # Cache key-values for efficiency
-        kv_cache = [(k.detach(), v.detach()) for k, v in outputs.past_key_values]
-        hidden_states_offset = 0
         
         # Process latent tokens
         for pass_idx in range(max_n_latents):
@@ -155,9 +152,6 @@ class DTT(nn.Module):
             
             if next_compute_range[0] == next_compute_range[1]:
                 break
-            
-            # Update hidden_states_offset
-            hidden_states_offset += outputs.past_key_values[0][0].shape[2] - kv_cache[0][0].shape[2]
             
             # Feedback the continuous thoughts to the input_embeds
             filling_indices = [
@@ -178,10 +172,9 @@ class DTT(nn.Module):
             # Replace latent tokens with continuous thoughts
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
-                # Replace with the preceding last hidden states
-                tensor_list[batch_idx][token_idx] = hidden_states[
-                    batch_idx, token_idx - 1 - hidden_states_offset, :
-                ]
+                # Use the last hidden state from the previous pass
+                # This ensures we're using a valid index
+                tensor_list[batch_idx][token_idx] = hidden_states[batch_idx, -1, :]
             
             # Reassemble the new inputs_embeds
             inputs_embeds = torch.stack(
@@ -195,18 +188,8 @@ class DTT(nn.Module):
             outputs = self.base_causallm(
                 inputs_embeds=inputs_embeds[:, next_compute_range[0]:next_compute_range[1], :],
                 attention_mask=attention_mask[:, :next_compute_range[1]],
-                position_ids=position_ids[:, next_compute_range[0]:next_compute_range[1]],
-                past_key_values=(
-                    [
-                        (
-                            k[:, :, :next_compute_range[0], :],
-                            v[:, :, :next_compute_range[0], :],
-                        )
-                        for k, v in kv_cache
-                    ]
-                    if kv_cache
-                    else None
-                ),
+                position_ids=position_ids[:, next_compute_range[0]:next_compute_range[1]] if position_ids is not None else None,
+                past_key_values=None,  # Don't use past key values to avoid indexing issues
                 output_hidden_states=True,
             )
             
@@ -214,31 +197,23 @@ class DTT(nn.Module):
             hidden_states = outputs.hidden_states[-1]
             hidden_states_list.append(hidden_states)
         
-        # Final pass
-        outputs = self.base_causallm(
-            inputs_embeds=inputs_embeds[:, next_compute_range[0]:next_compute_range[1], :],
-            attention_mask=attention_mask[:, :next_compute_range[1]],
-            position_ids=position_ids[:, next_compute_range[0]:next_compute_range[1]],
-            past_key_values=(
-                [
-                    (
-                        k[:, :, :next_compute_range[0], :],
-                        v[:, :, :next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
-                if kv_cache
-                else None
-            ),
-            output_hidden_states=True,
-        )
+        # Final pass for any remaining tokens
+        if next_compute_range[1] < seq_len:
+            outputs = self.base_causallm(
+                inputs_embeds=inputs_embeds[:, next_compute_range[1]:, :],
+                attention_mask=attention_mask[:, next_compute_range[1]:],
+                position_ids=position_ids[:, next_compute_range[1]:] if position_ids is not None else None,
+                past_key_values=None,
+                output_hidden_states=True,
+            )
+            
+            logits.append(outputs.logits)
+            hidden_states_list.append(outputs.hidden_states[-1])
         
-        logits.append(outputs.logits)
-        hidden_states_list.append(outputs.hidden_states[-1])
         self.gen_forward_cnt += max_n_latents + 1
         
         # Concatenate logits
-        logits = torch.cat(logits, dim=-2)
+        logits = torch.cat(logits, dim=1)
         
         # Compute loss if labels are provided
         loss = None
@@ -265,7 +240,8 @@ class DTT(nn.Module):
             inputs_embeds=inputs_embeds,
             logits=logits,
             rewards=rewards,
-            advantages=advantages
+            advantages=advantages,
+            hidden_states_list=hidden_states_list
         )
     
     def _compute_rewards(self, hidden_states_list, logits, labels):
@@ -295,8 +271,8 @@ class DTT(nn.Module):
                 h1 = hidden_states_list[i]
                 h2 = hidden_states_list[i + 1]
                 # Compute cosine similarity between consecutive hidden states
-                h1_norm = h1 / h1.norm(dim=-1, keepdim=True)
-                h2_norm = h2 / h2.norm(dim=-1, keepdim=True)
+                h1_norm = h1 / (h1.norm(dim=-1, keepdim=True) + 1e-8)  # Add epsilon to avoid division by zero
+                h2_norm = h2 / (h2.norm(dim=-1, keepdim=True) + 1e-8)
                 cos_sim = (h1_norm * h2_norm).sum(dim=-1).mean(dim=-1)
                 lcr_rewards += cos_sim
             lcr_rewards = lcr_rewards / (len(hidden_states_list) - 1)
@@ -363,7 +339,7 @@ class DTT(nn.Module):
         
         outputs = self.forward(
             input_ids,
-            torch.ones_like(input_ids, device=input_ids.device),
+            attention_mask,
             labels,
             torch.arange(
                 0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
