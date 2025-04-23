@@ -175,14 +175,13 @@ class DTT(nn.Module):
                 for batch_idx in range(inputs_embeds.shape[0])
             ]
             
+            # Replace latent tokens with continuous thoughts
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
-                # Calculate the local index for the position before the latent token
-                local_idx = token_idx - next_compute_range[0] - 1
-                # Ensure the local index is valid (should be >= 0)
-                assert local_idx >= 0, f"Invalid local index {local_idx} for token_idx {token_idx}, range {next_compute_range}"
-                # Use hidden state from the position before the latent token
-                tensor_list[batch_idx][token_idx] = hidden_states[batch_idx, local_idx, :]
+                # Replace with the preceding last hidden states
+                tensor_list[batch_idx][token_idx] = hidden_states[
+                    batch_idx, token_idx - 1 - hidden_states_offset, :
+                ]
             
             # Reassemble the new inputs_embeds
             inputs_embeds = torch.stack(
