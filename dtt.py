@@ -179,9 +179,7 @@ class DTT(nn.Module):
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
                 # Replace with the preceding last hidden states
-                tensor_list[batch_idx][token_idx] = hidden_states[
-                    batch_idx, token_idx - 1 - hidden_states_offset, :
-                ]
+                tensor_list[batch_idx][token_idx] = hidden_states[batch_idx, -1, :]
             
             # Reassemble the new inputs_embeds
             inputs_embeds = torch.stack(
