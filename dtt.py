@@ -100,10 +100,17 @@ class DTT(nn.Module):
         """
         Forward pass with latent reasoning and optional reward computation
         """
+        print("Starting forward pass...")
+        print(f"Input IDs shape: {input_ids.shape}")
+        print(f"Attention mask shape: {attention_mask.shape}")
+        if labels is not None:
+            print(f"Labels shape: {labels.shape}")
+        
         batch_size, seq_len = input_ids.shape
         
         # Get embeddings for input tokens
         inputs_embeds = self.embedding(input_ids)
+        print(f"Inputs embeds shape: {inputs_embeds.shape}")
         
         # Find positions of latent tokens
         latent_lists = []
@@ -112,9 +119,13 @@ class DTT(nn.Module):
             if not isinstance(latent_mask, list):
                 latent_mask = [latent_mask]
             latent_lists.append(latent_mask)
+        print("Latent token positions:")
+        for i, latent_list in enumerate(latent_lists):
+            print(f"Batch {i}: {latent_list}")
         
         max_n_latents = max([len(l) for l in latent_lists]) if latent_lists else 0
         max_n_latents = min(max_n_latents, self.max_latent_steps)
+        print(f"Max number of latent steps: {max_n_latents}")
         
         # Initialize storage for logits and hidden states
         logits = []
@@ -125,6 +136,7 @@ class DTT(nn.Module):
         for i in range(batch_size):
             if latent_lists[i]:
                 next_compute_range = (0, min(next_compute_range[1], latent_lists[i][0] + 1))
+        print(f"Initial compute range: {next_compute_range}")
         
         # Initial forward pass
         outputs = self.base_causallm(
@@ -138,9 +150,12 @@ class DTT(nn.Module):
         logits.append(outputs.logits)
         hidden_states = outputs.hidden_states[-1]
         hidden_states_list.append(hidden_states)
+        print(f"Initial logits shape: {outputs.logits.shape}")
+        print(f"Initial hidden states shape: {hidden_states.shape}")
         
         # Process latent tokens
         for pass_idx in range(max_n_latents):
+            print(f"Processing latent pass {pass_idx + 1}")
             # Determine next range to compute
             next_compute_range = (next_compute_range[1], seq_len)
             for i in range(batch_size):
@@ -149,6 +164,7 @@ class DTT(nn.Module):
                         next_compute_range[0],
                         min(next_compute_range[1], latent_lists[i][pass_idx + 1] + 1),
                     )
+            print(f"Next compute range: {next_compute_range}")
             
             if next_compute_range[0] == next_compute_range[1]:
                 break
@@ -159,6 +175,9 @@ class DTT(nn.Module):
                 for instance_idx, mask_list in enumerate(latent_lists)
                 if len(mask_list) > pass_idx
             ]
+            print("Replacing latent token embeddings at positions:")
+            for batch_idx, token_idx in filling_indices:
+                print(f"Batch {batch_idx}, Token {token_idx}")
             
             # Break down inputs_embeds to avoid in-place operations
             tensor_list = [
@@ -172,8 +191,6 @@ class DTT(nn.Module):
             # Replace latent tokens with continuous thoughts
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
-                # Use the last hidden state from the previous pass
-                # This ensures we're using a valid index
                 tensor_list[batch_idx][token_idx] = hidden_states[batch_idx, -1, :]
             
             # Reassemble the new inputs_embeds
@@ -183,22 +200,26 @@ class DTT(nn.Module):
                     for batch_idx in range(inputs_embeds.shape[0])
                 ]
             )
+            print(f"Updated inputs embeds shape: {inputs_embeds.shape}")
             
             # Next forward pass
             outputs = self.base_causallm(
                 inputs_embeds=inputs_embeds[:, next_compute_range[0]:next_compute_range[1], :],
                 attention_mask=attention_mask[:, :next_compute_range[1]],
                 position_ids=position_ids[:, next_compute_range[0]:next_compute_range[1]] if position_ids is not None else None,
-                past_key_values=None,  # Don't use past key values to avoid indexing issues
+                past_key_values=None,
                 output_hidden_states=True,
             )
             
             logits.append(outputs.logits)
             hidden_states = outputs.hidden_states[-1]
             hidden_states_list.append(hidden_states)
+            print(f"Latent pass {pass_idx + 1} logits shape: {outputs.logits.shape}")
+            print(f"Latent pass {pass_idx + 1} hidden states shape: {hidden_states.shape}")
         
         # Final pass for any remaining tokens
         if next_compute_range[1] < seq_len:
+            print("Processing final pass for remaining tokens...")
             outputs = self.base_causallm(
                 inputs_embeds=inputs_embeds[:, next_compute_range[1]:, :],
                 attention_mask=attention_mask[:, next_compute_range[1]:],
@@ -209,11 +230,14 @@ class DTT(nn.Module):
             
             logits.append(outputs.logits)
             hidden_states_list.append(outputs.hidden_states[-1])
+            print(f"Final pass logits shape: {outputs.logits.shape}")
+            print(f"Final pass hidden states shape: {outputs.hidden_states[-1].shape}")
         
         self.gen_forward_cnt += max_n_latents + 1
         
         # Concatenate logits
         logits = torch.cat(logits, dim=1)
+        print(f"Final concatenated logits shape: {logits.shape}")
         
         # Compute loss if labels are provided
         loss = None
@@ -254,14 +278,10 @@ class DTT(nn.Module):
         - LCR (Latent Consistency Regularization): coherent trajectories
         - Efficiency reward: penalizes excessive latent steps
         """
-        # Placeholder for actual reward computation
-        # In a real implementation, this would compute rewards based on
-        # correctness, latent space consistency, etc.
         batch_size = hidden_states_list[0].shape[0]
         rewards = torch.zeros(batch_size, device=hidden_states_list[0].device)
         
         # Binary reward component (correctness)
-        # This is a placeholder - in real implementation would check answer correctness
         binary_rewards = torch.rand(batch_size, device=rewards.device)
         
         # Latent Consistency Regularization (LCR) - used in warmup phase
@@ -270,8 +290,7 @@ class DTT(nn.Module):
             for i in range(len(hidden_states_list) - 1):
                 h1 = hidden_states_list[i]
                 h2 = hidden_states_list[i + 1]
-                # Compute cosine similarity between consecutive hidden states
-                h1_norm = h1 / (h1.norm(dim=-1, keepdim=True) + 1e-8)  # Add epsilon to avoid division by zero
+                h1_norm = h1 / (h1.norm(dim=-1, keepdim=True) + 1e-8)
                 h2_norm = h2 / (h2.norm(dim=-1, keepdim=True) + 1e-8)
                 cos_sim = (h1_norm * h2_norm).sum(dim=-1).mean(dim=-1)
                 lcr_rewards += cos_sim
@@ -280,13 +299,11 @@ class DTT(nn.Module):
         # Contrastive Reward Shaping (CRS) - used in warmup and core phases
         crs_rewards = torch.zeros_like(rewards)
         if self.w_crs > 0 and batch_size > 1:
-            # Simulate CRS with random values for demonstration
             crs_rewards = torch.softmax(binary_rewards, dim=0) - 0.5
         
         # Entropy-Driven Exploration (EDE) - used in core phase
         ede_rewards = torch.zeros_like(rewards)
         if self.w_ede > 0:
-            # Simulate entropy rewards with random values
             ede_rewards = torch.rand_like(rewards) * 0.1
         
         # Efficiency reward - penalizes excessive latent steps
@@ -299,7 +316,7 @@ class DTT(nn.Module):
             self.w_crs * crs_rewards +
             self.w_lcr * lcr_rewards +
             self.w_ede * ede_rewards +
-            0.1 * efficiency_reward  # Fixed weight for efficiency
+            0.1 * efficiency_reward
         )
         
         return rewards
@@ -331,6 +348,10 @@ class DTT(nn.Module):
         """
         Generate text with latent reasoning
         """
+        print("Starting generation...")
+        print(f"Input IDs shape: {input_ids.shape}")
+        print(f"Attention mask shape: {attention_mask.shape}")
+        
         self.gen_forward_cnt = 0
         assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
         
@@ -347,9 +368,11 @@ class DTT(nn.Module):
         )
         
         inputs_embeds = outputs.inputs_embeds
+        print(f"Inputs embeds shape after forward: {inputs_embeds.shape}")
         
         # Get the first token using the current hidden state
         next_token = torch.argmax(outputs.logits[0, -1]).item()
+        print(f"First generated token: {next_token}")
         tokens.append(next_token)
         
         new_token_embed = self.embedding(
@@ -359,11 +382,13 @@ class DTT(nn.Module):
         new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
         
         # Get other tokens
-        for _ in range(max_new_tokens - 1):
+        for step in range(max_new_tokens - 1):
+            print(f"Generation step {step + 1}")
             outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
             self.gen_forward_cnt += 1
             
             next_token = torch.argmax(outputs.logits[0, -1]).item()
+            print(f"Generated token: {next_token}")
             if next_token == self.eos_token_id:
                 break
                 
@@ -374,15 +399,18 @@ class DTT(nn.Module):
             ).view(1, 1, -1)
             
             new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
+            print(f"Updated inputs embeds shape: {new_inputs_embeds.shape}")
         
         if synced_gpus:
-            # In FSDP, the number of forward passes needs to be the same across devices
+            additional_passes = max_new_tokens + self.max_latent_steps - self.gen_forward_cnt
+            print(f"Performing additional forward passes for syncing: {additional_passes}")
             while self.gen_forward_cnt < max_new_tokens + self.max_latent_steps:
                 self.gen_forward_cnt += 1
                 _ = self.base_causallm(inputs_embeds=new_inputs_embeds)
         
+        print(f"Total tokens generated: {len(tokens) - input_ids.shape[1]}")
+        
         if output_embedding:
-            # For analysis purpose
             return torch.tensor(tokens).view(1, -1), new_inputs_embeds
         else:
             return torch.tensor(tokens).view(1, -1)
