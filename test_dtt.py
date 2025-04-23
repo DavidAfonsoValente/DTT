@@ -86,6 +86,10 @@ def main():
         print(f"Rewards: {outputs.rewards.item()}")
     if outputs.advantages is not None:
         print(f"Advantages: {outputs.advantages.item()}")
+    if outputs.hidden_states_list is not None:
+        print(f"Hidden states list length: {len(outputs.hidden_states_list)}")
+        for i, hidden_state in enumerate(outputs.hidden_states_list):
+            print(f"  Hidden state {i} shape: {hidden_state.shape}")
     
     # Test generation
     print("\nTesting generation...")
