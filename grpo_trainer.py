@@ -1,8 +1,7 @@
 """
-GRPO Trainer for Dynamic Thinking Tokens (DTT) Framework
+GRPO Trainer for DTT - grpo_trainer.py
 
-This module implements the Group Relative Policy Optimization (GRPO) training
-approach for the DTT framework, extending Coconut with reinforcement learning.
+This module implements the Group Relative Policy Optimization (GRPO) training approach for DTT.
 """
 
 import torch
@@ -25,8 +24,6 @@ from typing import Optional, List, Dict, Any, Union, Tuple
 class GRPOTrainer:
     """
     Group Relative Policy Optimization Trainer for DTT
-    
-    Implements the GRPO algorithm for training DTT models with reinforcement learning.
     """
     
     def __init__(
@@ -40,19 +37,6 @@ class GRPOTrainer:
         rank=0,
         world_size=1,
     ):
-        """
-        Initialize the GRPO trainer
-        
-        Args:
-            model: The DTT model to train
-            ref_model: Reference model for KL penalty calculation
-            optimizer: Optimizer for model updates
-            tokenizer: Tokenizer for processing text
-            configs: Configuration parameters
-            device: Device to run training on
-            rank: Process rank for distributed training
-            world_size: Total number of processes for distributed training
-        """
         self.model = model
         self.ref_model = ref_model
         self.optimizer = optimizer
@@ -62,21 +46,17 @@ class GRPOTrainer:
         self.rank = rank
         self.world_size = world_size
         
-        # GRPO hyperparameters
         self.kl_coef = configs.kl_coef if hasattr(configs, 'kl_coef') else 0.04
         self.clip_range = configs.clip_range if hasattr(configs, 'clip_range') else 0.2
         self.group_size = configs.group_size if hasattr(configs, 'group_size') else 8
         
-        # Training state
         self.total_steps = 0
         self.best_reward = float('-inf')
         
-        # Phase management
         self.total_training_steps = configs.num_epochs * configs.steps_per_epoch
         self.warmup_steps = int(0.2 * self.total_training_steps)
         self.core_steps = int(0.7 * self.total_training_steps)
         
-        # Set initial phase
         self._update_phase(0)
     
     def _update_phase(self, step):
@@ -85,7 +65,6 @@ class GRPOTrainer:
             phase = "warmup"
         elif step < self.warmup_steps + self.core_steps:
             phase = "core"
-            # Calculate progress within core phase for annealing
             core_progress = (step - self.warmup_steps) / self.core_steps
             self.model.module.set_phase(phase, core_progress, 1.0)
             return
@@ -96,23 +75,18 @@ class GRPOTrainer:
     
     def train_step(self, batch, grad_accumulation_steps=1):
         """
-        Perform a single GRPO training step
-        
-        Args:
-            batch: Batch of data containing multiple groups
-            grad_accumulation_steps: Number of steps to accumulate gradients
-            
-        Returns:
-            dict: Training metrics
+        Perform a single GRPO training step with generation
         """
         self.model.train()
         self.ref_model.eval()
         
-        # Update phase based on current step
         self._update_phase(self.total_steps)
         
-        # Process batch into groups
-        groups = self._prepare_groups(batch)
+        input_ids = batch['input_ids'].to(self.device)
+        attention_masks = batch['attention_mask'].to(self.device)
+        answers = batch['answer']
+        batch_size = input_ids.shape[0]
+        
         total_loss = 0
         metrics = {
             'loss': 0,
@@ -122,48 +96,43 @@ class GRPOTrainer:
             'advantage': 0,
         }
         
-        # Process each group
-        for group_idx, group in enumerate(groups):
-            # Forward pass with reward computation
-            outputs = self.model(
-                **group,
-                compute_rewards=True,
+        for i in range(batch_size):
+            # Repeat input for group_size sequences
+            group_input_ids = input_ids[i:i+1].repeat(self.group_size, 1)
+            group_attention_masks = attention_masks[i:i+1].repeat(self.group_size, 1)
+            answer = answers[i]
+            
+            # Generate multiple sequences
+            generated_sequences, log_probs = self.model.module.generate_with_log_probs(
+                input_ids=group_input_ids,
+                attention_mask=group_attention_masks,
+                max_new_tokens=64,
+                num_latent_steps=self.model.module.max_latent_steps
             )
             
-            rewards = outputs.rewards
-            advantages = outputs.advantages
+            # Compute rewards
+            rewards = self._compute_rewards_from_outputs(generated_sequences, answer)
+            advantages = self._compute_advantages(rewards)
             
-            # Get log probs from current policy
-            logits = outputs.logits
-            log_probs = self._get_log_probs(logits, group['labels'])
-            
-            # Get log probs from reference policy
+            # Compute reference log probs
             with torch.no_grad():
-                ref_outputs = self.ref_model(**group)
-                ref_logits = ref_outputs.logits
-                ref_log_probs = self._get_log_probs(ref_logits, group['labels'])
+                ref_log_probs = self.ref_model.module.compute_log_probs(
+                    group_input_ids,
+                    generated_sequences[:, input_ids.shape[1]:]
+                )
             
-            # Calculate policy ratio and clipped objective
-            ratio = torch.exp(log_probs - ref_log_probs)
-            policy_loss_1 = ratio * advantages.unsqueeze(-1)
-            policy_loss_2 = torch.clamp(
-                ratio,
-                1.0 - self.clip_range,
-                1.0 + self.clip_range
-            ) * advantages.unsqueeze(-1)
+            # Policy loss
+            ratio = torch.exp(log_probs.sum(dim=1) - ref_log_probs.sum(dim=1))
+            policy_loss_1 = ratio * advantages
+            policy_loss_2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * advantages
             policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
             
-            # Calculate KL divergence for penalty
-            kl = (ref_log_probs - log_probs).mean()
-            
-            # Combined loss
+            kl = (log_probs.sum(dim=1) - ref_log_probs.sum(dim=1)).mean()
             loss = policy_loss + self.kl_coef * kl
             loss = loss / grad_accumulation_steps
             
-            # Backward pass
             loss.backward()
             
-            # Update metrics
             total_loss += loss.item() * grad_accumulation_steps
             metrics['loss'] += loss.item() * grad_accumulation_steps
             metrics['kl'] += kl.item()
@@ -171,138 +140,68 @@ class GRPOTrainer:
             metrics['policy_ratio'] += ratio.mean().item()
             metrics['advantage'] += advantages.mean().item()
         
-        # Average metrics across groups
         for k in metrics:
-            metrics[k] /= len(groups)
+            metrics[k] /= batch_size
         
         self.total_steps += 1
         return metrics
     
-    def _prepare_groups(self, batch):
+    def _compute_rewards_from_outputs(self, generated_sequences, ground_truth_answer):
         """
-        Prepare batch data into groups for GRPO
-        
-        Args:
-            batch: Batch of data
-            
-        Returns:
-            list: List of group data dictionaries
+        Compute rewards based on generated outputs vs ground truth
         """
-        # This is a simplified implementation
-        # In practice, you would create multiple variations/samples for each input
-        
-        batch_size = batch['input_ids'].shape[0]
-        groups = []
-        
-        # Split batch into groups
-        for i in range(0, batch_size, self.group_size):
-            end_idx = min(i + self.group_size, batch_size)
-            group = {
-                'input_ids': batch['input_ids'][i:end_idx].to(self.device),
-                'attention_mask': batch['attention_mask'][i:end_idx].to(self.device),
-                'labels': batch['labels'][i:end_idx].to(self.device),
-                'position_ids': batch['position_ids'][i:end_idx].to(self.device) if 'position_ids' in batch else None,
-            }
-            groups.append(group)
-        
-        return groups
+        rewards = []
+        for seq in generated_sequences:
+            generated_text = self.tokenizer.decode(seq, skip_special_tokens=True)
+            if '<|end-latent|>' in generated_text:
+                answer_part = generated_text.split('<|end-latent|>')[1].strip()
+                reward = 1 if answer_part == ground_truth_answer else 0
+            else:
+                reward = 0
+            rewards.append(reward)
+        return torch.tensor(rewards, device=self.device)
     
-    def _get_log_probs(self, logits, labels):
-        """
-        Calculate log probabilities from logits and labels
-        
-        Args:
-            logits: Model logits
-            labels: Target labels
-            
-        Returns:
-            torch.Tensor: Log probabilities
-        """
-        # Shift logits and labels for next-token prediction
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        
-        # Calculate log probabilities
-        log_probs = F.log_softmax(shift_logits, dim=-1)
-        
-        # Gather the log probs at the positions of the labels
-        label_mask = (shift_labels >= 0).float()
-        gathered_log_probs = torch.gather(
-            log_probs,
-            dim=-1,
-            index=torch.clamp(shift_labels, min=0).unsqueeze(-1)
-        ).squeeze(-1)
-        
-        # Apply mask for padding tokens
-        masked_log_probs = gathered_log_probs * label_mask
-        
-        # Sum log probs over sequence dimension
-        seq_lengths = label_mask.sum(dim=-1, keepdim=True)
-        seq_lengths = torch.clamp(seq_lengths, min=1.0)  # Avoid division by zero
-        
-        # Average log probs over sequence length
-        token_log_probs = masked_log_probs.sum(dim=-1, keepdim=True) / seq_lengths
-        
-        return token_log_probs
+    def _compute_advantages(self, rewards):
+        mean_reward = rewards.mean()
+        std_reward = rewards.std() + 1e-8
+        advantages = (rewards - mean_reward) / std_reward
+        return advantages
     
     def evaluate(self, eval_dataloader):
         """
         Evaluate the model on validation data
-        
-        Args:
-            eval_dataloader: DataLoader for evaluation data
-            
-        Returns:
-            dict: Evaluation metrics
         """
         self.model.eval()
-        total_loss = 0
         total_reward = 0
-        num_batches = 0
+        num_samples = 0
         
         with torch.no_grad():
             for batch in eval_dataloader:
-                # Move batch to device
                 batch = {k: v.to(self.device) for k, v in batch.items() if k != 'idx'}
+                input_ids = batch['input_ids']
+                attention_masks = batch['attention_mask']
+                answers = batch['answer']
+                batch_size = input_ids.shape[0]
                 
-                # Forward pass with reward computation
-                outputs = self.model(
-                    **batch,
-                    compute_rewards=True,
-                )
-                
-                loss = outputs.loss
-                rewards = outputs.rewards
-                
-                # Gather metrics across distributed processes
-                if self.world_size > 1:
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(rewards.mean(), op=dist.ReduceOp.SUM)
-                    loss = loss / self.world_size
-                    rewards = rewards / self.world_size
-                
-                total_loss += loss.item()
-                total_reward += rewards.mean().item()
-                num_batches += 1
+                for i in range(batch_size):
+                    gen_ids = self.model.module.generate(
+                        input_ids=input_ids[i:i+1],
+                        attention_mask=attention_masks[i:i+1],
+                        max_new_tokens=64,
+                        num_latent_steps=self.model.module.max_latent_steps
+                    )
+                    rewards = self._compute_rewards_from_outputs(gen_ids, answers[i])
+                    total_reward += rewards.mean().item()
+                    num_samples += 1
         
         metrics = {
-            'eval_loss': total_loss / num_batches,
-            'eval_reward': total_reward / num_batches,
+            'eval_reward': total_reward / num_samples if num_samples > 0 else 0,
         }
         
         return metrics
     
     def save_checkpoint(self, path, epoch, metrics=None):
-        """
-        Save model checkpoint
-        
-        Args:
-            path: Path to save checkpoint
-            epoch: Current epoch
-            metrics: Optional evaluation metrics
-        """
         if self.rank == 0:
-            # Only save from rank 0 in distributed training
             checkpoint = {
                 'model': self.model.module.state_dict(),
                 'optimizer': self.optimizer.state_dict(),
@@ -315,15 +214,6 @@ class GRPOTrainer:
             print(f"Checkpoint saved to {path}")
     
     def load_checkpoint(self, path):
-        """
-        Load model checkpoint
-        
-        Args:
-            path: Path to checkpoint
-            
-        Returns:
-            int: Last completed epoch
-        """
         if not os.path.exists(path):
             return 0
         
@@ -332,7 +222,6 @@ class GRPOTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.total_steps = checkpoint['total_steps']
         
-        # Update phase based on loaded step count
         self._update_phase(self.total_steps)
         
         return checkpoint['epoch']
