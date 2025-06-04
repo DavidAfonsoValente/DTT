@@ -1,0 +1,7 @@
+dataset: "prontoqa"
+data_dir: "./data"
+checkpoint_path: "./experiments/gpt2-prontoqa"
+lora_rank: 32
+batch_size: 8
+max_length: 2048
+gate_temperature: 1.0
