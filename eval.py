@@ -1,156 +1,159 @@
 import os
-import yaml
 import torch
+import yaml
+import pandas as pd
 import wandb
-from datasets import load_dataset
-from model import SparseGatedModel, gumbel_sigmoid
-from utils import preprocess_dataset, process_answer
+from transformers import GenerationConfig
+from torch.utils.data import DataLoader
 
-def evaluate(config_path):
-    """Evaluate the trained model with enhanced metrics."""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+from model import SparseGatedModel
+from utils import preprocess_dataset
 
-    checkpoint_path = config["checkpoint_path"]
-    wandb.init(project="latent-reasoning", name=f"eval-{os.path.basename(checkpoint_path)}", config=config)
-    wandb.save(config_path)
+@torch.no_grad()
+def generate_for_evaluation(model, input_ids_b, attention_mask_b, max_gen_len, gen_config, eval_gumbel_hard):
+    model.eval()
+    batch_size = input_ids_b.shape[0]
+    device = model.device
+    
+    generated_ids = input_ids_b.clone()
+    current_attention_mask = attention_mask_b.clone()
+    all_gates = [[] for _ in range(batch_size)]
+    
+    initial_outputs, h_t_prompt = model(
+        input_ids=input_ids_b, attention_mask=current_attention_mask, use_cache=True,
+        gumbel_hard_during_forward=eval_gumbel_hard
+    )
+    past_key_values = initial_outputs.past_key_values
+    prev_h = h_t_prompt[:, -1:, :]
+    next_token_logits = initial_outputs.logits[:, -1, :]
+
+    for _ in range(max_gen_len):
+        if gen_config.do_sample:
+            probs = torch.softmax(next_token_logits / gen_config.temperature, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)
+        else:
+            next_tokens = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+        
+        generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
+        current_attention_mask = torch.cat([current_attention_mask, torch.ones_like(next_tokens, device=device)], dim=1)
+
+        if (gen_config.eos_token_id is not None) and (next_tokens.squeeze(-1) == gen_config.eos_token_id).all():
+            break
+
+        outputs_step, h_t_step = model(
+            input_ids=next_tokens, attention_mask=current_attention_mask, past_key_values=past_key_values,
+            prev_step_last_hidden_state=prev_h, use_cache=True,
+            gumbel_hard_during_forward=eval_gumbel_hard
+        )
+        
+        step_gates = model.current_gate_values_for_batch.squeeze()
+        for i in range(batch_size):
+            all_gates[i].append(step_gates[i].item() if batch_size > 1 else step_gates.item())
+
+        past_key_values = outputs_step.past_key_values
+        prev_h = h_t_step
+        next_token_logits = outputs_step.logits[:, -1, :]
+        
+    return generated_ids, all_gates
+
+def _collate_fn_eval(batch, tokenizer):
+    input_ids = [torch.tensor(item['input_ids']) for item in batch]
+    attn_mask = [torch.tensor(item['attention_mask']) for item in batch]
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
+    attn_mask_padded = torch.nn.utils.rnn.pad_sequence(attn_mask, batch_first=True, padding_value=0)
+    gts = [item['ground_truths'] for item in batch]
+    return {"input_ids": input_ids_padded, "attention_mask": attn_mask_padded, "ground_truths": gts}
+
+def evaluate_model(eval_config_path):
+    with open(eval_config_path, 'r') as f: config = yaml.safe_load(f)
+
+    model_path = config["model_checkpoint_path"]
+    eval_dir = config.get("eval_output_dir", os.path.join(model_path, "evaluation"))
+    os.makedirs(eval_dir, exist_ok=True)
+
+    exp_name = f"eval-{os.path.basename(model_path.rstrip('/'))}-{config['dataset_name']}"
+    wandb.init(project=config.get("wandb_project_eval", "dtt-eval"), name=exp_name, config=config)
 
     model = SparseGatedModel(
-        model_name="gpt2",
-        hidden_size=768,
-        embedding_dim=768,
-        lora_rank=config["lora_rank"],
-        temperature=config["gate_temperature"]
+        model_name=config["base_model_name_for_eval"],
+        max_seq_length=config["max_prompt_length"] + config["max_completion_length"],
+        hidden_size=config["hidden_size"], embedding_dim=config["embedding_dim"],
+        lora_rank=config["lora_rank"], gate_temperature=config["eval_gate_temperature"],
+        load_in_4bit=config.get("load_in_4bit_eval", True),
+        lora_target_modules=config.get("lora_target_modules_eval")
     )
-    model.load_state_dict(torch.load(os.path.join(checkpoint_path, "pytorch_model.bin")))
-    tokenizer = FastLanguageModel.from_pretrained("gpt2").tokenizer
-    tokenizer.add_special_tokens({'additional_special_tokens': ['[bot]', '[eot]']})
-    model.eval()
+    model.model.load_adapter(model_path)
+    tokenizer = model.tokenizer
 
-    dataset = preprocess_dataset(config["dataset"], config["data_dir"], "test")
-    
-    correct = 0
-    total_latent_steps = 0
-    total = 0
-    avg_gate_inside = 0.0
-    avg_gate_outside = 0.0
-    total_inside = 0
-    total_outside = 0
-    hidden_states_all = []
-    gate_values_all = []
-    reasoning_lengths = []
-    gate_values_flat = []
+    special_tokens = {'additional_special_tokens': ['[bot]', '[eot]']}
+    if tokenizer.add_special_tokens(special_tokens) > 0:
+        model.model.resize_token_embeddings(len(tokenizer))
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
-    # Per-example metrics table
-    eval_table = wandb.Table(columns=["question", "generated", "answer", "ground_truth", "is_correct", "latent_steps", "gate_inside", "gate_outside"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device)
 
-    for i in range(0, len(dataset), config["batch_size"]):
-        batch = dataset[i:i + config["batch_size"]]
-        input_ids = tokenizer(batch['question'], return_tensors="pt", padding=True).input_ids.to(model.device)
-        attention_mask = tokenizer(batch['question'], return_tensors="pt", padding=True).attention_mask.to(model.device)
-        prompt_len = input_ids.shape[1]
+    eval_dataset = preprocess_dataset(
+        config["dataset_name"], config["data_dir"], tokenizer,
+        config["max_prompt_length"], config.get("dataset_split_eval", "test")
+    )
+    eval_loader = DataLoader(eval_dataset, batch_size=config["eval_batch_size"], collate_fn=lambda b: _collate_fn_eval(b, tokenizer))
 
-        try:
-            outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=config["max_length"],
-                output_hidden_states=True,
-                return_dict_in_generate=True
-            )
-        except Exception as e:
-            print(f"Generation failed for batch {i}: {e}")
-            continue
+    gen_config = GenerationConfig(
+        max_new_tokens=config["max_completion_length"], temperature=config["sampling_temperature_eval"],
+        do_sample=config["sampling_temperature_eval"] > 0, pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
 
-        sequences = outputs.sequences
-        hidden_states = outputs.hidden_states
-        seq_len = sequences.shape[1] - prompt_len
+    results, total_correct = [], 0
+    bot_id, eot_id = tokenizer.convert_tokens_to_ids(["[bot]", "[eot]"])
 
-        gate_values_batch = []
-        for step in range(seq_len):
-            hs = hidden_states[step][-1][:, -1, :]
-            gate_logits = model.gate_linear(hs)
-            gate_val = gumbel_sigmoid(gate_logits, model.temperature, hard=False)
-            gate_values_batch.append(gate_val.squeeze(-1))
+    for batch in eval_loader:
+        ids_b, mask_b, gts_b = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["ground_truths"]
+        p_len = ids_b.shape[1]
+        gen_ids, gen_gates = generate_for_evaluation(model, ids_b, mask_b, config["max_completion_length"], gen_config, config.get("eval_gumbel_hard", True))
 
-        gate_values_list = [torch.stack([gate_values_batch[t][i] for t in range(seq_len)]).tolist() for i in range(sequences.shape[0])]
+        for i in range(gen_ids.shape[0]):
+            full_ids, gates = gen_ids[i].tolist(), gen_gates[i]
+            t = torch.tensor(full_ids); b_idxs, e_idxs = (t[p_len:]==bot_id).nonzero()+p_len, (t[p_len:]==eot_id).nonzero()+p_len
+            b_idx, e_idx = -1, -1
+            for b in b_idxs:
+                for e in e_idxs:
+                    if e > b: b_idx, e_idx = b.item(), e.item(); break
+                if b_idx != -1: break
+            
+            r_txt, pred_txt, correct = "", "", 0.0
+            if b_idx != -1:
+                r_txt = tokenizer.decode(full_ids[b_idx+1:e_idx], skip_special_tokens=True).strip()
+                pred_txt = tokenizer.decode(full_ids[e_idx+1:], skip_special_tokens=True).strip()
+                if pred_txt == gts_b[i].strip(): correct = 1.0
+            total_correct += correct
 
-        hidden_states_all.extend([hs.cpu() for hs in hidden_states])
-        gate_values_all.extend(gate_values_list)
-
-        for j, gen_ids in enumerate(sequences):
-            gen_text = tokenizer.decode(gen_ids, skip_special_tokens=False)
-            bot_token_id = tokenizer.convert_tokens_to_ids("[bot]")
-            eot_token_id = tokenizer.convert_tokens_to_ids("[eot]")
-            try:
-                bot_idx = gen_ids.tolist().index(bot_token_id)
-                eot_idx = gen_ids.tolist().index(eot_token_id, bot_idx + 1)
-                latent_steps = eot_idx - bot_idx - 1
-                answer_text = tokenizer.decode(gen_ids[eot_idx + 1:], skip_special_tokens=True).strip()
-                is_correct = process_answer(answer_text, batch['answer'][j], config["dataset"])
-                if is_correct:
-                    correct += 1
-                total_latent_steps += latent_steps
-                reasoning_lengths.append(latent_steps)
-                total += 1
-
-                gate_values = gate_values_list[j]
-                gate_inside = 0.0
-                gate_outside = 0.0
-                count_inside = 0
-                count_outside = 0
-                for k in range(prompt_len, len(gen_ids)):
-                    gate_val = gate_values[k - prompt_len]
-                    gate_values_flat.append(gate_val)
-                    if bot_idx < k <= eot_idx:
-                        gate_inside += gate_val
-                        count_inside += 1
-                        avg_gate_inside += gate_val
-                        total_inside += 1
-                    else:
-                        gate_outside += gate_val
-                        count_outside += 1
-                        avg_gate_outside += gate_val
-                        total_outside += 1
-
-                gate_inside_avg = gate_inside / count_inside if count_inside > 0 else 0.0
-                gate_outside_avg = gate_outside / count_outside if count_outside > 0 else 0.0
-
-                eval_table.add_data(
-                    batch['question'][j],
-                    gen_text,
-                    answer_text,
-                    batch['answer'][j],
-                    is_correct,
-                    latent_steps,
-                    gate_inside_avg,
-                    gate_outside_avg
-                )
-            except ValueError as e:
-                print(f"Invalid sequence in batch {i}, example {j}: {e}")
-                continue
-
-        if total > 0:
-            wandb.log({
-                "eval_accuracy": correct / total,
-                "avg_latent_steps": total_latent_steps / total,
-                "avg_gate_inside": avg_gate_inside / total_inside if total_inside > 0 else 0.0,
-                "avg_gate_outside": avg_gate_outside / total_outside if total_outside > 0 else 0.0,
-                "gate_histogram": wandb.Histogram(gate_values_flat),
-                "reasoning_length_histogram": wandb.Histogram(reasoning_lengths),
-                "eval_table": eval_table
+            r_g, nr_g = [], []
+            for j, g in enumerate(gates):
+                if b_idx != -1 and b_idx < p_len + j <= e_idx: r_g.append(g)
+                else: nr_g.append(g)
+            
+            results.append({
+                "prompt": tokenizer.decode(full_ids[:p_len], skip_special_tokens=True),
+                "reasoning_text": r_txt, "predicted_answer": pred_txt, "ground_truth": gts_b[i],
+                "is_correct": correct, "gate_mean_reasoning": torch.tensor(r_g).mean().item() if r_g else None,
+                "gate_mean_non_reasoning": torch.tensor(nr_g).mean().item() if nr_g else None,
             })
 
-    torch.save(hidden_states_all, os.path.join(checkpoint_path, "hidden_states.pt"))
-    torch.save(gate_values_all, os.path.join(checkpoint_path, "gate_values.pt"))
-    print(f"Hidden states saved to {checkpoint_path}/hidden_states.pt")
-    print(f"Gate values saved to {checkpoint_path}/gate_values.pt")
+    accuracy = total_correct / len(results) if results else 0.0
+    print(f"Final Accuracy: {accuracy:.4f} ({int(total_correct)}/{len(results)})")
     
-    wandb.finish()
+    if wandb.run:
+        wandb.log({"evaluation/accuracy": accuracy})
+        df = pd.DataFrame(results)
+        wandb.log({"evaluation/results_table": wandb.Table(dataframe=df)})
+        wandb.finish()
+        
+    df.to_csv(os.path.join(eval_dir, "evaluation_results.csv"), index=False)
+    print(f"Evaluation results saved to {eval_dir}/evaluation_results.csv")
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) != 2:
-        print("Usage: python eval.py <config_path>")
-        sys.exit(1)
-    evaluate(sys.argv[1])
+    if len(sys.argv) != 2: print("Usage: python eval.py <path_to_eval_config.yaml>"); sys.exit(1)
+    evaluate_model(sys.argv[1])

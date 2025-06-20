@@ -1,23 +1,52 @@
-dataset: "gsm8k"
-data_dir: "./data"
-output_dir: "./experiments/gpt2-gsm8k"
-lora_rank: 32
-lr: 5e-6
-beta: 0.005
-weight_decay: 0.1
+# configs/train_config.yaml -- REVISED FOR GPT-2
+wandb_project: "dtt-gpt2-gsm8k"
+
+# Model: Using a 4-bit quantized GPT-2 from Unsloth
+model_name: "unsloth/gpt2-bnb-4bit"
+hidden_size: 768        # For base GPT-2
+embedding_dim: 768      # For base GPT-2
+load_in_4bit: true
+lora_rank: 16
+lora_target_modules: ["c_attn", "c_proj", "c_fc"] # GPT-2 specific layers
+
+# Gate Mechanism
+initial_gate_temperature: 1.0
+min_gate_temperature: 0.1
+gumbel_hard_generation_train: false
+
+# Dataset
+dataset_name: "gsm8k"
+data_dir: "./data_cache"
+max_prompt_length: 384
+max_completion_length: 128
+
+# Training
+output_dir: "./experiments/dtt_gpt2_gsm8k_run1"
+overwrite_output_dir: false
+seed: 42
+lr: 3.0e-5
+optimizer: "adamw_bnb_8bit"
 warmup_ratio: 0.1
 lr_scheduler_type: "cosine"
-optimizer: "paged_adamw_8bit"
-max_grad_norm: 0.1
-group_size: 8
-temperature: 0.5
-gradient_accumulation_steps: 4
+max_grad_norm: 1.0
 per_device_train_batch_size: 8
-max_prompt_length: 1024
-max_completion_length: 1024
-num_train_epochs: 1
-save_steps: 250
-save_total_limit: 3
-lambda_penalty: 0.05
-gate_penalty: 0.1
-gate_temperature: 1.0
+gradient_accumulation_steps: 4
+num_train_epochs: 10
+max_steps: -1
+use_bf16: false # GPT-2 doesn't typically use bfloat16
+use_fp16: true # Use fp16 instead
+
+# GRPO
+beta_grpo: 0.1
+sampling_temperature_grpo: 0.7
+group_size_grpo: 8
+
+# Custom Reward
+lambda_penalty: 0.01
+gate_penalty_coeff: 0.05
+
+# Logging and Saving
+logging_steps: 5
+save_steps: 100
+save_total_limit: 2
+resume_from_checkpoint: null

@@ -1,7 +1,27 @@
-dataset: "gsm8k"
-data_dir: "./data"
-checkpoint_path: "./experiments/gpt2-gsm8k"
-lora_rank: 32
-batch_size: 8
-max_length: 2048
-gate_temperature: 1.0
+# configs/eval_config.yaml -- REVISED FOR GPT-2
+wandb_project_eval: "dtt-gpt2-gsm8k-eval"
+
+# Model: Must match the trained model's configuration
+model_checkpoint_path: "./experiments/dtt_gpt2_gsm8k_run1/checkpoint-100" # UPDATE THIS
+base_model_name_for_eval: "unsloth/gpt2-bnb-4bit"
+hidden_size: 768
+embedding_dim: 768
+lora_rank: 16
+lora_target_modules_eval: ["c_attn", "c_proj", "c_fc"]
+load_in_4bit_eval: true
+
+# Gate Mechanism
+eval_gate_temperature: 0.1
+eval_gumbel_hard: true
+
+# Dataset
+dataset_name: "gsm8k"
+data_dir: "./data_cache"
+dataset_split_eval: "test"
+max_prompt_length: 384
+max_completion_length: 128
+
+# Evaluation
+eval_output_dir: null
+eval_batch_size: 8
+sampling_temperature_eval: 0.0 # Greedy decoding for deterministic evaluation

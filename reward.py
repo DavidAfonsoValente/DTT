@@ -1,43 +1,68 @@
-from typing import List
 import torch
 
-def custom_reward(completions: List[List[int]], gate_values_list: List[List[float]], tokenizer, ground_truths: List[str], prompt_len: int, lambda_penalty: float = 0.05, gate_penalty: float = 0.1, num_generations: int = 1) -> List[float]:
-    """Reward function encouraging correct answers, minimal tokens, and proper gate values."""
+def custom_reward(completions_ids, gate_values_list, tokenizer, ground_truths, 
+                  prompt_len, lambda_penalty, gate_penalty_coeff, num_generations):
+    """Computes reward based on correctness, efficiency, and gate sparsity."""
     rewards = []
+    
     bot_id = tokenizer.convert_tokens_to_ids("[bot]")
     eot_id = tokenizer.convert_tokens_to_ids("[eot]")
 
-    for k, (completion, gate_values) in enumerate(zip(completions, gate_values_list)):
-        ground_truth = ground_truths[k // num_generations]
-        if not completion or not ground_truth:
-            rewards.append(-1.0)
-            continue
+    if bot_id is None or eot_id is None:
+        raise ValueError("[bot] or [eot] tokens not found in tokenizer.")
 
-        completion_tensor = torch.tensor(completion)
-        bot_mask = (completion_tensor == bot_id).float()
-        eot_mask = (completion_tensor == eot_id).float()
-        bot_idx = torch.argmax(bot_mask).item() if bot_mask.sum() > 0 else -1
-        eot_idx = torch.argmax(eot_mask).item() if eot_mask.sum() > 0 else -1
+    for k, (full_completion_token_ids, gate_values_for_generated_tokens) in enumerate(zip(completions_ids, gate_values_list)):
+        original_batch_idx = k // num_generations
+        ground_truth_answer_str = ground_truths[original_batch_idx]
         
-        if not (bot_idx >= prompt_len and eot_idx > bot_idx):
-            rewards.append(-1.0)
-            continue
+        completion_tensor = torch.tensor(full_completion_token_ids, dtype=torch.long)
+        
+        bot_indices = (completion_tensor[prompt_len:] == bot_id).nonzero(as_tuple=True)[0] + prompt_len
+        eot_indices = (completion_tensor[prompt_len:] == eot_id).nonzero(as_tuple=True)[0] + prompt_len
 
-        answer_tokens = completion[eot_idx + 1:] if eot_idx + 1 < len(completion) else []
-        answer_text = tokenizer.decode(answer_tokens, skip_special_tokens=True).strip()
-        is_correct = float(answer_text == ground_truth.strip())
-        num_tokens_in_reasoning = eot_idx - bot_idx - 1
+        current_bot_idx, current_eot_idx = -1, -1
+
+        for b_idx in bot_indices:
+            if b_idx >= prompt_len:
+                for e_idx in eot_indices:
+                    if e_idx > b_idx:
+                        current_bot_idx, current_eot_idx = b_idx.item(), e_idx.item()
+                        break
+                if current_bot_idx != -1:
+                    break
+        
+        is_correct = 0.0
+        if current_bot_idx != -1 and current_eot_idx != -1:
+            answer_token_ids = full_completion_token_ids[current_eot_idx + 1:]
+            predicted_answer_str = tokenizer.decode(answer_token_ids, skip_special_tokens=True).strip()
+            if predicted_answer_str == ground_truth_answer_str.strip():
+                is_correct = 1.0
+        else:
+            is_correct = -0.5
+
+        num_tokens_in_reasoning = 0
+        if current_bot_idx != -1 and current_eot_idx != -1:
+            num_tokens_in_reasoning = current_eot_idx - (current_bot_idx + 1)
+            if num_tokens_in_reasoning < 0: num_tokens_in_reasoning = 0
+
+        token_eff_penalty = lambda_penalty * num_tokens_in_reasoning
 
         gate_penalty_sum = 0.0
-        for i in range(prompt_len, len(completion)):
-            gate_val = gate_values[i - prompt_len]
-            if bot_idx < i <= eot_idx:
-                gate_penalty_sum += (1.0 - gate_val) ** 2
-            else:
-                gate_penalty_sum += gate_val ** 2
-        gate_penalty_avg = gate_penalty_sum / (len(completion) - prompt_len) if len(completion) > prompt_len else 0.0
+        if gate_values_for_generated_tokens:
+            for gen_token_idx, gate_val in enumerate(gate_values_for_generated_tokens):
+                actual_token_idx_in_full_seq = prompt_len + gen_token_idx
+                
+                if current_bot_idx != -1 and current_eot_idx != -1 and \
+                   current_bot_idx < actual_token_idx_in_full_seq <= current_eot_idx:
+                    gate_penalty_sum += (1.0 - gate_val)**2
+                else:
+                    gate_penalty_sum += gate_val**2
+            
+            avg_gate_penalty = gate_penalty_sum / len(gate_values_for_generated_tokens)
+        else:
+            avg_gate_penalty = 1.0 if len(full_completion_token_ids) > prompt_len else 0.0
 
-        reward = is_correct - lambda_penalty * num_tokens_in_reasoning - gate_penalty * gate_penalty_avg
-        rewards.append(reward)
-
+        total_reward = is_correct - token_eff_penalty - (gate_penalty_coeff * avg_gate_penalty)
+        rewards.append(total_reward)
+        
     return rewards

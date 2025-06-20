@@ -1,57 +1,47 @@
-import os
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 
-def preprocess_dataset(dataset_name, data_dir, split):
-    """Preprocess dataset based on its type."""
+def _preprocess_function_map(examples, tokenizer, max_prompt_length, question_field_name, answer_field_name):
+    """Helper function to tokenize questions and prepare them for the model."""
+    tokenized_prompts = tokenizer(
+        examples[question_field_name],
+        max_length=max_prompt_length,
+        padding="max_length", 
+        truncation=True,
+        return_tensors=None,
+    )
+    
+    processed_batch = {
+        "input_ids": tokenized_prompts["input_ids"],
+        "attention_mask": tokenized_prompts["attention_mask"],
+        "ground_truths": examples[answer_field_name]
+    }
+    return processed_batch
+
+def preprocess_dataset(dataset_name, data_dir, tokenizer, max_prompt_length, split="train"):
+    """Loads and preprocesses a specified dataset."""
     if dataset_name == "gsm8k":
-        data_path = os.path.join(data_dir, "gsm8k")
-        if not os.path.exists(data_path):
-            os.makedirs(data_path)
-            dataset = load_dataset("openai/gsm8k", "main")
-            dataset.save_to_disk(data_path)
-        dataset = Dataset.load_from_disk(data_path)[split]
-        def process_gsm8k(examples):
-            return {
-                "question": examples["question"],
-                "answer": [ans.split("####")[1].strip() if "####" in ans else ans for ans in examples["answer"]]
-            }
-        return dataset.map(process_gsm8k, batched=True)
+        raw_dataset = load_dataset("gsm8k", "main", split=split, cache_dir=data_dir)
+        raw_dataset = raw_dataset.map(
+            lambda x: {"processed_answer": x["answer"].split("####")[-1].strip()}
+        )
+        question_field, answer_field = "question", "processed_answer"
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-    elif dataset_name == "prosqa":
-        data_path = os.path.join(data_dir, "prosqa", f"{split}.json")
-        dataset = Dataset.from_json(data_path)
-        def process_prosqa(examples):
-            return {
-                "question": examples["question"],
-                "answer": examples["answer"]
-            }
-        return dataset.map(process_prosqa, batched=True)
-
-    elif dataset_name == "prontoqa":
-        data_path = os.path.join(data_dir, "prontoqa")
-        if not os.path.exists(data_path):
-            os.makedirs(data_path)
-            dataset = load_dataset("allenai/prontoqa")
-            dataset.save_to_disk(data_path)
-        dataset = Dataset.load_from_disk(data_path)[split]
-        def process_prontoqa(examples):
-            return {
-                "question": examples["query"],
-                "answer": examples["answer"]
-            }
-        return dataset.map(process_prontoqa, batched=True)
-
-def process_answer(pred, true_answer, dataset_name):
-    """Process and compare answers based on dataset type."""
-    pred = pred.strip()
-    true_answer = true_answer.strip()
-    if dataset_name == "gsm8k":
-        try:
-            pred_num = float(pred)
-            true_num = float(true_answer)
-            return abs(pred_num - true_num) < 1e-5
-        except ValueError:
-            return pred == true_answer
-    elif dataset_name in ["prosqa", "prontoqa"]:
-        return pred.lower() == true_answer.lower()
-    return False
+    processed_dataset = raw_dataset.map(
+        _preprocess_function_map,
+        batched=True,
+        fn_kwargs={
+            "tokenizer": tokenizer, 
+            "max_prompt_length": max_prompt_length,
+            "question_field_name": question_field,
+            "answer_field_name": answer_field
+        },
+        remove_columns=raw_dataset.column_names
+    )
+    
+    required_columns = ["input_ids", "attention_mask", "ground_truths"]
+    if not all(col in processed_dataset.column_names for col in required_columns):
+        raise ValueError(f"Processed dataset is missing one or more required columns: {required_columns}")
+            
+    return processed_dataset
