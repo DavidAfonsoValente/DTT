@@ -1,11 +1,9 @@
-# configs/train_config.yaml -- REVISED FOR GPT-2
 wandb_project: "dtt-gpt2-gsm8k"
 
-# Model: Using a 4-bit quantized GPT-2 from Unsloth
-model_name: "unsloth/gpt2-bnb-4bit"
+# Model: Using standard GPT-2 with manual quantization
+model_name: "gpt2"
 hidden_size: 768        # For base GPT-2
 embedding_dim: 768      # For base GPT-2
-load_in_4bit: true
 lora_rank: 16
 lora_target_modules: ["c_attn", "c_proj", "c_fc"] # GPT-2 specific layers
 

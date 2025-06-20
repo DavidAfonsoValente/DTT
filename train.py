@@ -2,15 +2,12 @@ import os
 import yaml
 import torch
 import wandb
-from unsloth import PatchFastRL
 from transformers import GenerationConfig
 from trl import GRPOConfig, GRPOTrainer
 
 from model import SparseGatedModel
 from reward import custom_reward
 from utils import preprocess_dataset
-
-PatchFastRL("GRPO")
 
 class CustomGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
@@ -202,7 +199,7 @@ def main(config_path):
         model_name=config["model_name"], max_seq_length=config["max_prompt_length"] + config["max_completion_length"],
         hidden_size=config["hidden_size"], embedding_dim=config["embedding_dim"],
         lora_rank=config["lora_rank"], gate_temperature=config["initial_gate_temperature"],
-        load_in_4bit=config.get("load_in_4bit", True), lora_target_modules=config.get("lora_target_modules")
+        lora_target_modules=config.get("lora_target_modules")
     )
     tokenizer = model.tokenizer
 

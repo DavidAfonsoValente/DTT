@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from unsloth import FastLanguageModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
 
 def gumbel_sigmoid(logits, temperature, hard=False, eps=1e-10):
     """Applies Gumbel-sigmoid to logits for near-binary gate values."""
@@ -15,43 +16,45 @@ def gumbel_sigmoid(logits, temperature, hard=False, eps=1e-10):
         y = y_soft
     return y
 
-class SparseGatedModel(FastLanguageModel):
+class SparseGatedModel(nn.Module):
     def __init__(self, model_name, max_seq_length, hidden_size, embedding_dim, lora_rank, gate_temperature, **kwargs):
-        """Initializes the SparseGatedModel, extending Unsloth's FastLanguageModel for sparse gating."""
         super().__init__()
         
-        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_name,
-            max_seq_length=max_seq_length,
-            dtype=kwargs.get("dtype", None),
-            load_in_4bit=kwargs.get("load_in_4bit", True),
+        # Configure 4-bit quantization with bitsandbytes
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
         )
         
-        self._hidden_size_internal = hidden_size
-        self._embedding_dim_internal = embedding_dim
+        # Load the base GPT-2 model with quantization
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+        )
         
-        self.projection = nn.Linear(self._hidden_size_internal, self._embedding_dim_internal, bias=False)
-        self.gate_linear = nn.Linear(self._hidden_size_internal, 1)
-        nn.init.constant_(self.gate_linear.bias, -3.0) 
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         
-        self.lora_rank_config = lora_rank
-        self.gate_temperature = gate_temperature
-
-        self.current_gate_values_for_batch = None
-        self.current_original_embeddings_for_batch = None
-
-        gpt2_target_modules = ["c_attn", "c_proj", "c_fc"]
-        self.get_peft_model(
-            r=self.lora_rank_config,
-            target_modules=kwargs.get("lora_target_modules", gpt2_target_modules),
-            lora_alpha=self.lora_rank_config * 2,
+        # Apply LoRA using peft
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_rank * 2,
+            target_modules=kwargs.get("lora_target_modules", ["c_attn", "c_proj", "c_fc"]),
             lora_dropout=0.05,
             bias="none",
-            use_gradient_checkpointing=kwargs.get("use_gradient_checkpointing", "unsloth"),
-            random_state=3407,
-            max_seq_length=max_seq_length,
-            modules_to_save=["projection", "gate_linear"],
         )
+        
+        self.model = get_peft_model(self.model, lora_config)
+        
+        # Define projection and gate layers
+        self.projection = nn.Linear(hidden_size, embedding_dim, bias=False)
+        self.gate_linear = nn.Linear(hidden_size, 1)
+        nn.init.constant_(self.gate_linear.bias, -3.0)
+        
+        self.gate_temperature = gate_temperature
+        self.current_gate_values_for_batch = None
+        self.current_original_embeddings_for_batch = None
 
     def forward(self,
                 input_ids=None,
@@ -64,10 +67,6 @@ class SparseGatedModel(FastLanguageModel):
                 output_hidden_states=True,
                 gumbel_hard_during_forward=False,
                 **kwargs):
-        """
-        Forward pass with HRPO-style gating.
-        E'_t = Gate_t * Proj(H_{t-1}) + (1-Gate_t) * Emb(token_t)
-        """
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("Cannot specify both input_ids and inputs_embeds.")
         
@@ -87,7 +86,7 @@ class SparseGatedModel(FastLanguageModel):
                 prev_step_last_hidden_state = prev_step_last_hidden_state.unsqueeze(1)
 
             if prev_step_last_hidden_state.shape[1] == 1 and seq_len > 1:
-                 prev_step_last_hidden_state = prev_step_last_hidden_state.repeat(1, seq_len, 1)
+                prev_step_last_hidden_state = prev_step_last_hidden_state.repeat(1, seq_len, 1)
             elif prev_step_last_hidden_state.shape[1] != seq_len:
                 raise ValueError(f"Shape mismatch: prev_step_last_hidden_state.shape[1] ({prev_step_last_hidden_state.shape[1]}) != seq_len ({seq_len})")
 
@@ -107,7 +106,7 @@ class SparseGatedModel(FastLanguageModel):
                 dummy_gate_logits, self.gate_temperature, hard=gumbel_hard_during_forward
             ).detach().clone()
 
-        outputs = self.model.forward(
+        outputs = self.model(
             inputs_embeds=effective_embeddings,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
