@@ -56,6 +56,10 @@ class SparseGatedModel(nn.Module):
         self.current_gate_values_for_batch = None
         self.current_original_embeddings_for_batch = None
 
+    @property
+    def config(self):
+        return self.model.config
+
     def forward(self,
                 input_ids=None,
                 attention_mask=None,
@@ -122,3 +126,4 @@ class SparseGatedModel(nn.Module):
         last_hidden_state_current_step = outputs.hidden_states[-1]
 
         return outputs, last_hidden_state_current_step
+    
