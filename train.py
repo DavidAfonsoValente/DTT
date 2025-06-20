@@ -2,8 +2,8 @@ import os
 import yaml
 import torch
 import wandb
-from transformers import GenerationConfig
 from unsloth import PatchFastRL
+from transformers import GenerationConfig
 from trl import GRPOConfig, GRPOTrainer
 
 from model import SparseGatedModel
