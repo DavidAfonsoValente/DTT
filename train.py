@@ -2,12 +2,27 @@ import os
 import yaml
 import torch
 import wandb
+# Import dataclasses
+from dataclasses import dataclass, field
 from transformers import GenerationConfig
 from trl import GRPOConfig, GRPOTrainer
 
 from model import SparseGatedModel
 from reward import custom_reward
 from utils import preprocess_dataset
+
+
+@dataclass
+class CustomGRPOConfig(GRPOConfig):
+    """
+    Custom GRPO configuration class to hold additional parameters for the
+    gating mechanism and custom reward function.
+    """
+    initial_gate_temperature: float = field(default=1.0, metadata={"help": "Initial temperature for the Gumbel-Sigmoid gate."})
+    min_gate_temperature: float = field(default=0.1, metadata={"help": "Minimum temperature for the Gumbel-Sigmoid gate."})
+    gumbel_hard_generation: bool = field(default=False, metadata={"help": "Whether to use the hard version of Gumbel-Sigmoid during generation in training."})
+    lambda_penalty: float = field(default=0.01, metadata={"help": "Coefficient for the token efficiency penalty in the reward."})
+    gate_penalty_coeff: float = field(default=0.05, metadata={"help": "Coefficient for the gate sparsity penalty in the reward."})
 
 class CustomGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
@@ -25,12 +40,12 @@ class CustomGRPOTrainer(GRPOTrainer):
                            self.args.gradient_accumulation_steps
         
         if len(self.train_dataset) > 0 and train_batch_size > 0:
-             unique_prompts_per_optim_step = self.args.per_device_train_batch_size * \
+              unique_prompts_per_optim_step = self.args.per_device_train_batch_size * \
                                               self.accelerator.num_processes * \
                                               self.args.gradient_accumulation_steps
-             self.total_steps_for_annealing = (self.args.num_train_epochs * len(self.train_dataset)) // unique_prompts_per_optim_step
+              self.total_steps_for_annealing = (self.args.num_train_epochs * len(self.train_dataset)) // unique_prompts_per_optim_step
         else:
-             self.total_steps_for_annealing = self.args.max_steps if self.args.max_steps > 0 else 1000
+              self.total_steps_for_annealing = self.args.max_steps if self.args.max_steps > 0 else 1000
 
     def _anneal_gumbel_temperature(self):
         if self.total_steps_for_annealing <= 0: return self.args.initial_gate_temperature
@@ -118,8 +133,8 @@ class CustomGRPOTrainer(GRPOTrainer):
         rewards = self.reward_funcs[0](
             completions_ids=completions_ids, gate_values_list=gate_values_list,
             tokenizer=self.processing_class, ground_truths=ground_truths,
-            prompt_len=prompt_len, lambda_penalty=self.args.lambda_penalty_config,
-            gate_penalty_coeff=self.args.gate_penalty_coeff_config, num_generations=self.args.num_generations
+            prompt_len=prompt_len, lambda_penalty=self.args.lambda_penalty,
+            gate_penalty_coeff=self.args.gate_penalty_coeff, num_generations=self.args.num_generations
         )
         
         if self.accelerator.is_main_process and self.state.global_step % self.args.logging_steps == 0:
@@ -150,7 +165,7 @@ class CustomGRPOTrainer(GRPOTrainer):
             scores.append(correct)
 
             r_toks = (e_idx - b_idx - 1) if b_idx != -1 and e_idx > b_idx else 0
-            t_pens.append(self.args.lambda_penalty_config * r_toks)
+            t_pens.append(self.args.lambda_penalty * r_toks)
             
             g_pen_sum = 0
             if gen_gates:
@@ -160,7 +175,7 @@ class CustomGRPOTrainer(GRPOTrainer):
                         g_pen_sum += (1.0 - g)**2; r_g.append(g)
                     else:
                         g_pen_sum += g**2; nr_g.append(g)
-                g_pens.append(self.args.gate_penalty_coeff_config * (g_pen_sum / len(gen_gates)))
+                g_pens.append(self.args.gate_penalty_coeff * (g_pen_sum / len(gen_gates)))
         
         metrics.update({
             "reward_mean": torch.tensor(rewards).mean().item(), "correctness_mean": torch.tensor(scores).mean().item(),
@@ -183,6 +198,7 @@ class CustomGRPOTrainer(GRPOTrainer):
             )
             if step > 0 and step % (self.args.logging_steps * 10) == 0:
                  wandb.log({"train_progress_summary": self.progress_table})
+
 
 def main(config_path):
     with open(config_path, 'r') as f: config = yaml.safe_load(f)
@@ -209,7 +225,8 @@ def main(config_path):
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
 
-    training_args = GRPOConfig(
+    # 2. Use your new CustomGRPOConfig class
+    training_args = CustomGRPOConfig(
         output_dir=exp_name, per_device_train_batch_size=config["per_device_train_batch_size"],
         gradient_accumulation_steps=config["gradient_accumulation_steps"], num_train_epochs=config["num_train_epochs"],
         max_steps=config.get("max_steps", -1), save_steps=config["save_steps"], save_total_limit=config["save_total_limit"],
@@ -218,12 +235,20 @@ def main(config_path):
         logging_steps=config.get("logging_steps", 10), seed=config.get("seed", 42),
         report_to="wandb" if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0 else None,
         remove_unused_columns=False, bf16=config.get("use_bf16", False), fp16=config.get("use_fp16", False),
-        beta=config["beta_grpo"], temperature=config["sampling_temperature_grpo"],
-        num_generations=config["group_size_grpo"], max_prompt_length=config["max_prompt_length"],
+        
+        # Standard GRPO arguments
+        beta=config["beta_grpo"], 
+        temperature=config["sampling_temperature_grpo"],
+        num_generations=config["group_size_grpo"], 
+        max_prompt_length=config["max_prompt_length"],
         max_completion_length=config["max_completion_length"],
-        initial_gate_temperature=config["initial_gate_temperature"], min_gate_temperature=config.get("min_gate_temperature", 0.1),
+        
+        # Your custom arguments
+        initial_gate_temperature=config["initial_gate_temperature"], 
+        min_gate_temperature=config.get("min_gate_temperature", 0.1),
         gumbel_hard_generation=config.get("gumbel_hard_generation_train", False),
-        lambda_penalty_config=config["lambda_penalty"], gate_penalty_coeff_config=config["gate_penalty_coeff"],
+        lambda_penalty=config["lambda_penalty"], 
+        gate_penalty_coeff=config["gate_penalty_coeff"],
     )
 
     train_dataset = preprocess_dataset(
@@ -231,7 +256,7 @@ def main(config_path):
     )
 
     trainer = CustomGRPOTrainer(model=model, args=training_args, train_dataset=train_dataset,
-                                processing_class=tokenizer, reward_funcs=[custom_reward])
+                                  processing_class=tokenizer, reward_funcs=[custom_reward])
     trainer.train(resume_from_checkpoint=config.get("resume_from_checkpoint", None))
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
