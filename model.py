@@ -19,18 +19,14 @@ def gumbel_sigmoid(logits, temperature, hard=False, eps=1e-10):
 class SparseGatedModel(nn.Module):
     def __init__(self, model_name, max_seq_length, hidden_size, embedding_dim, lora_rank, gate_temperature, **kwargs):
         super().__init__()
-
-        # FIX: Add the missing attribute expected by GRPOTrainer
         self.warnings_issued = {}
 
-        # Configure 4-bit quantization with bitsandbytes
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.float16,
         )
 
-        # Load the base GPT-2 model with quantization
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=bnb_config,
@@ -39,7 +35,6 @@ class SparseGatedModel(nn.Module):
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-        # Apply LoRA using peft
         lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_rank * 2,
@@ -50,7 +45,6 @@ class SparseGatedModel(nn.Module):
 
         self.model = get_peft_model(self.model, lora_config)
 
-        # Define projection and gate layers
         self.projection = nn.Linear(hidden_size, embedding_dim, bias=False)
         self.gate_linear = nn.Linear(hidden_size, 1)
         nn.init.constant_(self.gate_linear.bias, -3.0)
@@ -62,6 +56,20 @@ class SparseGatedModel(nn.Module):
     @property
     def config(self):
         return self.model.config
+
+    # FIX: Add __getattr__ to delegate calls to the underlying model
+    def __getattr__(self, name: str):
+        """
+        Forward attribute requests to the underlying model if they are not
+        found in the wrapper. This makes the wrapper transparent for methods
+        like `generate`, `add_model_tags`, etc.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if hasattr(self.model, name):
+                return getattr(self.model, name)
+            raise
 
     def forward(self,
                 input_ids=None,
