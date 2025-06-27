@@ -1,10 +1,11 @@
 import os
+import sys
 import yaml
 import torch
 import wandb
-# Import dataclasses
 from dataclasses import dataclass, field
-from transformers import GenerationConfig
+from transformers import GenerationConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
 
 from model import SparseGatedModel
@@ -30,7 +31,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         
         if self.accelerator.is_main_process:
             self.progress_table = wandb.Table(columns=[
-                "step", "loss", "reward_mean", "correctness_mean", "token_penalty_mean", 
+                "step", "loss", "reward_mean", "correctness_mean", "token_penalty_mean",
                 "gate_penalty_mean", "gate_mean_overall", "gate_mean_reasoning", "gate_mean_non_reasoning",
                 "gumbel_temp_model"
             ])
@@ -40,12 +41,12 @@ class CustomGRPOTrainer(GRPOTrainer):
                            self.args.gradient_accumulation_steps
         
         if len(self.train_dataset) > 0 and train_batch_size > 0:
-              unique_prompts_per_optim_step = self.args.per_device_train_batch_size * \
-                                              self.accelerator.num_processes * \
-                                              self.args.gradient_accumulation_steps
-              self.total_steps_for_annealing = (self.args.num_train_epochs * len(self.train_dataset)) // unique_prompts_per_optim_step
+            unique_prompts_per_optim_step = self.args.per_device_train_batch_size * \
+                                            self.accelerator.num_processes * \
+                                            self.args.gradient_accumulation_steps
+            self.total_steps_for_annealing = (self.args.num_train_epochs * len(self.train_dataset)) // unique_prompts_per_optim_step
         else:
-              self.total_steps_for_annealing = self.args.max_steps if self.args.max_steps > 0 else 1000
+            self.total_steps_for_annealing = self.args.max_steps if self.args.max_steps > 0 else 1000
 
     def _anneal_gumbel_temperature(self):
         if self.total_steps_for_annealing <= 0: return self.args.initial_gate_temperature
@@ -77,7 +78,8 @@ class CustomGRPOTrainer(GRPOTrainer):
         
         initial_lm_outputs, h_t_after_prompt = self.model(
             input_ids=input_ids, attention_mask=current_full_attention_mask, use_cache=True,
-            gumbel_hard_during_forward=self.args.gumbel_hard_generation
+            gumbel_hard_during_forward=self.args.gumbel_hard_generation,
+            return_last_hidden_state=True # Pass flag to get hidden state
         )
         past_key_values = initial_lm_outputs.past_key_values
         prev_h_for_next_step = h_t_after_prompt[:, -1:, :]
@@ -101,7 +103,8 @@ class CustomGRPOTrainer(GRPOTrainer):
             lm_outputs_step, h_t_current_step = self.model(
                 input_ids=next_tokens, attention_mask=current_full_attention_mask, past_key_values=past_key_values,
                 prev_step_last_hidden_state=prev_h_for_next_step, use_cache=True,
-                gumbel_hard_during_forward=self.args.gumbel_hard_generation
+                gumbel_hard_during_forward=self.args.gumbel_hard_generation,
+                return_last_hidden_state=True # Pass flag to get hidden state
             )
             
             step_gate_values = self.model.current_gate_values_for_batch.squeeze()
@@ -115,7 +118,9 @@ class CustomGRPOTrainer(GRPOTrainer):
         self.model.train()
         return generated_ids, all_gate_values, current_gumbel_model_temp
 
+    # The rest of the trainer methods (generate_and_compute_reward, etc.) do not need changes
     def generate_and_compute_reward(self, batch):
+        # This method remains the same
         input_ids, attention_mask = batch["input_ids"], batch["attention_mask"]
         ground_truths = batch["ground_truths"]
         prompt_len = input_ids.shape[1]
@@ -146,6 +151,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         return completions_decoded, rewards
 
     def _calculate_and_log_metrics(self, completions, gates, rewards, gts, p_len, gumbel_temp):
+        # This method remains the same
         metrics, scores, t_pens, g_pens, all_g, r_g, nr_g = {}, [], [], [], [], [], []
         bot_id, eot_id = self.processing_class.convert_tokens_to_ids(["[bot]", "[eot]"])
 
@@ -190,6 +196,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         return metrics
 
     def _log_to_progress_table(self, step, metrics, loss):
+        # This method remains the same
         if self.accelerator.is_main_process:
             self.progress_table.add_data(
                 step, loss.item() if loss else float('nan'), metrics.get("reward_mean", 0), metrics.get("correctness_mean", 0),
@@ -197,57 +204,92 @@ class CustomGRPOTrainer(GRPOTrainer):
                 metrics.get("gate_mean_reasoning", 0), metrics.get("gate_mean_non_reasoning", 0), metrics.get("gumbel_temp_model", 0)
             )
             if step > 0 and step % (self.args.logging_steps * 10) == 0:
-                 wandb.log({"train_progress_summary": self.progress_table})
-
+                wandb.log({"train_progress_summary": self.progress_table})
 
 def main(config_path):
-    with open(config_path, 'r') as f: config = yaml.safe_load(f)
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
 
     exp_name = config["output_dir"]
     if os.path.exists(exp_name) and os.listdir(exp_name) and not config.get("overwrite_output_dir"):
-        print(f"Directory {exp_name} exists and is not empty. Exiting."); return
+        print(f"Directory {exp_name} exists and is not empty. Exiting.")
+        return
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         wandb.init(project=config.get("wandb_project", "dtt-project"), name=exp_name, config=config)
         wandb.save(config_path)
 
-    model = SparseGatedModel(
-        model_name=config["model_name"], max_seq_length=config["max_prompt_length"] + config["max_completion_length"],
-        hidden_size=config["hidden_size"], embedding_dim=config["embedding_dim"],
-        lora_rank=config["lora_rank"], gate_temperature=config["initial_gate_temperature"],
-        lora_target_modules=config.get("lora_target_modules")
+    # --- Corrected Model Initialization ---
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
     )
-    tokenizer = model.tokenizer
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config["model_name"],
+        quantization_config=bnb_config,
+        device_map="auto",
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
+
+    lora_config = LoraConfig(
+        r=config["lora_rank"],
+        lora_alpha=config["lora_rank"] * 2,
+        target_modules=config.get("lora_target_modules"),
+        lora_dropout=0.05,
+        bias="none",
+    )
+
+    model = SparseGatedModel(
+        model=base_model,
+        peft_config=lora_config,
+        hidden_size=config["hidden_size"],
+        embedding_dim=config["embedding_dim"],
+        gate_temperature=config["initial_gate_temperature"],
+    )
+    # --- End of Corrected Model Initialization ---
 
     special_tokens = {'additional_special_tokens': ['[bot]', '[eot]']}
     if tokenizer.add_special_tokens(special_tokens) > 0:
-        model.model.resize_token_embeddings(len(tokenizer))
+        model.resize_token_embeddings(len(tokenizer))
     tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Use your new CustomGRPOConfig class
     training_args = CustomGRPOConfig(
-        output_dir=exp_name, per_device_train_batch_size=config["per_device_train_batch_size"],
-        gradient_accumulation_steps=config["gradient_accumulation_steps"], num_train_epochs=config["num_train_epochs"],
-        max_steps=config.get("max_steps", -1), save_steps=config["save_steps"], save_total_limit=config["save_total_limit"],
-        learning_rate=config["lr"], lr_scheduler_type=config["lr_scheduler_type"], warmup_ratio=config["warmup_ratio"],
-        optim=config.get("optimizer", "adamw_torch"), max_grad_norm=config["max_grad_norm"],
-        logging_steps=config.get("logging_steps", 10), seed=config.get("seed", 42),
+        output_dir=exp_name,
+        per_device_train_batch_size=config["per_device_train_batch_size"],
+        gradient_accumulation_steps=config["gradient_accumulation_steps"],
+        num_train_epochs=config["num_train_epochs"],
+        max_steps=config.get("max_steps", -1),
+        save_steps=config["save_steps"],
+        save_total_limit=config["save_total_limit"],
+        learning_rate=config["lr"],
+        lr_scheduler_type=config["lr_scheduler_type"],
+        warmup_ratio=config["warmup_ratio"],
+        optim=config.get("optimizer", "adamw_torch"),
+        max_grad_norm=config["max_grad_norm"],
+        logging_steps=config.get("logging_steps", 10),
+        seed=config.get("seed", 42),
         report_to="wandb" if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0 else None,
-        remove_unused_columns=False, bf16=config.get("use_bf16", False), fp16=config.get("use_fp16", False),
+        remove_unused_columns=False,
+        bf16=config.get("use_bf16", False),
+        fp16=config.get("use_fp16", False),
         
         # Standard GRPO arguments
-        beta=config["beta_grpo"], 
+        beta=config["beta_grpo"],
         temperature=config["sampling_temperature_grpo"],
-        num_generations=config["group_size_grpo"], 
+        num_generations=config["group_size_grpo"],
         max_prompt_length=config["max_prompt_length"],
         max_completion_length=config["max_completion_length"],
         
-        # Your custom arguments
-        initial_gate_temperature=config["initial_gate_temperature"], 
+        # Custom arguments
+        initial_gate_temperature=config["initial_gate_temperature"],
         min_gate_temperature=config.get("min_gate_temperature", 0.1),
         gumbel_hard_generation=config.get("gumbel_hard_generation_train", False),
-        lambda_penalty=config["lambda_penalty"], 
+        lambda_penalty=config["lambda_penalty"],
         gate_penalty_coeff=config["gate_penalty_coeff"],
     )
 
@@ -255,16 +297,24 @@ def main(config_path):
         config["dataset_name"], config["data_dir"], tokenizer, config["max_prompt_length"], "train"
     )
 
-    trainer = CustomGRPOTrainer(model=model, args=training_args, train_dataset=train_dataset,
-                                  processing_class=tokenizer, reward_funcs=[custom_reward])
+    trainer = CustomGRPOTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        processing_class=tokenizer,
+        reward_funcs=[custom_reward]
+    )
     trainer.train(resume_from_checkpoint=config.get("resume_from_checkpoint", None))
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        # Saving the final model
         model.save_pretrained(exp_name)
         print(f"Training complete. Model saved to {exp_name}")
-        if wandb.run: wandb.finish()
+        if wandb.run:
+            wandb.finish()
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) != 2: print("Usage: python train.py <path_to_config.yaml>"); sys.exit(1)
+    if len(sys.argv) != 2:
+        print("Usage: python train.py <path_to_config.yaml>")
+        sys.exit(1)
     main(sys.argv[1])
