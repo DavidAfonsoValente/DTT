@@ -229,7 +229,7 @@ def main(config_path):
     base_model = AutoModelForCausalLM.from_pretrained(
         config["model_name"],
         quantization_config=bnb_config,
-        device_map="auto",
+        #device_map="auto",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
