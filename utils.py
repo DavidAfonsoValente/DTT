@@ -13,7 +13,7 @@ def _preprocess_function_map(examples, tokenizer, max_prompt_length, question_fi
     )
     
     processed_batch = {
-        "prompt": prompts,  # <-- Add the raw prompts here
+        "prompt": prompts,  # <-- This is the required line to add.
         "input_ids": tokenized_prompts["input_ids"],
         "attention_mask": tokenized_prompts["attention_mask"],
         "ground_truths": examples[answer_field_name]
