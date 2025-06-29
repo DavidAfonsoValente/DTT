@@ -4,6 +4,9 @@ import yaml
 import torch
 import wandb
 from dataclasses import dataclass, field
+
+# Import the Accelerator class
+from accelerate import Accelerator
 from transformers import GenerationConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
@@ -53,14 +56,16 @@ class CustomGRPOTrainer(GRPOTrainer):
         progress = min(1.0, self.state.global_step / self.total_steps_for_annealing)
         annealed_temp = self.args.initial_gate_temperature - \
                         (self.args.initial_gate_temperature - self.args.min_gate_temperature) * progress
-        self.model.gate_temperature = max(self.args.min_gate_temperature, annealed_temp)
-        return self.model.gate_temperature
+        # The model is wrapped by DDP, access the underlying module
+        self.model.module.gate_temperature = max(self.args.min_gate_temperature, annealed_temp)
+        return self.model.module.gate_temperature
 
     @torch.no_grad()
     def _custom_generate_sequences(self, input_ids, attention_mask):
-        self.model.eval()
+        # The model is wrapped by DDP, access the underlying module for eval and custom attrs
+        self.model.module.eval()
         batch_size, prompt_len = input_ids.shape
-        device = self.model.device
+        device = self.model.module.device
         
         gen_config = GenerationConfig(
             max_new_tokens=self.args.max_completion_length,
@@ -79,7 +84,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         initial_lm_outputs, h_t_after_prompt = self.model(
             input_ids=input_ids, attention_mask=current_full_attention_mask, use_cache=True,
             gumbel_hard_during_forward=self.args.gumbel_hard_generation,
-            return_last_hidden_state=True # Pass flag to get hidden state
+            return_last_hidden_state=True
         )
         past_key_values = initial_lm_outputs.past_key_values
         prev_h_for_next_step = h_t_after_prompt[:, -1:, :]
@@ -104,10 +109,10 @@ class CustomGRPOTrainer(GRPOTrainer):
                 input_ids=next_tokens, attention_mask=current_full_attention_mask, past_key_values=past_key_values,
                 prev_step_last_hidden_state=prev_h_for_next_step, use_cache=True,
                 gumbel_hard_during_forward=self.args.gumbel_hard_generation,
-                return_last_hidden_state=True # Pass flag to get hidden state
+                return_last_hidden_state=True
             )
             
-            step_gate_values = self.model.current_gate_values_for_batch.squeeze()
+            step_gate_values = self.model.module.current_gate_values_for_batch.squeeze()
             for i in range(batch_size):
                 all_gate_values[i].append(step_gate_values[i].item() if batch_size > 1 else step_gate_values.item())
 
@@ -115,12 +120,10 @@ class CustomGRPOTrainer(GRPOTrainer):
             prev_h_for_next_step = h_t_current_step
             next_token_logits = lm_outputs_step.logits[:, -1, :]
         
-        self.model.train()
+        self.model.module.train()
         return generated_ids, all_gate_values, current_gumbel_model_temp
 
-    # The rest of the trainer methods (generate_and_compute_reward, etc.) do not need changes
     def generate_and_compute_reward(self, batch):
-        # This method remains the same
         input_ids, attention_mask = batch["input_ids"], batch["attention_mask"]
         ground_truths = batch["ground_truths"]
         prompt_len = input_ids.shape[1]
@@ -129,7 +132,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         expanded_attention_mask = attention_mask.repeat_interleave(self.args.num_generations, dim=0)
         
         sequences_ids, gate_values_list, current_gumbel_temp = self._custom_generate_sequences(
-            expanded_input_ids.to(self.model.device), expanded_attention_mask.to(self.model.device)
+            expanded_input_ids, expanded_attention_mask
         )
         
         completions_decoded = [self.processing_class.decode(s, skip_special_tokens=True) for s in sequences_ids]
@@ -151,7 +154,6 @@ class CustomGRPOTrainer(GRPOTrainer):
         return completions_decoded, rewards
 
     def _calculate_and_log_metrics(self, completions, gates, rewards, gts, p_len, gumbel_temp):
-        # This method remains the same
         metrics, scores, t_pens, g_pens, all_g, r_g, nr_g = {}, [], [], [], [], [], []
         bot_id, eot_id = self.processing_class.convert_tokens_to_ids(["[bot]", "[eot]"])
 
@@ -196,7 +198,6 @@ class CustomGRPOTrainer(GRPOTrainer):
         return metrics
 
     def _log_to_progress_table(self, step, metrics, loss):
-        # This method remains the same
         if self.accelerator.is_main_process:
             self.progress_table.add_data(
                 step, loss.item() if loss else float('nan'), metrics.get("reward_mean", 0), metrics.get("correctness_mean", 0),
@@ -210,26 +211,29 @@ def main(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    exp_name = config["output_dir"]
-    if os.path.exists(exp_name) and os.listdir(exp_name) and not config.get("overwrite_output_dir"):
-        print(f"Directory {exp_name} exists and is not empty. Exiting.")
-        return
+    # Instantiate the Accelerator at the beginning of main
+    accelerator = Accelerator()
 
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    exp_name = config["output_dir"]
+    # Use the accelerator's check for the main process
+    if accelerator.is_main_process:
+        if os.path.exists(exp_name) and os.listdir(exp_name) and not config.get("overwrite_output_dir"):
+            print(f"Directory {exp_name} exists and is not empty. Exiting.")
+            return
         wandb.init(project=config.get("wandb_project", "dtt-project"), name=exp_name, config=config)
         wandb.save(config_path)
 
-    # --- Corrected Model Initialization ---
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16,
     )
 
+    # Use the explicit device_map to load one full model per process/GPU
     base_model = AutoModelForCausalLM.from_pretrained(
         config["model_name"],
         quantization_config=bnb_config,
-        #device_map="auto",
+        device_map={"": accelerator.device}
     )
 
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
@@ -249,7 +253,6 @@ def main(config_path):
         embedding_dim=config["embedding_dim"],
         gate_temperature=config["initial_gate_temperature"],
     )
-    # --- End of Corrected Model Initialization ---
 
     special_tokens = {'additional_special_tokens': ['[bot]', '[eot]']}
     if tokenizer.add_special_tokens(special_tokens) > 0:
@@ -273,19 +276,17 @@ def main(config_path):
         max_grad_norm=config["max_grad_norm"],
         logging_steps=config.get("logging_steps", 10),
         seed=config.get("seed", 42),
-        report_to="wandb" if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0 else None,
+        report_to="wandb" if accelerator.is_main_process else None,
         remove_unused_columns=False,
         bf16=config.get("use_bf16", False),
         fp16=config.get("use_fp16", False),
         
-        # Standard GRPO arguments
         beta=config["beta_grpo"],
         temperature=config["sampling_temperature_grpo"],
         num_generations=config["group_size_grpo"],
         max_prompt_length=config["max_prompt_length"],
         max_completion_length=config["max_completion_length"],
         
-        # Custom arguments
         initial_gate_temperature=config["initial_gate_temperature"],
         min_gate_temperature=config.get("min_gate_temperature", 0.1),
         gumbel_hard_generation=config.get("gumbel_hard_generation_train", False),
@@ -306,12 +307,14 @@ def main(config_path):
     )
     trainer.train(resume_from_checkpoint=config.get("resume_from_checkpoint", None))
 
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        # Saving the final model
-        model.save_pretrained(exp_name)
+    if accelerator.is_main_process:
+        # It's good practice to unwrap the model before saving
+        unwrapped_model = accelerator.unwrap_model(trainer.model)
+        unwrapped_model.save_pretrained(exp_name)
         print(f"Training complete. Model saved to {exp_name}")
         if wandb.run:
             wandb.finish()
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
