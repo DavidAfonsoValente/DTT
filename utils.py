@@ -2,8 +2,10 @@ from datasets import load_dataset
 
 def _preprocess_function_map(examples, tokenizer, max_prompt_length, question_field_name, answer_field_name):
     """Helper function to tokenize questions and prepare them for the model."""
+    prompts = examples[question_field_name]
+    
     tokenized_prompts = tokenizer(
-        examples[question_field_name],
+        prompts,
         max_length=max_prompt_length,
         padding="max_length", 
         truncation=True,
@@ -11,6 +13,7 @@ def _preprocess_function_map(examples, tokenizer, max_prompt_length, question_fi
     )
     
     processed_batch = {
+        "prompt": prompts,  # <-- Add the raw prompts here
         "input_ids": tokenized_prompts["input_ids"],
         "attention_mask": tokenized_prompts["attention_mask"],
         "ground_truths": examples[answer_field_name]
