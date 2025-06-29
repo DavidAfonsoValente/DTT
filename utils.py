@@ -41,11 +41,13 @@ def preprocess_dataset(dataset_name, data_dir, tokenizer, max_prompt_length, spl
             "question_field_name": question_field,
             "answer_field_name": answer_field
         },
-        remove_columns=raw_dataset.column_names
     )
     
-    required_columns = ["input_ids", "attention_mask", "ground_truths"]
-    if not all(col in processed_dataset.column_names for col in required_columns):
-        raise ValueError(f"Processed dataset is missing one or more required columns: {required_columns}")
+    final_columns = ["input_ids", "attention_mask", "ground_truths", "prompt"]
+    
+    processed_dataset = processed_dataset.select_columns(final_columns)
+
+    if not all(col in processed_dataset.column_names for col in final_columns):
+        raise ValueError(f"Processed dataset is missing one or more required columns: {final_columns}")
             
     return processed_dataset
