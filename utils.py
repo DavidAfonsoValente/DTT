@@ -2,16 +2,19 @@ from datasets import load_dataset
 
 def _preprocess_function_map(examples, tokenizer, max_prompt_length, question_field_name, answer_field_name):
     """Helper function to tokenize questions and prepare them for the model."""
+    
+    prompts = examples[question_field_name]
+    
     tokenized_prompts = tokenizer(
-        examples[question_field_name],
+        prompts,
         max_length=max_prompt_length,
-        padding="max_length",
+        padding="max_length",  
         truncation=True,
         return_tensors=None,
     )
-
+    
     processed_batch = {
-        "prompt": examples[question_field_name],  # <-- Add this line to keep the raw prompt text
+        "prompt": prompts,
         "input_ids": tokenized_prompts["input_ids"],
         "attention_mask": tokenized_prompts["attention_mask"],
         "ground_truths": examples[answer_field_name]
@@ -33,17 +36,16 @@ def preprocess_dataset(dataset_name, data_dir, tokenizer, max_prompt_length, spl
         _preprocess_function_map,
         batched=True,
         fn_kwargs={
-            "tokenizer": tokenizer,
+            "tokenizer": tokenizer, 
             "max_prompt_length": max_prompt_length,
             "question_field_name": question_field,
             "answer_field_name": answer_field
         },
         remove_columns=raw_dataset.column_names
     )
-
-    # The required_columns check should now account for the 'prompt' field.
-    required_columns = ["prompt", "input_ids", "attention_mask", "ground_truths"]
+    
+    required_columns = ["input_ids", "attention_mask", "ground_truths"]
     if not all(col in processed_dataset.column_names for col in required_columns):
         raise ValueError(f"Processed dataset is missing one or more required columns: {required_columns}")
-
+            
     return processed_dataset
