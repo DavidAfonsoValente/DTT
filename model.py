@@ -123,6 +123,8 @@ class SparseGatedModel(PeftModel):
                 dummy_gate_logits, self.gate_temperature, hard=gumbel_hard_during_forward
             ).detach().clone()
 
+        kwargs.pop("logits_to_keep", None)
+
         # Call the forward method of the base model (which includes the PEFT adapters)
         outputs = self.base_model(
             inputs_embeds=effective_embeddings,
