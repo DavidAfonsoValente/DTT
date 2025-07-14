@@ -78,6 +78,7 @@ class SparseGatedModel(PeftModel):
         output_hidden_states=True, # This must be True for the gating mechanism to work
         gumbel_hard_during_forward=False,
         return_last_hidden_state=False, # Flag to control the return signature
+        logits_to_keep=None, # <--- ADD THIS ARGUMENT
         **kwargs
     ):
         if input_ids is not None and inputs_embeds is not None:
@@ -122,8 +123,6 @@ class SparseGatedModel(PeftModel):
             self.current_gate_values_for_batch = gumbel_sigmoid(
                 dummy_gate_logits, self.gate_temperature, hard=gumbel_hard_during_forward
             ).detach().clone()
-
-        kwargs.pop("logits_to_keep", None)
 
         # Call the forward method of the base model (which includes the PEFT adapters)
         outputs = self.base_model(
