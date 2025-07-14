@@ -15,6 +15,7 @@ from model import SparseGatedModel
 from reward import custom_reward
 from utils import preprocess_dataset
 
+from torch import nn
 import torch.nn.functional as F
 from typing import Any, Dict, List, Optional, Tuple, Union
 
