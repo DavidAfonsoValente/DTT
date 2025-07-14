@@ -15,19 +15,10 @@ from model import SparseGatedModel
 from reward import custom_reward
 from utils import preprocess_dataset
 
+import torch.nn.functional as F
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 @dataclass
-class CustomGRPOConfig(GRPOConfig):
-    """
-    Custom GRPO configuration class to hold additional parameters for the
-    gating mechanism and custom reward function.
-    """
-    initial_gate_temperature: float = field(default=1.0, metadata={"help": "Initial temperature for the Gumbel-Sigmoid gate."})
-    min_gate_temperature: float = field(default=0.1, metadata={"help": "Minimum temperature for the Gumbel-Sigmoid gate."})
-    gumbel_hard_generation: bool = field(default=False, metadata={"help": "Whether to use the hard version of Gumbel-Sigmoid during generation in training."})
-    lambda_penalty: float = field(default=0.01, metadata={"help": "Coefficient for the token efficiency penalty in the reward."})
-    gate_penalty_coeff: float = field(default=0.05, metadata={"help": "Coefficient for the gate sparsity penalty in the reward."})
-
 class CustomGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -123,35 +114,81 @@ class CustomGRPOTrainer(GRPOTrainer):
         self.model.module.train()
         return generated_ids, all_gate_values, current_gumbel_model_temp
 
-    def generate_and_compute_reward(self, batch):
-        input_ids, attention_mask = batch["input_ids"], batch["attention_mask"]
-        ground_truths = batch["ground_truths"]
-        prompt_len = input_ids.shape[1]
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        Override training_step to implement the custom generation and reward pipeline.
+        """
+        # Move original batch to device
+        inputs = self._prepare_inputs(inputs)
         
-        expanded_input_ids = input_ids.repeat_interleave(self.args.num_generations, dim=0)
-        expanded_attention_mask = attention_mask.repeat_interleave(self.args.num_generations, dim=0)
-        
-        sequences_ids, gate_values_list, current_gumbel_temp = self._custom_generate_sequences(
-            expanded_input_ids, expanded_attention_mask
-        )
-        
-        completions_decoded = [self.processing_class.decode(s, skip_special_tokens=True) for s in sequences_ids]
-        completions_ids = [s.tolist() for s in sequences_ids]
+        # 1. Generate completions and get gate values using our custom method
+        prompt_input_ids = inputs["input_ids"]
+        prompt_attention_mask = inputs["attention_mask"]
+        prompt_len = prompt_input_ids.shape[1]
 
+        expanded_input_ids = prompt_input_ids.repeat_interleave(self.args.num_generations, dim=0)
+        expanded_attention_mask = prompt_attention_mask.repeat_interleave(self.args.num_generations, dim=0)
+
+        with torch.no_grad():
+            sequences_ids, gate_values_list, current_gumbel_temp = self._custom_generate_sequences(
+                expanded_input_ids, expanded_attention_mask
+            )
+        
+        # 2. Compute rewards using our custom reward function
+        completions_ids = [s.tolist() for s in sequences_ids]
         rewards = self.reward_funcs[0](
-            completions_ids=completions_ids, gate_values_list=gate_values_list,
-            tokenizer=self.processing_class, ground_truths=ground_truths,
-            prompt_len=prompt_len, lambda_penalty=self.args.lambda_penalty,
-            gate_penalty_coeff=self.args.gate_penalty_coeff, num_generations=self.args.num_generations
+            completions_ids=completions_ids,
+            gate_values_list=gate_values_list,
+            tokenizer=self.processing_class,
+            ground_truths=inputs["ground_truths"],
+            prompt_len=prompt_len,
+            lambda_penalty=self.args.lambda_penalty,
+            gate_penalty_coeff=self.args.gate_penalty_coeff,
+            num_generations=self.args.num_generations,
         )
         
+        # 3. Form chosen/rejected pairs based on rewards
+        rewards_tensor = torch.tensor(rewards, device=self.accelerator.device).view(-1, self.args.num_generations)
+        chosen_indices = torch.argmax(rewards_tensor, dim=-1)
+        
+        # Create pairs of (chosen, rejected)
+        chosen_responses = []
+        rejected_responses = []
+        
+        for i in range(len(prompt_input_ids)):
+            chosen_idx = chosen_indices[i]
+            # global index in the flattened batch
+            global_chosen_idx = i * self.args.num_generations + chosen_idx
+            
+            for j in range(self.args.num_generations):
+                if i * self.args.num_generations + j != global_chosen_idx:
+                    chosen_responses.append(sequences_ids[global_chosen_idx])
+                    rejected_responses.append(sequences_ids[i * self.args.num_generations + j])
+
+        # 4. Get log probabilities for the chosen and rejected sequences
+        # This requires a forward pass with the model in training mode
+        model.train()
+        
+        chosen_toks = self._left_pad_sequences(chosen_responses, self.processing_class.pad_token_id)
+        rejected_toks = self._left_pad_sequences(rejected_responses, self.processing_class.pad_token_id)
+
+        all_toks = torch.cat((chosen_toks, rejected_toks), dim=0)
+        all_logps, _ = self.get_logps(model, all_toks, prompt_len)
+        
+        chosen_logps = all_logps[:len(chosen_responses)]
+        rejected_logps = all_logps[len(chosen_responses):]
+        
+        # 5. Compute GRPO loss
+        loss = -F.logsigmoid(self.beta * (chosen_logps - rejected_logps)).mean()
+        
+        # Logging
         if self.accelerator.is_main_process and self.state.global_step % self.args.logging_steps == 0:
             metrics = self._calculate_and_log_metrics(
-                completions_ids, gate_values_list, rewards, ground_truths, prompt_len, current_gumbel_temp
+                completions_ids, gate_values_list, rewards, inputs["ground_truths"], prompt_len, current_gumbel_temp
             )
-            self._log_to_progress_table(self.state.global_step, metrics, self.state.loss if hasattr(self.state, 'loss') else None)
+            self._log_to_progress_table(self.state.global_step, metrics, loss)
 
-        return completions_decoded, rewards
+        return loss
 
     def _calculate_and_log_metrics(self, completions, gates, rewards, gts, p_len, gumbel_temp):
         metrics, scores, t_pens, g_pens, all_g, r_g, nr_g = {}, [], [], [], [], [], []
@@ -183,8 +220,10 @@ class CustomGRPOTrainer(GRPOTrainer):
                         g_pen_sum += (1.0 - g)**2; r_g.append(g)
                     else:
                         g_pen_sum += g**2; nr_g.append(g)
-                g_pens.append(self.args.gate_penalty_coeff * (g_pen_sum / len(gen_gates)))
-        
+                g_pens.append(self.args.gate_penalty_coeff * (g_pen_sum / len(gen_gates)) if gen_gates else 0.0)
+            else:
+                g_pens.append(0.0)
+
         metrics.update({
             "reward_mean": torch.tensor(rewards).mean().item(), "correctness_mean": torch.tensor(scores).mean().item(),
             "token_penalty_mean": torch.tensor(t_pens).mean().item(), "gate_penalty_mean": torch.tensor(g_pens).mean().item(),
@@ -206,6 +245,15 @@ class CustomGRPOTrainer(GRPOTrainer):
             )
             if step > 0 and step % (self.args.logging_steps * 10) == 0:
                 wandb.log({"train_progress_summary": self.progress_table})
+
+    def _left_pad_sequences(self, sequences, pad_value):
+        """Left pads a list of tensors to the same length."""
+        max_len = max(len(seq) for seq in sequences)
+        padded_sequences = [
+            torch.cat([torch.full((max_len - len(seq),), pad_value, dtype=seq.dtype, device=seq.device), seq]) 
+            for seq in sequences
+        ]
+        return torch.stack(padded_sequences)
 
 def main(config_path):
     with open(config_path, 'r') as f:
