@@ -1,7 +1,7 @@
 import torch
 
-def custom_reward(completions_ids, gate_values_list, tokenizer, ground_truths, 
-                  prompt_len, lambda_penalty, gate_penalty_coeff, num_generations):
+def custom_reward(completions_ids, gate_values_list, tokenizer, ground_truths,
+                  prompt_len, lambda_penalty, gate_penalty_coeff, num_generations, **kwargs): # <--- ADD **kwargs HERE
     """Computes reward based on correctness, efficiency, and gate sparsity."""
     rewards = []
     
