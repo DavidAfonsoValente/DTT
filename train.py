@@ -126,7 +126,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         self.model.module.train()
         return generated_ids, all_gate_values, current_gumbel_model_temp
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch: int) -> torch.Tensor:
         """
         Override training_step to implement the custom generation and reward pipeline.
         """
