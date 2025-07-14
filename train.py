@@ -20,6 +20,17 @@ import torch.nn.functional as F
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 @dataclass
+class CustomGRPOConfig(GRPOConfig):
+    """
+    Custom GRPO configuration class to hold additional parameters for the
+    gating mechanism and custom reward function.
+    """
+    initial_gate_temperature: float = field(default=1.0, metadata={"help": "Initial temperature for the Gumbel-Sigmoid gate."})
+    min_gate_temperature: float = field(default=0.1, metadata={"help": "Minimum temperature for the Gumbel-Sigmoid gate."})
+    gumbel_hard_generation: bool = field(default=False, metadata={"help": "Whether to use the hard version of Gumbel-Sigmoid during generation in training."})
+    lambda_penalty: float = field(default=0.01, metadata={"help": "Coefficient for the token efficiency penalty in the reward."})
+    gate_penalty_coeff: float = field(default=0.05, metadata={"help": "Coefficient for the gate sparsity penalty in the reward."})
+
 class CustomGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
