@@ -54,6 +54,17 @@ class CustomGRPOTrainer(GRPOTrainer):
         else:
             self.total_steps_for_annealing = self.args.max_steps if self.args.max_steps > 0 else 1000
 
+    def _prepare_inputs(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
+        """
+        Overrides the GRPOTrainer's data preparation to prevent it from
+        calling the reward function, which is handled within our custom training_step.
+        This implementation simply moves data to the correct device.
+        """
+        # By calling super(GRPOTrainer, self), we explicitly call the
+        # _prepare_inputs method from the grandparent class (transformers.Trainer),
+        # skipping the problematic GRPOTrainer implementation.
+        return super(GRPOTrainer, self)._prepare_inputs(inputs)
+    
     def _anneal_gumbel_temperature(self):
         if self.total_steps_for_annealing <= 0: return self.args.initial_gate_temperature
         progress = min(1.0, self.state.global_step / self.total_steps_for_annealing)
