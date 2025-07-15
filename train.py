@@ -3,6 +3,7 @@ import sys
 import yaml
 import torch
 import wandb
+import transformers
 from dataclasses import dataclass, field
 
 # Import the Accelerator class
@@ -63,7 +64,7 @@ class CustomGRPOTrainer(GRPOTrainer):
         # By calling super(GRPOTrainer, self), we explicitly call the
         # _prepare_inputs method from the grandparent class (transformers.Trainer),
         # skipping the problematic GRPOTrainer implementation.
-        return super(GRPOTrainer, self)._prepare_inputs(inputs)
+        return transformers.Trainer._prepare_inputs(self, inputs)
     
     def _anneal_gumbel_temperature(self):
         if self.total_steps_for_annealing <= 0: return self.args.initial_gate_temperature
