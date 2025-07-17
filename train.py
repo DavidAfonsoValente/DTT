@@ -2,297 +2,162 @@ import os
 import sys
 import yaml
 import torch
-import wandb
-import transformers
-from dataclasses import dataclass, field
-
-# Import the Accelerator class
-from accelerate import Accelerator
-from transformers import GenerationConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig
-from trl import GRPOConfig, GRPOTrainer
-
 from model import SparseGatedModel
 from reward import custom_reward
 from utils import preprocess_dataset
+import wandb
+from typing import Dict, Any
+from pathlib import Path
 
-from torch import nn
-import torch.nn.functional as F
-from typing import Any, Dict, List, Optional, Tuple, Union
+def setup_ddp() -> tuple[int, int, int]:
+    """Initialize DistributedDataParallel for multi-GPU training."""
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank)
+    return local_rank, global_rank, world_size
 
-@dataclass
-class CustomGRPOConfig(GRPOConfig):
+def cleanup_ddp() -> None:
+    """Clean up DDP environment."""
+    destroy_process_group()
+
+@torch.no_grad()
+def generate_completions(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float,
+    do_sample: bool,
+    pad_token_id: int,
+    eos_token_id: int,
+    gumbel_hard: bool
+) -> tuple[torch.Tensor, list[list[float]], list[list[float]], torch.Tensor]:
     """
-    Custom GRPO configuration class to hold additional parameters for the
-    gating mechanism and custom reward function.
+    Generate completions and collect old log probabilities.
     """
-    initial_gate_temperature: float = field(default=1.0, metadata={"help": "Initial temperature for the Gumbel-Sigmoid gate."})
-    min_gate_temperature: float = field(default=0.1, metadata={"help": "Minimum temperature for the Gumbel-Sigmoid gate."})
-    gumbel_hard_generation: bool = field(default=False, metadata={"help": "Whether to use the hard version of Gumbel-Sigmoid during generation in training."})
-    lambda_penalty: float = field(default=0.01, metadata={"help": "Coefficient for the token efficiency penalty in the reward."})
-    gate_penalty_coeff: float = field(default=0.05, metadata={"help": "Coefficient for the gate sparsity penalty in the reward."})
+    batch_size, seq_len = input_ids.shape
+    device = input_ids.device
+    generated_ids = input_ids.clone()
+    current_attention_mask = attention_mask.clone()
+    gate_values = [[] for _ in range(batch_size)]
+    old_log_probs = [[] for _ in range(batch_size)]
+    still_generating = torch.ones(batch_size, device=device, dtype=torch.bool)
 
-class CustomGRPOTrainer(GRPOTrainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        if self.accelerator.is_main_process:
-            self.progress_table = wandb.Table(columns=[
-                "step", "loss", "reward_mean", "correctness_mean", "token_penalty_mean",
-                "gate_penalty_mean", "gate_mean_overall", "gate_mean_reasoning", "gate_mean_non_reasoning",
-                "gumbel_temp_model"
-            ])
-        
-        train_batch_size = self.args.per_device_train_batch_size * \
-                           self.accelerator.num_processes * \
-                           self.args.gradient_accumulation_steps
-        
-        if len(self.train_dataset) > 0 and train_batch_size > 0:
-            unique_prompts_per_optim_step = self.args.per_device_train_batch_size * \
-                                            self.accelerator.num_processes * \
-                                            self.args.gradient_accumulation_steps
-            self.total_steps_for_annealing = (self.args.num_train_epochs * len(self.train_dataset)) // unique_prompts_per_optim_step
+    outputs, last_hidden = model(
+        input_ids=input_ids,
+        attention_mask=current_attention_mask,
+        use_cache=True,
+        gumbel_hard_during_forward=gumbel_hard,
+        return_last_hidden_state=True
+    )
+    past_key_values = outputs.past_key_values
+    next_hidden = last_hidden[:, -1:, :]
+    next_logits = outputs.logits[:, -1, :]
+
+    for _ in range(max_new_tokens):
+        if do_sample:
+            probs = torch.softmax(next_logits / temperature, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)
         else:
-            self.total_steps_for_annealing = self.args.max_steps if self.args.max_steps > 0 else 1000
+            next_tokens = torch.argmax(next_logits, dim=-1).unsqueeze(-1)
 
-    def _prepare_inputs(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
-        """
-        Overrides the GRPOTrainer's data preparation to prevent it from
-        calling the reward function, which is handled within our custom training_step.
-        This implementation simply moves data to the correct device.
-        """
-        # By calling super(GRPOTrainer, self), we explicitly call the
-        # _prepare_inputs method from the grandparent class (transformers.Trainer),
-        # skipping the problematic GRPOTrainer implementation.
-        return transformers.Trainer._prepare_inputs(self, inputs)
-    
-    def _anneal_gumbel_temperature(self):
-        if self.total_steps_for_annealing <= 0: return self.args.initial_gate_temperature
-        progress = min(1.0, self.state.global_step / self.total_steps_for_annealing)
-        annealed_temp = self.args.initial_gate_temperature - \
-                        (self.args.initial_gate_temperature - self.args.min_gate_temperature) * progress
-        # The model is wrapped by DDP, access the underlying module
-        self.model.module.gate_temperature = max(self.args.min_gate_temperature, annealed_temp)
-        return self.model.module.gate_temperature
+        log_probs = torch.log_softmax(next_logits, dim=-1)
+        chosen_log_prob = log_probs.gather(1, next_tokens).squeeze(1)
+        for i in range(batch_size):
+            if still_generating[i]:
+                old_log_probs[i].append(chosen_log_prob[i].item())
 
-    @torch.no_grad()
-    def _custom_generate_sequences(self, input_ids, attention_mask):
-        # The model is wrapped by DDP, access the underlying module for eval and custom attrs
-        self.model.module.eval()
-        batch_size, prompt_len = input_ids.shape
-        device = self.model.module.device
-        
-        gen_config = GenerationConfig(
-            max_new_tokens=self.args.max_completion_length,
-            temperature=self.args.temperature,
-            do_sample=self.args.temperature > 0,
-            pad_token_id=self.processing_class.pad_token_id,
-            eos_token_id=self.processing_class.eos_token_id,
-        )
-        
-        current_gumbel_model_temp = self._anneal_gumbel_temperature()
+        generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
+        current_attention_mask = torch.cat([current_attention_mask, torch.ones_like(next_tokens, device=device)], dim=1)
 
-        generated_ids = input_ids.clone()
-        current_full_attention_mask = attention_mask.clone()
-        all_gate_values = [[] for _ in range(batch_size)]
-        
-        initial_lm_outputs, h_t_after_prompt = self.model(
-            input_ids=input_ids, attention_mask=current_full_attention_mask, use_cache=True,
-            gumbel_hard_during_forward=self.args.gumbel_hard_generation,
+        eos_mask = (next_tokens.squeeze(-1) == eos_token_id)
+        still_generating = still_generating & (~eos_mask)
+
+        if not still_generating.any():
+            break
+
+        step_outputs, step_hidden = model(
+            input_ids=next_tokens,
+            attention_mask=current_attention_mask,
+            past_key_values=past_key_values,
+            prev_step_last_hidden_state=next_hidden,
+            use_cache=True,
+            gumbel_hard_during_forward=gumbel_hard,
             return_last_hidden_state=True
         )
-        past_key_values = initial_lm_outputs.past_key_values
-        prev_h_for_next_step = h_t_after_prompt[:, -1:, :]
-        next_token_logits = initial_lm_outputs.logits[:, -1, :]
 
-        for _ in range(self.args.max_completion_length):
-            if gen_config.do_sample:
-                probs = torch.softmax(next_token_logits / gen_config.temperature, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1)
-            else:
-                next_tokens = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-            
-            generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
-            current_full_attention_mask = torch.cat(
-                [current_full_attention_mask, torch.ones_like(next_tokens, device=device)], dim=1
-            )
+        step_gates = model.module.current_gate_values_for_batch.squeeze()
+        for i in range(batch_size):
+            if still_generating[i]:
+                gate_values[i].append(step_gates[i].item() if batch_size > 1 else step_gates.item())
 
-            if (gen_config.eos_token_id is not None) and (next_tokens.squeeze(-1) == gen_config.eos_token_id).all():
-                break
+        past_key_values = step_outputs.past_key_values
+        next_hidden = step_hidden
+        next_logits = step_outputs.logits[:, -1, :]
 
-            lm_outputs_step, h_t_current_step = self.model(
-                input_ids=next_tokens, attention_mask=current_full_attention_mask, past_key_values=past_key_values,
-                prev_step_last_hidden_state=prev_h_for_next_step, use_cache=True,
-                gumbel_hard_during_forward=self.args.gumbel_hard_generation,
-                return_last_hidden_state=True
-            )
-            
-            step_gate_values = self.model.module.current_gate_values_for_batch.squeeze()
-            for i in range(batch_size):
-                all_gate_values[i].append(step_gate_values[i].item() if batch_size > 1 else step_gate_values.item())
+    return generated_ids, gate_values, old_log_probs, current_attention_mask
 
-            past_key_values = lm_outputs_step.past_key_values
-            prev_h_for_next_step = h_t_current_step
-            next_token_logits = lm_outputs_step.logits[:, -1, :]
-        
-        self.model.module.train()
-        return generated_ids, all_gate_values, current_gumbel_model_temp
+def compute_log_probs(model: torch.nn.Module, sequences: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute per-token log probabilities for sequences.
+    """
+    outputs = model(input_ids=sequences, attention_mask=attention_mask)
+    logits = outputs.logits
+    log_probs = F.log_softmax(logits, dim=-1)
+    indices = sequences.unsqueeze(-1).expand(-1, -1, log_probs.size(-1))
+    selected_log_probs = log_probs.gather(2, indices).squeeze(2)
+    return selected_log_probs
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch: int) -> torch.Tensor:
-        """
-        Override training_step to implement the custom generation and reward pipeline.
-        """
-        # Move original batch to device
-        inputs = self._prepare_inputs(inputs)
-        
-        # 1. Generate completions and get gate values using our custom method
-        prompt_input_ids = inputs["input_ids"]
-        prompt_attention_mask = inputs["attention_mask"]
-        prompt_len = prompt_input_ids.shape[1]
+def pad_sequences(sequences: list[torch.Tensor], pad_value: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pad sequences to the maximum length on the right.
+    """
+    max_len = max(len(seq) for seq in sequences)
+    padded_sequences = [
+        torch.cat([seq, torch.full((max_len - len(seq),), pad_value, dtype=seq.dtype, device=seq.device)])
+        for seq in sequences
+    ]
+    attention_masks = [
+        torch.cat([torch.ones(len(seq), dtype=torch.long, device=seq.device),
+                   torch.zeros(max_len - len(seq), dtype=torch.long, device=seq.device)])
+        for seq in sequences
+    ]
+    return torch.stack(padded_sequences), torch.stack(attention_masks)
 
-        expanded_input_ids = prompt_input_ids.repeat_interleave(self.args.num_generations, dim=0)
-        expanded_attention_mask = prompt_attention_mask.repeat_interleave(self.args.num_generations, dim=0)
+def compute_grpo_loss(new_log_probs: torch.Tensor, old_log_probs: torch.Tensor, advantages: torch.Tensor, mask: torch.Tensor, epsilon_clip: float, beta_kl: float = 0.0) -> torch.Tensor:
+    """
+    Compute GRPO loss with clipping and masking.
+    """
+    ratios = torch.exp(new_log_probs - old_log_probs)
+    surrogate1 = ratios * advantages
+    clipped_ratios = torch.clamp(ratios, 1 - epsilon_clip, 1 + epsilon_clip)
+    surrogate2 = clipped_ratios * advantages
+    loss = -torch.min(surrogate1, surrogate2)
+    masked_loss = loss * mask
+    loss_value = masked_loss.sum() / mask.sum()
+    if beta_kl > 0:
+        kl_div = (new_log_probs - old_log_probs).sum(dim=1).mean()
+        loss_value += beta_kl * kl_div
+    return loss_value
 
-        with torch.no_grad():
-            sequences_ids, gate_values_list, current_gumbel_temp = self._custom_generate_sequences(
-                expanded_input_ids, expanded_attention_mask
-            )
-        
-        # 2. Compute rewards using our custom reward function
-        completions_ids = [s.tolist() for s in sequences_ids]
-        rewards = self.reward_funcs[0](
-            completions_ids=completions_ids,
-            gate_values_list=gate_values_list,
-            tokenizer=self.processing_class,
-            ground_truths=inputs["ground_truths"],
-            prompt_len=prompt_len,
-            lambda_penalty=self.args.lambda_penalty,
-            gate_penalty_coeff=self.args.gate_penalty_coeff,
-            num_generations=self.args.num_generations,
-        )
-        
-        # 3. Form chosen/rejected pairs based on rewards
-        rewards_tensor = torch.tensor(rewards, device=self.accelerator.device).view(-1, self.args.num_generations)
-        chosen_indices = torch.argmax(rewards_tensor, dim=-1)
-        
-        # Create pairs of (chosen, rejected)
-        chosen_responses = []
-        rejected_responses = []
-        
-        for i in range(len(prompt_input_ids)):
-            chosen_idx = chosen_indices[i]
-            # global index in the flattened batch
-            global_chosen_idx = i * self.args.num_generations + chosen_idx
-            
-            for j in range(self.args.num_generations):
-                if i * self.args.num_generations + j != global_chosen_idx:
-                    chosen_responses.append(sequences_ids[global_chosen_idx])
-                    rejected_responses.append(sequences_ids[i * self.args.num_generations + j])
-
-        # 4. Get log probabilities for the chosen and rejected sequences
-        # This requires a forward pass with the model in training mode
-        model.train()
-        
-        chosen_toks = self._left_pad_sequences(chosen_responses, self.processing_class.pad_token_id)
-        rejected_toks = self._left_pad_sequences(rejected_responses, self.processing_class.pad_token_id)
-
-        all_toks = torch.cat((chosen_toks, rejected_toks), dim=0)
-        all_logps, _ = self.get_logps(model, all_toks, prompt_len)
-        
-        chosen_logps = all_logps[:len(chosen_responses)]
-        rejected_logps = all_logps[len(chosen_responses):]
-        
-        # 5. Compute GRPO loss
-        loss = -F.logsigmoid(self.beta * (chosen_logps - rejected_logps)).mean()
-        
-        # Logging
-        if self.accelerator.is_main_process and self.state.global_step % self.args.logging_steps == 0:
-            metrics = self._calculate_and_log_metrics(
-                completions_ids, gate_values_list, rewards, inputs["ground_truths"], prompt_len, current_gumbel_temp
-            )
-            self._log_to_progress_table(self.state.global_step, metrics, loss)
-
-        return loss
-
-    def _calculate_and_log_metrics(self, completions, gates, rewards, gts, p_len, gumbel_temp):
-        metrics, scores, t_pens, g_pens, all_g, r_g, nr_g = {}, [], [], [], [], [], []
-        bot_id, eot_id = self.processing_class.convert_tokens_to_ids(["[bot]", "[eot]"])
-
-        for k, (ids, gen_gates) in enumerate(zip(completions, gates)):
-            gt_ans = gts[k // self.args.num_generations]
-            t = torch.tensor(ids); b_idxs, e_idxs = (t[p_len:]==bot_id).nonzero()+p_len, (t[p_len:]==eot_id).nonzero()+p_len
-            b_idx, e_idx = -1, -1
-            for b in b_idxs:
-                for e in e_idxs:
-                    if e > b: b_idx, e_idx = b.item(), e.item(); break
-                if b_idx != -1: break
-            
-            correct = 0.0
-            if b_idx != -1:
-                pred = self.processing_class.decode(ids[e_idx+1:], skip_special_tokens=True).strip()
-                if pred == gt_ans.strip(): correct = 1.0
-            scores.append(correct)
-
-            r_toks = (e_idx - b_idx - 1) if b_idx != -1 and e_idx > b_idx else 0
-            t_pens.append(self.args.lambda_penalty * r_toks)
-            
-            g_pen_sum = 0
-            if gen_gates:
-                for i, g in enumerate(gen_gates):
-                    all_g.append(g); idx = p_len + i
-                    if b_idx != -1 and b_idx < idx <= e_idx:
-                        g_pen_sum += (1.0 - g)**2; r_g.append(g)
-                    else:
-                        g_pen_sum += g**2; nr_g.append(g)
-                g_pens.append(self.args.gate_penalty_coeff * (g_pen_sum / len(gen_gates)) if gen_gates else 0.0)
-            else:
-                g_pens.append(0.0)
-
-        metrics.update({
-            "reward_mean": torch.tensor(rewards).mean().item(), "correctness_mean": torch.tensor(scores).mean().item(),
-            "token_penalty_mean": torch.tensor(t_pens).mean().item(), "gate_penalty_mean": torch.tensor(g_pens).mean().item(),
-            "gumbel_temp_model": gumbel_temp, "gate_mean_overall": torch.tensor(all_g).mean().item() if all_g else 0,
-            "gate_mean_reasoning": torch.tensor(r_g).mean().item() if r_g else 0,
-            "gate_mean_non_reasoning": torch.tensor(nr_g).mean().item() if nr_g else 0,
-        })
-        if all_g: metrics["gate_histogram_overall"] = wandb.Histogram(all_g)
-        wandb.log({f"train/{k}": v for k, v in metrics.items() if "hist" not in k})
-        if "gate_histogram_overall" in metrics: wandb.log({"train/gate_histogram_overall": metrics["gate_histogram_overall"]})
-        return metrics
-
-    def _log_to_progress_table(self, step, metrics, loss):
-        if self.accelerator.is_main_process:
-            self.progress_table.add_data(
-                step, loss.item() if loss else float('nan'), metrics.get("reward_mean", 0), metrics.get("correctness_mean", 0),
-                metrics.get("token_penalty_mean", 0), metrics.get("gate_penalty_mean", 0), metrics.get("gate_mean_overall", 0),
-                metrics.get("gate_mean_reasoning", 0), metrics.get("gate_mean_non_reasoning", 0), metrics.get("gumbel_temp_model", 0)
-            )
-            if step > 0 and step % (self.args.logging_steps * 10) == 0:
-                wandb.log({"train_progress_summary": self.progress_table})
-
-    def _left_pad_sequences(self, sequences, pad_value):
-        """Left pads a list of tensors to the same length."""
-        max_len = max(len(seq) for seq in sequences)
-        padded_sequences = [
-            torch.cat([torch.full((max_len - len(seq),), pad_value, dtype=seq.dtype, device=seq.device), seq]) 
-            for seq in sequences
-        ]
-        return torch.stack(padded_sequences)
-
-def main(config_path):
-    with open(config_path, 'r') as f:
+def main(config_path: str) -> None:
+    """Main training function with GRPO implementation."""
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
-    # Instantiate the Accelerator at the beginning of main
-    accelerator = Accelerator()
+    local_rank, global_rank, world_size = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}")
 
-    exp_name = config["output_dir"]
-    # Use the accelerator's check for the main process
-    if accelerator.is_main_process:
-        if os.path.exists(exp_name) and os.listdir(exp_name) and not config.get("overwrite_output_dir"):
-            print(f"Directory {exp_name} exists and is not empty. Exiting.")
-            return
-        wandb.init(project=config.get("wandb_project", "dtt-project"), name=exp_name, config=config)
+    if global_rank == 0:
+        wandb.init(project=config.get("wandb_project", "grpo-training"), name=config["output_dir"], config=config)
         wandb.save(config_path)
 
     bnb_config = BitsAndBytesConfig(
@@ -301,15 +166,13 @@ def main(config_path):
         bnb_4bit_compute_dtype=torch.float16,
     )
 
-    # Use the explicit device_map to load one full model per process/GPU
     base_model = AutoModelForCausalLM.from_pretrained(
         config["model_name"],
         quantization_config=bnb_config,
-        device_map={"": accelerator.device}
+        device_map={"": device}
     )
 
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
-
     lora_config = LoraConfig(
         r=config["lora_rank"],
         lora_alpha=config["lora_rank"] * 2,
@@ -322,71 +185,128 @@ def main(config_path):
         model=base_model,
         peft_config=lora_config,
         hidden_size=config["hidden_size"],
-        embedding_dim=config["embedding_dim"],
+        embedding_dim=base_model.config.hidden_size,
         gate_temperature=config["initial_gate_temperature"],
-    )
-
-    special_tokens = {'additional_special_tokens': ['[bot]', '[eot]']}
-    if tokenizer.add_special_tokens(special_tokens) > 0:
-        model.resize_token_embeddings(len(tokenizer))
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    training_args = CustomGRPOConfig(
-        output_dir=exp_name,
-        per_device_train_batch_size=config["per_device_train_batch_size"],
-        gradient_accumulation_steps=config["gradient_accumulation_steps"],
-        num_train_epochs=config["num_train_epochs"],
-        max_steps=config.get("max_steps", -1),
-        save_steps=config["save_steps"],
-        save_total_limit=config["save_total_limit"],
-        learning_rate=config["lr"],
-        lr_scheduler_type=config["lr_scheduler_type"],
-        warmup_ratio=config["warmup_ratio"],
-        optim=config.get("optimizer", "adamw_torch"),
-        max_grad_norm=config["max_grad_norm"],
-        logging_steps=config.get("logging_steps", 10),
-        seed=config.get("seed", 42),
-        report_to="wandb" if accelerator.is_main_process else None,
-        remove_unused_columns=False,
-        bf16=config.get("use_bf16", False),
-        fp16=config.get("use_fp16", False),
-        
-        beta=config["beta_grpo"],
-        temperature=config["sampling_temperature_grpo"],
-        num_generations=config["group_size_grpo"],
-        max_prompt_length=config["max_prompt_length"],
-        max_completion_length=config["max_completion_length"],
-        
-        initial_gate_temperature=config["initial_gate_temperature"],
-        min_gate_temperature=config.get("min_gate_temperature", 0.1),
-        gumbel_hard_generation=config.get("gumbel_hard_generation_train", False),
-        lambda_penalty=config["lambda_penalty"],
-        gate_penalty_coeff=config["gate_penalty_coeff"],
-    )
+    ).to(device)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     train_dataset = preprocess_dataset(
         config["dataset_name"], config["data_dir"], tokenizer, config["max_prompt_length"], "train"
     )
 
-    trainer = CustomGRPOTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        processing_class=tokenizer,
-        reward_funcs=[custom_reward]
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["per_device_train_batch_size"],
+        sampler=train_sampler,
+        num_workers=4
     )
-    trainer.train(resume_from_checkpoint=config.get("resume_from_checkpoint", None))
 
-    if accelerator.is_main_process:
-        # It's good practice to unwrap the model before saving
-        unwrapped_model = accelerator.unwrap_model(trainer.model)
-        unwrapped_model.save_pretrained(exp_name)
-        print(f"Training complete. Model saved to {exp_name}")
-        if wandb.run:
-            wandb.finish()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
+    num_training_steps = (
+        len(train_dataset) // (config["per_device_train_batch_size"] * world_size * config["gradient_accumulation_steps"])
+    ) * config["num_train_epochs"]
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_training_steps,
+        eta_min=0
+    )
 
+    global_step = 0
+    for epoch in range(config["num_train_epochs"]):
+        train_sampler.set_epoch(epoch)
+        model.train()
+
+        for step, batch in enumerate(train_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            ground_truths = batch["ground_truths"]
+
+            # Compute per-sequence prompt lengths
+            prompt_lens = attention_mask.sum(dim=1)
+
+            expanded_input_ids = input_ids.repeat_interleave(config["group_size_grpo"], dim=0)
+            expanded_attention_mask = attention_mask.repeat_interleave(config["group_size_grpo"], dim=0)
+
+            generated_ids, gate_values, old_log_probs, _ = generate_completions(
+                model,
+                expanded_input_ids,
+                expanded_attention_mask,
+                config["max_completion_length"],
+                config["sampling_temperature_grpo"],
+                config["sampling_temperature_grpo"] > 0,
+                tokenizer.pad_token_id,
+                tokenizer.eos_token_id,
+                config["gumbel_hard_generation_train"]
+            )
+
+            completions_ids = [s.tolist() for s in generated_ids]
+            rewards = custom_reward(
+                completions_ids,
+                gate_values,
+                tokenizer,
+                ground_truths,
+                prompt_lens,
+                config["lambda_penalty"],
+                config["gate_penalty_coeff"],
+                config["group_size_grpo"]
+            )
+
+            rewards_tensor = torch.tensor(rewards, device=device).view(-1, config["group_size_grpo"])
+            mean_rewards = rewards_tensor.mean(dim=1, keepdim=True)
+            std_rewards = rewards_tensor.std(dim=1, keepdim=True)
+            advantages = (rewards_tensor - mean_rewards) / (std_rewards + 1e-8)
+
+            padded_sequences, padded_masks = pad_sequences(generated_ids, tokenizer.pad_token_id)
+            new_log_probs = compute_log_probs(model, padded_sequences, padded_masks)
+
+            # Align old_log_probs with new_log_probs
+            old_log_probs_tensor = []
+            for i in range(len(generated_ids)):
+                seq_len = len(generated_ids[i])
+                old_log_probs_padded = old_log_probs[i] + [0.0] * (seq_len - len(old_log_probs[i]))
+                old_log_probs_tensor.append(torch.tensor(old_log_probs_padded, device=device))
+            old_log_probs_tensor = torch.stack(old_log_probs_tensor)
+
+            # Create mask for generated tokens
+            mask = torch.zeros_like(new_log_probs)
+            for i in range(len(generated_ids)):
+                prompt_len = prompt_lens[i // config["group_size_grpo"]]
+                mask[i, prompt_len:] = 1
+
+            loss = compute_grpo_loss(
+                new_log_probs,
+                old_log_probs_tensor,
+                advantages,
+                mask,
+                config["epsilon_clip"],
+                config["beta_kl"]
+            )
+            loss.backward()
+
+            if (step + 1) % config["gradient_accumulation_steps"] == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+                global_step += 1
+
+                if global_rank == 0:
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/learning_rate": optimizer.param_groups[0]["lr"],
+                        "train/global_step": global_step
+                    })
+
+            if global_step % config["save_steps"] == 0 and global_rank == 0:
+                checkpoint_dir = Path(config["output_dir"]) / f"checkpoint-{global_step}"
+                model.module.save_pretrained(checkpoint_dir)
+
+    if global_rank == 0:
+        model.module.save_pretrained(config["output_dir"])
+        wandb.finish()
+
+    cleanup_ddp()
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
