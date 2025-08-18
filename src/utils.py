@@ -1,8 +1,8 @@
+# src/utils.py
 from torch.utils.data import DataLoader
 import torch
 from src.rewards import compute_reward
-from src.datasets import DTTDataset
-from datasets import collate_fn
+from src.datasets import DTTDataset, collate_fn
 
 def validate_bootstrap(model, config, accelerator, tokenizer):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', data_dir=config.get('data_dir', 'data'))
@@ -39,8 +39,8 @@ def validate_grpo(model, config, accelerator, tokenizer):
         for batch in val_loader:
             if num_samples >= 256: break
             gen_ids, gates = model.generate(batch['input_ids'], max_length=config['max_length'], return_gates=True)
-            reward = compute_reward(gen_ids[0], gates[0], tokenizer, batch['answer_gt'][0], model.bot_id, model.eot_id)
-            total_reward += reward
+            reward_dict = compute_reward(gen_ids[0], gates[0], tokenizer, batch['answer_gt'][0], model.bot_id, model.eot_id, config['dataset'], model.dummy_id)
+            total_reward += reward_dict['total']
             num_samples += 1
     
     return total_reward / num_samples if num_samples > 0 else 0.0

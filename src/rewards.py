@@ -1,6 +1,7 @@
+# src/rewards.py
 import torch
 
-def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id):
+def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset, dummy_id):
     bot_pos = (completion_ids == bot_id).nonzero(as_tuple=True)[0]
     eot_pos = (completion_ids == eot_id).nonzero(as_tuple=True)[0]
     has_span = len(bot_pos) > 0 and len(eot_pos) > 0 and bot_pos[0] < eot_pos[0]
@@ -8,14 +9,17 @@ def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id):
     r_struct = 0.2 if has_span else -1.0
     
     if has_span:
-        think_len = eot_pos[0] - bot_pos[0] - 1
-        r_eff = -0.01 * think_len.item()
-        pred_answer = tokenizer.decode(completion_ids[eot_pos[0] + 1:]).strip()
+        span_ids = completion_ids[bot_pos[0] + 1:eot_pos[0]]
+        think_len = (span_ids != dummy_id).sum().item()  # Surface tokens only
+        r_eff = -0.01 * think_len
+        pred_ids = [id.item() for id in completion_ids[eot_pos[0] + 1:] if id != dummy_id]
+        pred_answer = tokenizer.decode(pred_ids).strip()
     else:
         r_eff = 0.0
-        pred_answer = tokenizer.decode(completion_ids).strip()
+        pred_ids = [id.item() for id in completion_ids if id != dummy_id]
+        pred_answer = tokenizer.decode(pred_ids).strip()
     
-    if 'gsm8k' in str(tokenizer).lower():
+    if dataset == 'gsm8k':
         try:
             pred_num = float(pred_answer.split('####')[-1].strip() if '####' in pred_answer else pred_answer)
             gt_num = float(answer_gt.split('####')[-1].strip())
@@ -33,7 +37,16 @@ def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id):
         r_gate = 0.5 * g_in - 0.2 * g_out
     else:
         r_gate = -0.2
-
-    components = [r_struct, r_corr, r_eff, r_gate.item()]
+    
+    components = [r_struct, r_corr, r_eff, r_gate.item() if isinstance(r_gate, torch.Tensor) else r_gate]
     clipped = [min(max(c, -1.5), 1.5) for c in components]
-    return sum(clipped)
+    total_reward = sum(clipped)
+    
+    # Return dict for logging components
+    return {
+        'total': total_reward,
+        'struct': clipped[0],
+        'corr': clipped[1],
+        'eff': clipped[2],
+        'gate': clipped[3]
+    }

@@ -1,5 +1,6 @@
+# src/datasets.py
 from datasets import load_dataset
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import random
 import torch
 import os
@@ -47,7 +48,7 @@ class DTTDataset(Dataset):
             return {'input_ids': input_ids, 'labels': input_ids.clone(), 'noisy_mask': noisy_mask, 'answer_gt': answer}
 
         input_ids = self.tokenizer.encode(question, return_tensors='pt').squeeze()
-        return {'input_ids': input_ids, 'answer_gt': answer}
+        return {'input_ids': input_ids, 'answer_gt': answer, 'noisy_mask': None}
 
 def collate_fn(batch):
     input_ids = [b['input_ids'] for b in batch]

@@ -1,13 +1,13 @@
+# src/grpo.py
+from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
 from src.rewards import compute_reward
 from src.utils import validate_grpo
-from src.datasets import collate_fn
-from src.model import DTTModel
-from torch.nn.functional import kl_div
 import wandb
+from src.datasets import collate_fn
 
 def train_grpo(model, dataset, config, accelerator, ref_checkpoint):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
@@ -43,19 +43,19 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint):
                 
                 completions = []
                 rewards = []
-                r_structs = []
-                r_corrs = []
-                r_effs = []
-                r_gates = []
+                reward_dicts = []
                 for _ in range(config['group_size']):
                     gen_ids, gates = model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)
-                    reward = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id)
-                    # Assume compute_reward returns dict for components if modified, but for now approximate
+                    reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id)
                     completions.append(gen_ids)
-                    rewards.append(reward)
-                    # To log components, modify compute_reward to return dict, but for simplicity, sum here
+                    rewards.append(reward_dict['total'])
+                    reward_dicts.append(reward_dict)
                 num_samples += config['group_size']
                 epoch_reward += sum(rewards)
+                epoch_r_struct += sum(d['struct'] for d in reward_dicts)
+                epoch_r_corr += sum(d['corr'] for d in reward_dicts)
+                epoch_r_eff += sum(d['eff'] for d in reward_dicts)
+                epoch_r_gate += sum(d['gate'] for d in reward_dicts)
                 
                 mu = sum(rewards) / config['group_size']
                 sigma = (sum((r - mu)**2 for r in rewards) / config['group_size'])**0.5 + 1e-8
@@ -104,12 +104,19 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint):
                 prev_val_reward = val_reward
         
         avg_reward = epoch_reward / num_samples if num_samples > 0 else 0
+        avg_r_struct = epoch_r_struct / num_samples if num_samples > 0 else 0
+        avg_r_corr = epoch_r_corr / num_samples if num_samples > 0 else 0
+        avg_r_eff = epoch_r_eff / num_samples if num_samples > 0 else 0
+        avg_r_gate = epoch_r_gate / num_samples if num_samples > 0 else 0
         avg_kl = epoch_kl / num_samples if num_samples > 0 else 0
-        # Add avg for components if extracted
         
         if accelerator.is_local_main_process:
             wandb.log({
                 "grpo/epoch": epoch + 1,
                 "grpo/avg_reward": avg_reward,
+                "grpo/avg_r_struct": avg_r_struct,
+                "grpo/avg_r_corr": avg_r_corr,
+                "grpo/avg_r_eff": avg_r_eff,
+                "grpo/avg_r_gate": avg_r_gate,
                 "grpo/avg_kl": avg_kl
             })

@@ -1,6 +1,7 @@
+# train.py
 import yaml
 from accelerate import Accelerator
-from transformers import GPT2Config
+from transformers import GPT2Config, GPT2Tokenizer
 from src.model import DTTModel
 from src.datasets import DTTDataset
 from src.bootstrap import train_bootstrap
@@ -26,7 +27,11 @@ config['dataset'] = args.dataset
 if accelerator.is_local_main_process:
     wandb.init(project="dtt-training", config=config, name=f"{args.dataset}-stage{args.stage}")
 
-tokenizer = DTTModel(GPT2Config.from_pretrained('gpt2')).tokenizer
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+tokenizer.add_special_tokens({
+    'additional_special_tokens': ['[bot]', '[eot]'],
+    'pad_token': '<pad>'
+})
 dataset = DTTDataset(args.dataset, tokenizer, data_dir=config.get('data_dir', 'data'))
 model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
 
