@@ -9,11 +9,15 @@ from torch.nn.utils.rnn import pad_sequence
 class DTTDataset(Dataset):
     def __init__(self, dataset_name, tokenizer, split='train', synthetic_ratio=0.15, data_dir='data'):
         self.tokenizer = tokenizer
-        self.synthetic_ratio = synthetic_ratio
+        self.dataset_name = dataset_name
         self.vocab_size = len(tokenizer) - 3  # Adjusted for added tokens
         self.bot_id = tokenizer.convert_tokens_to_ids('[bot]')
         self.eot_id = tokenizer.convert_tokens_to_ids('[eot]')
         self.data_dir = data_dir
+        self.is_synthetic = synthetic_ratio > 0
+        self.synthetic_ratio = synthetic_ratio
+        if split == 'valid':
+            split = 'test' if dataset_name in ['gsm8k', 'prontoqa'] else 'validation'
 
         if dataset_name == 'gsm8k':
             self.data = load_dataset('gsm8k', 'main', split=split)
@@ -27,6 +31,10 @@ class DTTDataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
 
+        if self.is_synthetic:
+            num_samples = int(len(self.data) * self.synthetic_ratio)
+            self.data = self.data.shuffle(seed=42).select(range(num_samples))
+
     def __len__(self):
         return len(self.data)
 
@@ -34,26 +42,30 @@ class DTTDataset(Dataset):
         item = self.data[idx]
         question = item['question']['text'] if isinstance(item['question'], dict) else item['question']
         answer = item['answer'] if 'answer' in item else (item['answers'][0] if 'answers' in item else item.get('explanation', ''))
+        answer_gt = answer.split('####')[-1].strip() if self.dataset_name == 'gsm8k' else answer
 
-        input_ids = self.tokenizer.encode(question, return_tensors='pt').squeeze()
+        question_ids = self.tokenizer.encode(question, return_tensors='pt').squeeze()
+        input_ids = question_ids.clone()
+        noisy_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        labels = torch.full_like(input_ids, -100)
 
-        if random.random() < self.synthetic_ratio:
+        if self.is_synthetic:
             k = random.randint(0, 5)
             fillers_ids = [random.randint(0, self.vocab_size - 1) for _ in range(k)]
             fillers_text = ' '.join(self.tokenizer.decode([f]) for f in fillers_ids)
-            input_text = f"{question} [bot] {fillers_text} [eot] {answer}"
-            input_ids = self.tokenizer.encode(input_text, return_tensors='pt').squeeze()
-            bot_pos = (input_ids == self.bot_id).nonzero(as_tuple=True)[0][0].item() if len((input_ids == self.bot_id).nonzero()) > 0 else -1
-            eot_pos = (input_ids == self.eot_id).nonzero(as_tuple=True)[0][0].item() if len((input_ids == self.eot_id).nonzero()) > 0 else -1
+            suffix_text = f" [bot] {fillers_text} [eot] {answer_gt}"
+            suffix_ids = self.tokenizer.encode(suffix_text, return_tensors='pt').squeeze()
+            input_ids = torch.cat([input_ids, suffix_ids])
+            bot_pos = (input_ids == self.bot_id).nonzero(as_tuple=True)[0]
+            bot_pos = bot_pos[0].item() if bot_pos.numel() > 0 else -1
+            eot_pos = (input_ids == self.eot_id).nonzero(as_tuple=True)[0]
+            eot_pos = eot_pos[0].item() if eot_pos.numel() > 0 else -1
             noisy_mask = torch.zeros_like(input_ids, dtype=torch.bool)
             if bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos:
                 noisy_mask[bot_pos + 1:eot_pos] = True
             labels = input_ids.clone()
-        else:
-            noisy_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-            labels = input_ids.clone()
 
-        return {'input_ids': input_ids, 'labels': labels, 'noisy_mask': noisy_mask, 'answer_gt': answer}
+        return {'input_ids': input_ids, 'labels': labels, 'noisy_mask': noisy_mask, 'answer_gt': answer_gt}
 
 def collate_fn(batch, pad_token_id, ignore_index=-100):
     input_ids = pad_sequence([b['input_ids'] for b in batch], batch_first=True, padding_value=pad_token_id)

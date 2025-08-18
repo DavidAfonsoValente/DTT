@@ -117,7 +117,7 @@ class DTTModel(GPT2LMHeadModel):
 
         for _ in range(max_length - input_ids.size(1)):
             outputs = self.forward(inputs_embeds=input_embeds)
-            hidden = outputs['hidden_states'][-1][:, -1, :]
+            hidden = outputs.hidden_states[-1][:, -1, :]
             gate_logit = torch.matmul(hidden, self.gate_weight.t()) + self.gate_bias
             gate = self.gumbel_sigmoid(gate_logit.squeeze(-1), self.temperature, self.training)
             gates_list.append(gate.unsqueeze(1))

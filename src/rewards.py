@@ -1,7 +1,9 @@
 # src/rewards.py
 import torch
 
-def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset, dummy_id):
+def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset, dummy_id, weights=None):
+    if weights is None:
+        weights = {'struct': 1.0, 'corr': 1.0, 'eff': 1.0, 'gate': 1.0}
     bot_pos = (completion_ids == bot_id).nonzero(as_tuple=True)[0]
     eot_pos = (completion_ids == eot_id).nonzero(as_tuple=True)[0]
     has_span = len(bot_pos) > 0 and len(eot_pos) > 0 and bot_pos[0] < eot_pos[0]
@@ -22,7 +24,7 @@ def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, 
     if dataset == 'gsm8k':
         try:
             pred_num = float(pred_answer.split('####')[-1].strip() if '####' in pred_answer else pred_answer)
-            gt_num = float(answer_gt.split('####')[-1].strip())
+            gt_num = float(answer_gt)
             r_corr = 1.0 if abs(pred_num - gt_num) < 1e-3 else -0.5
         except:
             r_corr = -0.5
@@ -40,7 +42,7 @@ def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, 
     
     components = [r_struct, r_corr, r_eff, r_gate.item() if isinstance(r_gate, torch.Tensor) else r_gate]
     clipped = [min(max(c, -1.5), 1.5) for c in components]
-    total_reward = sum(clipped)
+    total_reward = sum(weights[k] * clipped[i] for i, k in enumerate(['struct', 'corr', 'eff', 'gate']))
     
     # Return dict for logging components
     return {

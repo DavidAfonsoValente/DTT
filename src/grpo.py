@@ -8,6 +8,32 @@ from src.rewards import compute_reward
 from src.utils import validate_grpo
 import wandb
 from src.model import DTTModel
+import math
+
+def smooth(k, a, b):
+    mid = (a + b) / 2
+    scale = (b - a) / 6
+    return 1 / (1 + math.exp(- (k - mid) / scale))
+
+def get_weights(step):
+    if step < 1500:
+        return {'struct': 1.0, 'corr': 0.4, 'eff': 0.0, 'gate': 0.6}
+    elif step < 4000:
+        s = smooth(step, 1500, 3500)
+        w_struct = 1.0 - 0.3 * s
+        w_corr = 0.4 + 0.6 * s
+        w_eff = 0.0 + 0.15 * s
+        w_gate = 0.6 - 0.1 * s
+        return {'struct': w_struct, 'corr': w_corr, 'eff': w_eff, 'gate': w_gate}
+    elif step < 7000:
+        s = smooth(step, 4000, 6500)
+        w_struct = 0.7 - 0.1 * s
+        w_corr = 1.0
+        w_eff = 0.15 + 0.15 * s
+        w_gate = 0.5 + 0.1 * s
+        return {'struct': w_struct, 'corr': w_corr, 'eff': w_eff, 'gate': w_gate}
+    else:
+        return {'struct': 0.6, 'corr': 1.0, 'eff': 0.3, 'gate': 0.6}
 
 def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
@@ -24,6 +50,18 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
     step = 0
     prev_val_reward = -float('inf')
     plateau_steps = 0
+    current_phase = 1
+    phase_thresholds = [0, 1500, 4000, 7000]
+    phase_conditions = [
+        None,
+        lambda m: m['structure_rate'] >= 0.7 and m['mean_inner_gate'] >= 0.6,
+        lambda m: m['structure_rate'] >= 0.85 and m['correct_rate'] >= 0.4,
+        lambda m: m['structure_rate'] >= 0.9 and m['correct_rate'] >= 0.6,
+    ]
+    next_transition_attempt = 0
+    prev_metrics = None
+    transition_metrics = None
+    transition_step = 0
     
     for epoch in range(config['epochs']):
         model.train()
@@ -44,9 +82,10 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
                 completions = []
                 rewards = []
                 reward_dicts = []
+                weights = get_weights(step)
                 for _ in range(config['group_size']):
                     gen_ids, gates = model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)
-                    reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id)
+                    reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id, weights=weights)
                     completions.append(gen_ids)
                     rewards.append(reward_dict['total'])
                     reward_dicts.append(reward_dict)
@@ -88,20 +127,49 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
             step += 1
             if step % 1000 == 0:
                 model.set_temperature(max(0.1, 2.0 * (0.9 ** (step / 1000))))
-                val_reward = validate_grpo(model, config, accelerator, model.tokenizer)
+                val_metrics = validate_grpo(model, config, accelerator, model.tokenizer)
                 if accelerator.is_local_main_process:
                     wandb.log({
                         "grpo/step": step,
-                        "grpo/validation_reward": val_reward
+                        "grpo/validation_reward": val_metrics['avg_reward'],
+                        "grpo/validation_structure_rate": val_metrics['structure_rate'],
+                        "grpo/validation_correct_rate": val_metrics['correct_rate'],
+                        "grpo/validation_mean_inner_gate": val_metrics['mean_inner_gate'],
+                        "grpo/validation_avg_r_struct": val_metrics['avg_r_struct'],
+                        "grpo/validation_avg_r_corr": val_metrics['avg_r_corr'],
+                        "grpo/validation_avg_r_eff": val_metrics['avg_r_eff'],
+                        "grpo/validation_avg_r_gate": val_metrics['avg_r_gate'],
                     })
-                if val_reward < prev_val_reward * 1.02:
+                if val_metrics['avg_reward'] < prev_val_reward * 1.02:
                     plateau_steps += 1000
                 else:
                     plateau_steps = 0
                 if plateau_steps >= 5000:
                     model.set_temperature(model.temperature / 2)
                     plateau_steps = 0
-                prev_val_reward = val_reward
+                prev_val_reward = val_metrics['avg_reward']
+
+                # Phase transition logic
+                prev_phase = current_phase
+                if step >= next_transition_attempt and current_phase < 4 and step >= phase_thresholds[current_phase] and phase_conditions[current_phase](val_metrics):
+                    current_phase += 1
+                    transition_metrics = prev_metrics
+                    transition_step = step
+                    next_transition_attempt = 0
+
+                # Degradation check
+                if prev_phase < current_phase and step - transition_step <= 5000:
+                    degrade = False
+                    key_metrics = ['structure_rate', 'correct_rate']
+                    for km in key_metrics:
+                        if val_metrics[km] < transition_metrics[km] * 0.85:
+                            degrade = True
+                            break
+                    if degrade:
+                        current_phase -= 1
+                        next_transition_attempt = step + 1000
+
+                prev_metrics = val_metrics
         
         avg_reward = epoch_reward / num_samples if num_samples > 0 else 0
         avg_r_struct = epoch_r_struct / num_samples if num_samples > 0 else 0
