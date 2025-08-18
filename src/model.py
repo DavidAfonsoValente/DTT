@@ -14,10 +14,9 @@ class DTTModel(GPT2LMHeadModel):
         self.resize_token_embeddings(len(self.tokenizer))
         self.bot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['bot'])
         self.eot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['eot'])
-        self.dummy_id = self.tokenizer.pad_token_id  # Use pad as dummy for latent
-        self.temperature = 2.0  # Initial tau
+        self.dummy_id = self.tokenizer.pad_token_id
+        self.temperature = 2.0
 
-        # Attention hook for masking (register in forward if noisy_mask)
         def attn_hook(module, args):
             q, k, v = args
             attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (k.size(-1)**0.5)
@@ -26,10 +25,10 @@ class DTTModel(GPT2LMHeadModel):
                 noisy_mask_exp = self.noisy_mask.unsqueeze(1).unsqueeze(2).expand(-1, attn_scores.size(1), seq_len, seq_len)
                 attn_scores = torch.where(noisy_mask_exp & noisy_mask_exp.transpose(-2, -1), attn_scores * 0.3, attn_scores)
             attn_probs = softmax(attn_scores, dim=-1)
-            return torch.matmul(attn_probs, v)  # Return output
+            return torch.matmul(attn_probs, v)
 
         for layer in self.transformer.h:
-            layer.attn.register_forward_hook(attn_hook)  # Hook all layers
+            layer.attn.register_forward_hook(attn_hook)
 
     def gumbel_sigmoid(self, logit, temperature, training):
         if training:
@@ -40,7 +39,7 @@ class DTTModel(GPT2LMHeadModel):
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, input_embeds=None, noisy_mask=None, **kwargs):
         if noisy_mask is not None:
-            self.noisy_mask = noisy_mask.float()  # For broadcasting
+            self.noisy_mask = noisy_mask.float()
 
         if input_embeds is not None:
             outputs = super().forward(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
@@ -59,7 +58,7 @@ class DTTModel(GPT2LMHeadModel):
             outputs['loss'] = loss
 
         outputs['gates'] = gates
-        self.noisy_mask = None  # Reset
+        self.noisy_mask = None
         return outputs
 
     def generate(self, input_ids, max_length=512, do_sample=True, top_p=0.95, temperature=1.0, return_gates=False, **kwargs):
@@ -68,12 +67,12 @@ class DTTModel(GPT2LMHeadModel):
         generated_ids = input_ids.clone()
         gates_list = []
 
-        for step in range(max_length - input_ids.size(1)):
+        for _ in range(max_length - input_ids.size(1)):
             outputs = self.forward(inputs_embeds=input_embeds)
             hidden = outputs['hidden_states'][-1][:, -1, :]
             gate_logit = torch.matmul(hidden, self.gate_weight.t()) + self.gate_bias
             gate = self.gumbel_sigmoid(gate_logit.squeeze(-1), self.temperature, self.training)
-            gates_list.append(gate.unsqueeze(1))  # (bs, 1)
+            gates_list.append(gate.unsqueeze(1))
 
             next_token_logits = outputs.logits[:, -1, :] / temperature
             if do_sample:
@@ -89,7 +88,7 @@ class DTTModel(GPT2LMHeadModel):
             else:
                 next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
-            if gate.mean() > 0.5:  # Threshold mean for batch
+            if gate.mean() > 0.5:
                 next_embed = gate.unsqueeze(-1) * hidden + (1 - gate).unsqueeze(-1) * self.transformer.wte(torch.full((batch_size, 1), self.dummy_id, device=hidden.device))
                 generated_ids = torch.cat([generated_ids, torch.full((batch_size, 1), self.dummy_id, device=generated_ids.device)], dim=1)
             else:

@@ -17,7 +17,7 @@ def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id):
     
     if 'gsm8k' in str(tokenizer).lower():
         try:
-            pred_num = float(pred_answer.split('####')[-1].strip() if '####' in pred_answer else pred_answer)  # GSM format
+            pred_num = float(pred_answer.split('####')[-1].strip() if '####' in pred_answer else pred_answer)
             gt_num = float(answer_gt.split('####')[-1].strip())
             r_corr = 1.0 if abs(pred_num - gt_num) < 1e-3 else -0.5
         except:

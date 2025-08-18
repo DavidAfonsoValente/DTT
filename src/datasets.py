@@ -3,7 +3,6 @@ from torch.utils.data import Dataset, DataLoader
 import random
 import torch
 import os
-import json
 
 class DTTDataset(Dataset):
     def __init__(self, dataset_name, tokenizer, split='train', synthetic_ratio=0.15, data_dir='data'):
@@ -12,19 +11,19 @@ class DTTDataset(Dataset):
         self.vocab_size = len(tokenizer) - 2
         self.bot_id = tokenizer.convert_tokens_to_ids('[bot]')
         self.eot_id = tokenizer.convert_tokens_to_ids('[eot]')
-        
+        self.data_dir = data_dir
+
         if dataset_name == 'gsm8k':
             self.data = load_dataset('gsm8k', 'main', split=split)
         elif dataset_name == 'prontoqa':
             self.data = load_dataset('allenai/prontoqa', split=split)
         elif dataset_name == 'prosqa':
-            # Custom from Coconut: Assume downloaded to data/prosqa_train.json etc.
             file_path = os.path.join(data_dir, f'prosqa_{split}.json')
             if not os.path.exists(file_path):
-                raise ValueError(f"Download prosqa_{split}.json from https://github.com/facebookresearch/coconut/data")
-            self.data = load_dataset('json', data_files=file_path, split='train')  # All as train split
+                raise ValueError(f"ProsQA file {file_path} not found. Download prosqa_{split}.json from https://github.com/facebookresearch/coconut/data")
+            self.data = load_dataset('json', data_files=file_path, split='train')
         else:
-            raise ValueError("Unknown dataset")
+            raise ValueError(f"Unknown dataset: {dataset_name}")
 
     def __len__(self):
         return len(self.data)
@@ -43,7 +42,7 @@ class DTTDataset(Dataset):
             bot_pos = (input_ids == self.bot_id).nonzero(as_tuple=True)[0][0].item() if len((input_ids == self.bot_id).nonzero()) > 0 else -1
             eot_pos = (input_ids == self.eot_id).nonzero(as_tuple=True)[0][0].item() if len((input_ids == self.eot_id).nonzero()) > 0 else -1
             noisy_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-            if bot_pos != -1 and eot_pos != -1:
+            if bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos:
                 noisy_mask[bot_pos + 1:eot_pos] = True
             return {'input_ids': input_ids, 'labels': input_ids.clone(), 'noisy_mask': noisy_mask, 'answer_gt': answer}
 

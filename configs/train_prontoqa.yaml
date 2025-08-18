@@ -1,3 +1,4 @@
+dataset: prontoqa
 batch_size: 16
 epochs: 2
 lr: 1.0e-5
@@ -7,3 +8,4 @@ epsilon: 0.2
 beta_kl: 0.01
 max_length: 512
 val_size: 256
+data_dir: data

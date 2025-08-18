@@ -3,3 +3,4 @@ transformers==4.35.2
 datasets==2.15.0
 accelerate==0.25.0
 pyyaml==6.0.1
+wandb==0.17.7

@@ -1,72 +1,83 @@
-# Discrete Thinking Tokens (DTT) Project Description
+Dynamic Thinking Tokens (DTT) Project Description
+Introduction
+The Dynamic Thinking Tokens (DTT) project trains a GPT-2-based language model to generate structured outputs for reasoning tasks, producing sequences in the format [bot]...reasoning...[eot]...answer. It employs a Gumbel-sigmoid gating mechanism to decide when to use hidden states for latent reasoning (gate ≈ 1) or token embeddings (gate ≈ 0), inspired by the Chain of Continuous Thought (COCONUT) method (arXiv:2412.06769) and related works on hybrid reasoning. The project supports datasets like GSM8K, ProsQA, and ProntoQA, uses Group Relative Policy Optimization (GRPO) for training, and is optimized for distributed training on 4 GPUs using Hugging Face's Accelerate library.
+Background
+COCONUT: Chain of Continuous Thought
+COCONUT, described in "Training Large Language Models to Reason in a Continuous Latent Space" (arXiv:2412.06769), enables LLMs to reason in a continuous latent space by feeding the last hidden state back as the next input embedding. This avoids generating intermediate text tokens, improving efficiency for tasks like mathematical reasoning or logical puzzles that require backtracking. COCONUT’s approach is particularly effective for complex reasoning, as it reduces the overhead of textual coherence.
+Project Description
+The DTT project builds on COCONUT’s latent efficiency to create a model that generates structured outputs with minimal reasoning tokens. The model uses a Gumbel-sigmoid gating mechanism to control hidden state usage, trained with GRPO to optimize correctness, efficiency, and gate sparsity.
+Model Architecture
 
-## Introduction
+DTTModel: Extends Hugging Face’s GPT2LMHeadModel for GPT-2 small, with:
+Gate Linear Layer: Produces gate logits from hidden states.
+Gumbel-Sigmoid: Ensures near-binary gate values for sparsity, controlled by a temperature parameter.
 
-The Discrete Thinking Tokens (DTT) project aims to train a GPT-2-based language model to generate structured outputs for reasoning tasks, producing sequences in the format `[bot]`...reasoning...`[eot]`...answer. It employs a sparse gating mechanism to decide when to use hidden states for latent reasoning (gate ≈ 1) or token embeddings (gate ≈ 0), inspired by the Hybrid Reasoning Policy Optimization (HRPO) framework ([arXiv:2505.18454](https://arxiv.org/abs/2505.18454)) and the Chain of Continuous Thought (COCONUT) method ([arXiv:2412.06769](https://arxiv.org/abs/2412.06769)). The project supports datasets like GSM8K, ProsQA, and ProntoQA, uses Group Relative Policy Optimization (GRPO) for training, and is optimized for distributed training on 4 GPUs with comprehensive monitoring via Weights & Biases (wandb).
 
-## Background
+Forward Pass: Combines token embeddings and hidden states based on gate values, with attention masking during bootstrap.
+Generate Method: Custom generation loop that dynamically builds input embeddings for blended latent reasoning.
 
-### HRPO: Hybrid Reasoning Policy Optimization
-HRPO, introduced in the paper *"Hybrid Latent Reasoning via Reinforcement Learning"* ([arXiv:2505.18454](https://arxiv.org/abs/2505.18454)), integrates prior hidden states into sampled tokens using a learnable gating mechanism. It initializes training with predominantly token embeddings and progressively incorporates hidden features, balancing the discrete nature of language generation with continuous reasoning representations. This hybrid approach enhances LLMs’ reasoning capabilities while maintaining generative performance, making it suitable for tasks requiring multi-step reasoning.
+Training Process
 
-### COCONUT: Chain of Continuous Thought
-COCONUT, described in *"Training Large Language Models to Reason in a Continuous Latent Space"* ([arXiv:2412.06769](https://arxiv.org/abs/2412.06769)), enables LLMs to reason in a continuous latent space by using the last hidden state as a reasoning state, fed back as the next input embedding. This avoids generating intermediate text tokens, improving efficiency for tasks like mathematical reasoning or logical puzzles that require backtracking. COCONUT’s approach is particularly effective for complex reasoning, as it reduces the overhead of textual coherence.
+Two-Stage Training:
+Stage 1 (Bootstrap): Supervised fine-tuning with synthetic data (15% of samples include random fillers between [bot] and [eot]). Uses cross-entropy loss plus hinge regularizer on gates, with attention scaled (0.3) in noisy spans.
+Stage 2 (GRPO): Reinforcement learning with GRPO, sampling 8 completions per prompt, computing group-normalized advantages, and applying PPO-style clipped surrogate loss with KL penalty to a reference model (post-bootstrap).
 
-## Project Description
 
-The DTT project combines HRPO’s hybrid reasoning and COCONUT’s focus on latent efficiency to create a model that generates structured outputs with minimal reasoning tokens. The model uses a Gumbel-sigmoid gating mechanism to control hidden state usage, trained with GRPO to optimize correctness, efficiency, and gate sparsity.
+Reward Function: Composite reward balancing:
+Structure (0.2 if valid [bot]–[eot] span, -1.0 otherwise).
+Correctness (1.0 for exact match, -0.5 otherwise; numerical tolerance for GSM8K).
+Efficiency (-0.01 per reasoning token).
+Gate (0.5 * mean inner gate - 0.2 * mean outer gate).
+Clipped to [-1.5, 1.5] per component.
 
-### Model Architecture
-- **SparseGatedModel**: Extends Unsloth’s `FastLanguageModel` for GPT-2, with:
-  - **Projection Layer**: Maps hidden states (768 dimensions) to the embedding space.
-  - **Gate Linear Layer**: Produces gate logits from hidden states.
-  - **Gumbel-Sigmoid**: Ensures near-binary gate values for sparsity, controlled by a temperature parameter.
-  - **LoRA**: Fine-tunes attention and feed-forward layers efficiently.
-- **Forward Pass**: Combines token embeddings and projected hidden states based on gate values, storing results for reward computation.
 
-### Training Process
-- **CustomGRPOTrainer**: A subclass of TRL’s `GRPOTrainer`, supporting:
-  - Distributed training on 4 GPUs using Hugging Face’s Accelerate library.
-  - Sequence generation with `model.generate`, collecting hidden states for gate value computation.
-  - Detailed wandb logging of reward components, gate statistics, and a progress table.
-- **Reward Function**: Balances:
-  - Correctness (1.0 for correct answers, 0.0 otherwise).
-  - Token efficiency (penalizes reasoning token count).
-  - Gate sparsity (encourages gate ≈ 1 during reasoning, ≈ 0 elsewhere).
-- **Datasets**: GSM8K (math), ProsQA (professional), ProntoQA (logical), with tailored preprocessing.
+Datasets: GSM8K (math), ProsQA (professional QA), ProntoQA (logical QA), with tailored preprocessing (synthetic injection for Stage 1, raw questions for Stage 2).
+Temperature Annealing: Exponential decay from 2.0 to 0.1, with halving on validation plateaus.
 
-### Evaluation
-- **Metrics**:
-  - Accuracy: Percentage of correct answers.
-  - Average Latent Steps: Number of reasoning tokens.
-  - Gate Statistics: Mean, std, min, max of gate values inside/outside reasoning.
-- **Visualizations**: Wandb logs include gate value histograms, reasoning length histograms, and a per-example metrics table.
-- **Artifacts**: Hidden states and gate values saved as `.pt` files.
+Evaluation
 
-## Implementation Details
-- **Files**:
-  - `model.py`: Defines the model with Gumbel-sigmoid gating.
-  - `reward.py`: Computes rewards for correctness, efficiency, and sparsity.
-  - `train.py`: Manages training with distributed support and wandb logging.
-  - `eval.py`: Evaluates performance with detailed metrics.
-  - `utils.py`: Handles dataset preprocessing and answer comparison.
-  - YAML configs: Specify hyperparameters for each dataset.
-- **Distributed Training**: Launched with `accelerate launch --num_processes 4 train.py --config_path <config>`.
-- **Monitoring**: Wandb tracks reward components, gate statistics, and progress tables.
+Metrics:
+Accuracy: Percentage of correct answers.
+Average Reasoning Steps: Number of tokens in reasoning span.
+Gate Statistics: Mean inner/outer gates.
 
-## Running the Project
-- **Setup**:
-  - Install: `pip install accelerate transformers trl unsloth datasets torch wandb pyyaml`.
-  - Configure Accelerate: `accelerate config` (select DDP, 4 GPUs).
-- **Training Commands**:
-  - GSM8K: `accelerate launch --num_processes 4 train.py --config_path configs/train_gsm8k.yaml`
-  - ProsQA: `accelerate launch --num_processes 4 train.py --config_path configs/train_prosqa.yaml`
-  - ProntoQA: `accelerate launch --num_processes 4 train.py --config_path configs/train_prontoqa.yaml`
-- **Evaluation**: `python eval.py --config_path configs/eval_gsm8k.yaml` (adjust for other datasets).
 
-## Conclusion
-The DTT project appears to successfully implement a language model with a sparse gating mechanism, drawing on HRPO’s hybrid reasoning and COCONUT’s latent efficiency. It supports distributed training, comprehensive monitoring, and robust evaluation across multiple datasets. Future work could explore advanced gating techniques or continuous thought integration for further optimization.
+Validation: During training, checks structure rate and mean inner gate (Stage 1), average reward (Stage 2) on 256 held-out samples.
 
-## Key Citations
-- [Hybrid Latent Reasoning via Reinforcement Learning](https://arxiv.org/abs/2505.18454)
-- [Training Large Language Models to Reason in a Continuous Latent Space](https://arxiv.org/abs/2412.06769)
+Implementation Details
+
+Files:
+model.py: Defines the custom DTT GPT-2 model with gating and blended embeddings.
+reward.py: Computes the composite reward.
+train.py: Entry point for two-stage training with Accelerate.
+bootstrap.py: Stage 1 supervised bootstrap loop.
+grpo.py: Stage 2 GRPO reinforcement loop.
+datasets.py: Dataset loading and preprocessing (HF for GSM8K/ProntoQA, JSON for ProsQA).
+utils.py: Validation helpers for structure/gate metrics and rewards.
+YAML configs: Specify hyperparameters for each dataset (e.g., gsm8k.yaml).
+
+
+Distributed Training: Uses Accelerate for DDP on 4 GPUs.
+Monitoring: Console logging via tqdm; extendable to wandb if needed.
+
+Running the Project
+
+Setup:
+Install: pip install -r requirements.txt.
+Configure Accelerate: accelerate config (select multi-GPU, DDP).
+Download ProsQA: Copy prosqa_*.json from Coconut GitHub to data/.
+
+
+Training Commands:
+GSM8K Stage 1: accelerate launch --num_processes 4 train.py --stage 1 --dataset gsm8k --config configs/gsm8k.yaml
+GSM8K Stage 2: accelerate launch --num_processes 4 train.py --stage 2 --dataset gsm8k --config configs/gsm8k.yaml --ref_checkpoint bootstrap_checkpoint
+ProsQA: Replace --dataset prosqa --config configs/prosqa.yaml.
+ProntoQA: Replace --dataset prontoqa --config configs/prontoqa.yaml.
+
+
+
+Conclusion
+The DTT project successfully implements a language model with a dynamic gating mechanism for latent reasoning, drawing on COCONUT’s continuous thought approach. It supports distributed training and robust evaluation across multiple datasets without supervised CoT data. Future work could explore advanced annealing strategies or integration with larger models for further optimization.
+Key Citations
+
+Training Large Language Models to Reason in a Continuous Latent Space
