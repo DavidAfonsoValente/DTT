@@ -1,10 +1,12 @@
-from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
 from src.rewards import compute_reward
 from src.utils import validate_grpo
+from src.datasets import collate_fn
+from src.model import DTTModel
+from torch.nn.functional import kl_div
 import wandb
 
 def train_grpo(model, dataset, config, accelerator, ref_checkpoint):

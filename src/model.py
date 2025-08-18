@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import sigmoid, relu, cross_entropy, kl_div, softmax
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
+from torch.nn.functional import sigmoid, cross_entropy, softmax
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 class DTTModel(GPT2LMHeadModel):
     def __init__(self, config):

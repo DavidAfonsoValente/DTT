@@ -2,6 +2,7 @@ from torch.utils.data import DataLoader
 import torch
 from src.rewards import compute_reward
 from src.datasets import DTTDataset
+from datasets import collate_fn
 
 def validate_bootstrap(model, config, accelerator, tokenizer):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', data_dir=config.get('data_dir', 'data'))

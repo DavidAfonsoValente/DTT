@@ -1,9 +1,10 @@
-from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
 from src.utils import validate_bootstrap
+from src.datasets import collate_fn
+from torch.nn.functional import relu
 import wandb
 
 def train_bootstrap(model, dataset, config, accelerator):
