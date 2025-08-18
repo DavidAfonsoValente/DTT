@@ -69,7 +69,7 @@ Download ProsQA: Copy prosqa_*.json from Coconut GitHub to data/.
 
 
 Training Commands:
-GSM8K Stage 1: accelerate launch --num_processes 4 train.py --stage 1 --dataset gsm8k --config configs/gsm8k.yaml
+GSM8K Stage 1: accelerate launch --num_processes 4 train.py --stage 1 --dataset gsm8k --config configs/train_gsm8k.yaml
 GSM8K Stage 2: accelerate launch --num_processes 4 train.py --stage 2 --dataset gsm8k --config configs/gsm8k.yaml --ref_checkpoint bootstrap_checkpoint
 ProsQA: Replace --dataset prosqa --config configs/prosqa.yaml.
 ProntoQA: Replace --dataset prontoqa --config configs/prontoqa.yaml.

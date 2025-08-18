@@ -3,7 +3,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
-from rewards import compute_reward
+from src.rewards import compute_reward
 from src.utils import validate_grpo
 import wandb
 

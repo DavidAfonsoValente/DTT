@@ -1,6 +1,6 @@
 from torch.utils.data import DataLoader
 import torch
-from rewards import compute_reward
+from src.rewards import compute_reward
 from src.datasets import DTTDataset
 
 def validate_bootstrap(model, config, accelerator, tokenizer):
