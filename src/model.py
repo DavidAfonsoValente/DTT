@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 import math
+import time
 
 @dataclass
 class CausalLMOutputWithGates(CausalLMOutputWithCrossAttentions):
@@ -141,8 +142,11 @@ class DTTModel(GPT2LMHeadModel):
         input_embeds = self.transformer.wte(input_ids)
         generated_ids = input_ids.clone()
         gates_list = []
+        debug = kwargs.get('debug', False)  # Assume debug passed via kwargs if needed; otherwise False
 
-        for _ in range(max_length - input_ids.size(1)):
+        for step in range(max_length - input_ids.size(1)):
+            if debug:
+                step_start = time.time()
             outputs = self.forward(inputs_embeds=input_embeds)
             hidden = outputs.hidden_states[-1][:, -1, :]
             gate_logit = torch.matmul(hidden, self.gate_weight.t()) + self.gate_bias
@@ -171,6 +175,9 @@ class DTTModel(GPT2LMHeadModel):
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
             input_embeds = torch.cat([input_embeds, next_embed], dim=1)
+            
+            if debug and step % 50 == 0:  # Print every 50 steps to avoid too much output
+                print(f"Generate step {step+1}/{max_length - input_ids.size(1)} took {time.time() - step_start:.4f}s")
 
         if return_gates:
             return generated_ids, torch.cat(gates_list, dim=1)

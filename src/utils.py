@@ -1,10 +1,10 @@
-# src/utils.py
 from torch.utils.data import DataLoader
 import torch
 from src.rewards import compute_reward
 from src.datasets import DTTDataset, collate_fn
+import time
 
-def validate_bootstrap(model, config, accelerator, tokenizer):
+def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
     val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
@@ -16,7 +16,11 @@ def validate_bootstrap(model, config, accelerator, tokenizer):
     with torch.no_grad():
         for batch in val_loader:
             if num_samples >= config['val_size']: break
+            if debug:
+                gen_start = time.time()
             gen_ids, gates = model.generate(batch['input_ids'], max_length=config['max_length'], return_gates=True)
+            if debug:
+                print(f"Validation generate took {time.time() - gen_start:.2f}s")
             bot_pos = (gen_ids == model.bot_id).nonzero(as_tuple=True)[0]
             eot_pos = (gen_ids == model.eot_id).nonzero(as_tuple=True)[0]
             if len(bot_pos) > 0 and len(eot_pos) > 0 and bot_pos[0] < eot_pos[0]:
@@ -29,7 +33,7 @@ def validate_bootstrap(model, config, accelerator, tokenizer):
     mean_inner_gate = inner_gates_sum / (structure_count or 1)
     return {'is_valid': structure_rate >= 0.70 and mean_inner_gate >= 0.60, 'structure_rate': structure_rate, 'mean_inner_gate': mean_inner_gate}
 
-def validate_grpo(model, config, accelerator, tokenizer):
+def validate_grpo(model, config, accelerator, tokenizer, debug=False):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
     val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
@@ -47,7 +51,11 @@ def validate_grpo(model, config, accelerator, tokenizer):
     with torch.no_grad():
         for batch in val_loader:
             if num_samples >= 256: break
+            if debug:
+                gen_start = time.time()
             gen_ids, gates = model.generate(batch['input_ids'], max_length=config['max_length'], return_gates=True)
+            if debug:
+                print(f"Validation generate took {time.time() - gen_start:.2f}s")
             reward_dict = compute_reward(gen_ids[0], gates[0], tokenizer, batch['answer_gt'][0], model.bot_id, model.eot_id, config['dataset'], model.dummy_id)
             total_reward += reward_dict['total']
             r_struct_sum += reward_dict['struct']

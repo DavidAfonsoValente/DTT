@@ -1,4 +1,3 @@
-# train.py
 import yaml
 from accelerate import Accelerator
 from transformers import GPT2Config, GPT2Tokenizer
@@ -15,6 +14,7 @@ parser.add_argument('--stage', type=int, choices=[1,2], required=True)
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
 parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--ref_checkpoint', type=str, default=None)
+parser.add_argument('--debug', action='store_true', default=False)
 args = parser.parse_args()
 
 accelerator = Accelerator()
@@ -39,11 +39,11 @@ model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
 collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
 
 if args.stage == 1:
-    train_bootstrap(model, dataset, config, accelerator, collate)
+    train_bootstrap(model, dataset, config, accelerator, collate, debug=args.debug)
 elif args.stage == 2:
     if args.ref_checkpoint is None:
         raise ValueError("Provide --ref_checkpoint for Stage 2")
-    train_grpo(model, dataset, config, accelerator, args.ref_checkpoint, collate)
+    train_grpo(model, dataset, config, accelerator, args.ref_checkpoint, collate, debug=args.debug)
 
 if accelerator.is_local_main_process:
     wandb.finish()

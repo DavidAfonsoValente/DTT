@@ -1,4 +1,3 @@
-# src/grpo.py
 from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -9,6 +8,7 @@ from src.utils import validate_grpo
 import wandb
 from src.model import DTTModel
 import math
+import time
 
 def smooth(k, a, b):
     mid = (a + b) / 2
@@ -35,7 +35,7 @@ def get_weights(step):
     else:
         return {'struct': 0.6, 'corr': 1.0, 'eff': 0.3, 'gate': 0.6}
 
-def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
+def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, debug=False):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
     optimizer = AdamW(model.parameters(), lr=config['lr'])
     
@@ -64,6 +64,10 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
     transition_step = 0
     
     for epoch in range(config['epochs']):
+        if debug and accelerator.is_local_main_process:
+            print(f"Starting epoch {epoch + 1}/{config['epochs']}")
+            epoch_start = time.time()
+        
         model.train()
         epoch_reward = 0.0
         epoch_r_struct = 0.0
@@ -74,6 +78,9 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
         num_samples = 0
         
         for batch in tqdm(dataloader):
+            if debug and accelerator.is_local_main_process:
+                batch_start = time.time()
+            
             batch_loss = 0.0
             for prompt_idx in range(batch['input_ids'].size(0)):
                 prompt_ids = batch['input_ids'][prompt_idx:prompt_idx+1]
@@ -84,7 +91,11 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
                 reward_dicts = []
                 weights = get_weights(step)
                 for _ in range(config['group_size']):
+                    if debug and accelerator.is_local_main_process:
+                        gen_start = time.time()
                     gen_ids, gates = model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)
+                    if debug and accelerator.is_local_main_process:
+                        print(f"Generation {_+1}/{config['group_size']} took {time.time() - gen_start:.2f}s")
                     reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id, weights=weights)
                     completions.append(gen_ids)
                     rewards.append(reward_dict['total'])
@@ -127,7 +138,7 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
             step += 1
             if step % 1000 == 0:
                 model.set_temperature(max(0.1, 2.0 * (0.9 ** (step / 1000))))
-                val_metrics = validate_grpo(model, config, accelerator, model.tokenizer)
+                val_metrics = validate_grpo(model, config, accelerator, model.tokenizer, debug=debug)
                 if accelerator.is_local_main_process:
                     wandb.log({
                         "grpo/step": step,
@@ -170,6 +181,9 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
                         next_transition_attempt = step + 1000
 
                 prev_metrics = val_metrics
+            
+            if debug and accelerator.is_local_main_process:
+                print(f"Batch processed in {time.time() - batch_start:.2f}s")
         
         avg_reward = epoch_reward / num_samples if num_samples > 0 else 0
         avg_r_struct = epoch_r_struct / num_samples if num_samples > 0 else 0
@@ -188,3 +202,6 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
                 "grpo/avg_r_gate": avg_r_gate,
                 "grpo/avg_kl": avg_kl
             })
+        
+        if debug and accelerator.is_local_main_process:
+            print(f"Epoch {epoch + 1} completed in {time.time() - epoch_start:.2f}s | Avg Reward: {avg_reward:.4f}")
