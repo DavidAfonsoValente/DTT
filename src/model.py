@@ -8,6 +8,7 @@ import weakref
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+import math
 
 @dataclass
 class CausalLMOutputWithGates(CausalLMOutputWithCrossAttentions):
@@ -17,6 +18,9 @@ class CustomGPT2Attention(GPT2Attention):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__(config, is_cross_attention, layer_idx)
         self.model = None  # Set later
+        self.bias = torch.tril(torch.ones((config.n_ctx, config.n_ctx), dtype=torch.bool)).view(
+            1, 1, config.n_ctx, config.n_ctx
+        )
 
     def forward(self, hidden_states, layer_past=None, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, use_cache=False, output_attentions=False):
         query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
@@ -34,7 +38,14 @@ class CustomGPT2Attention(GPT2Attention):
         else:
             present = None
 
-        attn_scores = torch.matmul(query, key.transpose(-1, -2)) / torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32))
+        attn_scores = torch.matmul(query, key.transpose(-1, -2))
+        attn_scores = attn_scores / math.sqrt(self.head_dim)
+
+        # Apply causal mask
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+        mask_value = torch.finfo(attn_scores.dtype).min
+        attn_scores = torch.where(causal_mask, attn_scores, mask_value)
 
         # Apply noisy scaling if noisy_mask is set
         if self.model is not None:
@@ -44,7 +55,10 @@ class CustomGPT2Attention(GPT2Attention):
                 noisy_mask_exp = model.noisy_mask.unsqueeze(1).unsqueeze(2).expand(-1, self.num_heads, seq_len, seq_len)
                 attn_scores = torch.where(noisy_mask_exp & noisy_mask_exp.transpose(-2, -1), attn_scores * 0.3, attn_scores)
 
-        attn_scores = attn_scores + attention_mask
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+
         attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
         attn_probs = self.attn_dropout(attn_probs)
 
