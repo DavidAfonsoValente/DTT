@@ -1,131 +1,106 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel, PeftConfig
+from torch.nn.functional import sigmoid, relu, cross_entropy, kl_div, softmax
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
 
-def gumbel_sigmoid(logits: torch.Tensor, temperature: float, hard: bool = False, eps: float = 1e-10) -> torch.Tensor:
-    """
-    Applies Gumbel-Sigmoid for differentiable Bernoulli sampling.
-    
-    Args:
-        logits: Raw logits from the model.
-        temperature: Temperature for Gumbel-Sigmoid.
-        hard: If True, uses hard decisions in forward pass with soft gradients.
-        eps: Small value to prevent numerical instability.
-    
-    Returns:
-        Tensor of near-binary gate values.
-    """
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits, dtype=logits.dtype) + eps) + eps)
-    y_soft = torch.sigmoid((logits + gumbel_noise) / temperature)
-    if hard:
-        y_hard = (y_soft > 0.5).float()
-        y = (y_hard - y_soft).detach() + y_soft
-    else:
-        y = y_soft
-    return y
+class DTTModel(GPT2LMHeadModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.gate_weight = nn.Parameter(torch.randn(1, config.n_embd))  # W
+        self.gate_bias = nn.Parameter(torch.tensor(0.0))  # b
+        self.special_tokens = {'bot': '[bot]', 'eot': '[eot]'}
+        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+        self.tokenizer.add_tokens(list(self.special_tokens.values()))
+        self.resize_token_embeddings(len(self.tokenizer))
+        self.bot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['bot'])
+        self.eot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['eot'])
+        self.dummy_id = self.tokenizer.pad_token_id  # Use pad as dummy for latent
+        self.temperature = 2.0  # Initial tau
 
-class SparseGatedModel(PeftModel):
-    """
-    A model with a sparse gating mechanism to choose between projected hidden states
-    and original embeddings for each token generation step.
-    """
-    def __init__(self, model: AutoModelForCausalLM, peft_config: PeftConfig, hidden_size: int, embedding_dim: int, gate_temperature: float):
-        """
-        Initializes the SparseGatedModel.
-        
-        Args:
-            model: Base transformer model (quantized if applicable).
-            peft_config: PEFT configuration (e.g., LoraConfig).
-            hidden_size: Hidden state dimension of the base model.
-            embedding_dim: Embedding dimension of the base model.
-            gate_temperature: Initial temperature for Gumbel-Sigmoid gate.
-        """
-        super().__init__(model, peft_config)
-        self.tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path)
-        self.projection = nn.Linear(hidden_size, embedding_dim, bias=False)
-        self.gate_linear = nn.Linear(hidden_size, 1)
-        nn.init.constant_(self.gate_linear.bias, -3.0)
-        self.gate_temperature = gate_temperature
-        self.current_gate_values_for_batch = None
+        # Attention hook for masking (register in forward if noisy_mask)
+        def attn_hook(module, args):
+            q, k, v = args
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (k.size(-1)**0.5)
+            if hasattr(self, 'noisy_mask') and self.noisy_mask is not None:
+                seq_len = attn_scores.size(-1)
+                noisy_mask_exp = self.noisy_mask.unsqueeze(1).unsqueeze(2).expand(-1, attn_scores.size(1), seq_len, seq_len)
+                attn_scores = torch.where(noisy_mask_exp & noisy_mask_exp.transpose(-2, -1), attn_scores * 0.3, attn_scores)
+            attn_probs = softmax(attn_scores, dim=-1)
+            return torch.matmul(attn_probs, v)  # Return output
 
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        past_key_values=None,
-        prev_step_last_hidden_state=None,
-        use_cache=True,
-        output_attentions=False,
-        output_hidden_states=True,
-        gumbel_hard_during_forward=False,
-        return_last_hidden_state=False,
-        **kwargs
-    ):
-        """
-        Forward pass with gating mechanism.
-        
-        Args:
-            input_ids: Token IDs.
-            attention_mask: Attention mask.
-            inputs_embeds: Precomputed embeddings (optional).
-            past_key_values: Cached key/value pairs for generation.
-            prev_step_last_hidden_state: Hidden state from previous step.
-            use_cache: Whether to use cached key/values.
-            output_attentions: Whether to return attention weights.
-            output_hidden_states: Must be True for gating to work.
-            gumbel_hard_during_forward: Use hard Gumbel-Sigmoid if True.
-            return_last_hidden_state: Return hidden state with outputs if True.
-        
-        Returns:
-            Model outputs, optionally with last hidden state.
-        """
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("Cannot specify both input_ids and inputs_embeds")
-        
-        if inputs_embeds is None:
-            current_token_original_embeddings = self.get_input_embeddings()(input_ids)
+        for layer in self.transformer.h:
+            layer.attn.register_forward_hook(attn_hook)  # Hook all layers
+
+    def gumbel_sigmoid(self, logit, temperature, training):
+        if training:
+            u = torch.rand_like(logit)
+            gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+            return sigmoid((logit + gumbel_noise) / temperature)
+        return sigmoid(logit)
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, input_embeds=None, noisy_mask=None, **kwargs):
+        if noisy_mask is not None:
+            self.noisy_mask = noisy_mask.float()  # For broadcasting
+
+        if input_embeds is not None:
+            outputs = super().forward(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
         else:
-            current_token_original_embeddings = inputs_embeds
-        
-        self.current_original_embeddings_for_batch = current_token_original_embeddings.detach().clone()
-        batch_size, seq_len, _ = current_token_original_embeddings.shape
-        device = current_token_original_embeddings.device
-        dtype = current_token_original_embeddings.dtype
-        
-        if prev_step_last_hidden_state is not None:
-            if prev_step_last_hidden_state.ndim == 2:
-                prev_step_last_hidden_state = prev_step_last_hidden_state.unsqueeze(1)
-            if prev_step_last_hidden_state.shape[1] == 1 and seq_len > 1:
-                prev_step_last_hidden_state = prev_step_last_hidden_state.repeat(1, seq_len, 1)
-            elif prev_step_last_hidden_state.shape[1] != seq_len:
-                raise ValueError(f"Shape mismatch: prev_step_last_hidden_state.shape[1] ({prev_step_last_hidden_state.shape[1]}) != seq_len ({seq_len})")
-            
-            gate_logits = self.gate_linear(prev_step_last_hidden_state)
-            gate_values = gumbel_sigmoid(gate_logits, self.gate_temperature, hard=gumbel_hard_during_forward)
-            projected_hidden = self.projection(prev_step_last_hidden_state)
-            effective_embeddings = gate_values * projected_hidden + (1 - gate_values) * current_token_original_embeddings
-            self.current_gate_values_for_batch = gate_values.detach().clone()
-        else:
-            effective_embeddings = current_token_original_embeddings
-            dummy_gate_logits = torch.full((batch_size, seq_len, 1), -3.0, device=device, dtype=dtype)
-            self.current_gate_values_for_batch = gumbel_sigmoid(dummy_gate_logits, self.gate_temperature, hard=gumbel_hard_during_forward).detach().clone()
-        
-        outputs = self.base_model(
-            inputs_embeds=effective_embeddings,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            **kwargs
-        )
-        
-        if not output_hidden_states or outputs.hidden_states is None:
-            raise ValueError("Base model must return hidden states (output_hidden_states=True).")
-        
-        last_hidden_state_current_step = outputs.hidden_states[-1]
-        if return_last_hidden_state:
-            return outputs, last_hidden_state_current_step
+            outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
+
+        hidden_states = outputs.hidden_states[-1]
+        gate_logits = torch.matmul(hidden_states, self.gate_weight.t()) + self.gate_bias
+        gate_logits = gate_logits.squeeze(-1)
+        gates = self.gumbel_sigmoid(gate_logits, self.temperature, self.training)
+
+        if labels is not None:
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            outputs['loss'] = loss
+
+        outputs['gates'] = gates
+        self.noisy_mask = None  # Reset
         return outputs
+
+    def generate(self, input_ids, max_length=512, do_sample=True, top_p=0.95, temperature=1.0, return_gates=False, **kwargs):
+        batch_size = input_ids.size(0)
+        input_embeds = self.transformer.wte(input_ids)
+        generated_ids = input_ids.clone()
+        gates_list = []
+
+        for step in range(max_length - input_ids.size(1)):
+            outputs = self.forward(inputs_embeds=input_embeds)
+            hidden = outputs['hidden_states'][-1][:, -1, :]
+            gate_logit = torch.matmul(hidden, self.gate_weight.t()) + self.gate_bias
+            gate = self.gumbel_sigmoid(gate_logit.squeeze(-1), self.temperature, self.training)
+            gates_list.append(gate.unsqueeze(1))  # (bs, 1)
+
+            next_token_logits = outputs.logits[:, -1, :] / temperature
+            if do_sample:
+                filtered_logits = next_token_logits.clone()
+                sorted_logits, sorted_indices = torch.sort(filtered_logits, descending=True)
+                cumulative_probs = torch.cumsum(softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                filtered_logits[indices_to_remove] = float('-inf')
+                next_token = torch.multinomial(softmax(filtered_logits, dim=-1), num_samples=1)
+            else:
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+            if gate.mean() > 0.5:  # Threshold mean for batch
+                next_embed = gate.unsqueeze(-1) * hidden + (1 - gate).unsqueeze(-1) * self.transformer.wte(torch.full((batch_size, 1), self.dummy_id, device=hidden.device))
+                generated_ids = torch.cat([generated_ids, torch.full((batch_size, 1), self.dummy_id, device=generated_ids.device)], dim=1)
+            else:
+                next_embed = self.transformer.wte(next_token)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+            input_embeds = torch.cat([input_embeds, next_embed], dim=1)
+
+        if return_gates:
+            return generated_ids, torch.cat(gates_list, dim=1)
+        return generated_ids
+
+    def set_temperature(self, tau):
+        self.temperature = max(0.1, tau)
