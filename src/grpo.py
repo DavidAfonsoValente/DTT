@@ -80,21 +80,16 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
         for batch_idx, batch in enumerate(tqdm(dataloader)):
             if debug and accelerator.is_local_main_process:
                 batch_start = time.time()
-                input_text = model.tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
-                print(f"Batch {batch_idx + 1}/{len(dataloader)}")
-                print(f"Input text: {input_text[:100]}...")
-                print(f"Ground truth answer: {batch['answer_gt'][0][:100]}...")
-                print(f"Input_ids shape: {batch['input_ids'].shape}")
+                print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
+                print(f"Batch input_ids shape: {batch['input_ids'].shape}")
+                print(f"Batch answer_gt: {batch['answer_gt']}")
             
             batch_loss = 0.0
             for prompt_idx in range(batch['input_ids'].size(0)):
                 prompt_ids = batch['input_ids'][prompt_idx:prompt_idx+1]
                 answer_gt = batch['answer_gt'][prompt_idx]
                 if debug and accelerator.is_local_main_process:
-                    prompt_text = model.tokenizer.decode(prompt_ids[0], skip_special_tokens=False)
-                    print(f"  Prompt {prompt_idx + 1}: prompt_ids shape {prompt_ids.shape}")
-                    print(f"  Prompt text: {prompt_text[:100]}...")
-                    print(f"  GT answer: {answer_gt[:100]}...")
+                    print(f"  Prompt {prompt_idx + 1}: prompt_ids shape {prompt_ids.shape}, GT answer: {answer_gt}")
                 
                 completions = []
                 rewards = []
@@ -104,10 +99,10 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                     if debug and accelerator.is_local_main_process:
                         gen_start = time.time()
                     gen_ids, gates = model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)
-                    gen_text = model.tokenizer.decode(gen_ids[0], skip_special_tokens=False)
                     if debug and accelerator.is_local_main_process:
                         print(f"    Generation {gen_idx + 1}/{config['group_size']} took {time.time() - gen_start:.2f}s")
-                        print(f"    Generated text: {gen_text[:100]}...")
+                        gen_text = model.tokenizer.decode(gen_ids[0], skip_special_tokens=False)
+                        print(f"    Generated text: {gen_text[:100]}...")  # Truncated for brevity
                     
                     reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id, weights=weights)
                     if debug and accelerator.is_local_main_process:
@@ -148,9 +143,7 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                     
                     epoch_kl += kl.item()
                     if debug and accelerator.is_local_main_process:
-                        comp_text = model.tokenizer.decode(comp_ids[0], skip_special_tokens=False)
                         print(f"    Completion {i + 1}: PPO loss {ppo_loss.item():.4f}, KL {kl.item():.4f}, Total loss {loss.item():.4f}")
-                        print(f"    Completion text: {comp_text[:100]}...")
             
             batch_loss /= batch['input_ids'].size(0)
             if debug and accelerator.is_local_main_process:
