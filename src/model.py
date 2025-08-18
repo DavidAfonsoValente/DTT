@@ -5,6 +5,13 @@ from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
 from transformers.modeling_utils import ModuleUtilsMixin
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 import weakref
+from typing import Optional, Tuple
+from dataclasses import dataclass
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+
+@dataclass
+class CausalLMOutputWithGates(CausalLMOutputWithCrossAttentions):
+    gates: Optional[torch.FloatTensor] = None
 
 class CustomGPT2Attention(GPT2Attention):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
@@ -89,24 +96,31 @@ class DTTModel(GPT2LMHeadModel):
             self.noisy_mask = noisy_mask  # Keep as bool, remove .float()
 
         if input_embeds is not None:
-            outputs = super().forward(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
+            transformer_outputs = super().forward(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
         else:
-            outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
+            transformer_outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
 
-        hidden_states = outputs.hidden_states[-1]
+        hidden_states = transformer_outputs.hidden_states[-1]
         gate_logits = torch.matmul(hidden_states, self.gate_weight.t()) + self.gate_bias
         gate_logits = gate_logits.squeeze(-1)
         gates = self.gumbel_sigmoid(gate_logits, self.temperature, self.training)
 
+        loss = None
         if labels is not None:
-            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_logits = transformer_outputs.logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            outputs['loss'] = loss
 
-        outputs['gates'] = gates
         self.noisy_mask = None
-        return outputs
+        return CausalLMOutputWithGates(
+            loss=loss,
+            logits=transformer_outputs.logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+            cross_attentions=transformer_outputs.cross_attentions,
+            gates=gates,
+        )
 
     def generate(self, input_ids, max_length=512, do_sample=True, top_p=0.95, temperature=1.0, return_gates=False, **kwargs):
         batch_size = input_ids.size(0)

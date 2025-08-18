@@ -25,9 +25,8 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn):
         
         for batch in tqdm(dataloader):
             outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'], noisy_mask=batch['noisy_mask'])
-            loss = outputs['loss']
-            
-            gates = outputs['gates']
+            loss = outputs.loss
+            gates = outputs.gates
             noisy_mask = batch['noisy_mask']
             gate_reg_value = 0.0
             if noisy_mask is not None:
