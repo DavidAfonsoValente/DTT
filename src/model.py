@@ -5,11 +5,12 @@ from torch.nn.functional import sigmoid, relu, cross_entropy, kl_div, softmax
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
 from transformers.modeling_utils import ModuleUtilsMixin
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+import weakref
 
 class CustomGPT2Attention(GPT2Attention):
-    def __init__(self, config, model):
-        super().__init__(config)
-        self.model = model  # Reference to DTTModel for accessing noisy_mask
+    def __init__(self, config, is_cross_attention=False, layer_idx=None):
+        super().__init__(config, is_cross_attention, layer_idx)
+        self.model = None  # Set later
 
     def forward(self, hidden_states, layer_past=None, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, use_cache=False, output_attentions=False):
         query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
@@ -30,10 +31,12 @@ class CustomGPT2Attention(GPT2Attention):
         attn_scores = torch.matmul(query, key.transpose(-1, -2)) / torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32))
 
         # Apply noisy scaling if noisy_mask is set
-        if hasattr(self.model, 'noisy_mask') and self.model.noisy_mask is not None:
-            seq_len = attn_scores.size(-1)
-            noisy_mask_exp = self.model.noisy_mask.unsqueeze(1).unsqueeze(2).expand(-1, self.num_heads, seq_len, seq_len)
-            attn_scores = torch.where(noisy_mask_exp & noisy_mask_exp.transpose(-2, -1), attn_scores * 0.3, attn_scores)
+        if self.model is not None:
+            model = self.model()
+            if model is not None and hasattr(model, 'noisy_mask') and model.noisy_mask is not None:
+                seq_len = attn_scores.size(-1)
+                noisy_mask_exp = model.noisy_mask.unsqueeze(1).unsqueeze(2).expand(-1, self.num_heads, seq_len, seq_len)
+                attn_scores = torch.where(noisy_mask_exp & noisy_mask_exp.transpose(-2, -1), attn_scores * 0.3, attn_scores)
 
         attn_scores = attn_scores + attention_mask
         attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
@@ -71,7 +74,9 @@ class DTTModel(GPT2LMHeadModel):
         self.temperature = 2.0
 
         for i, layer in enumerate(self.transformer.h):
-            layer.attn = CustomGPT2Attention(self.config, self)
+            custom_attn = CustomGPT2Attention(self.config, is_cross_attention=False, layer_idx=i)
+            custom_attn.model = weakref.ref(self)
+            layer.attn = custom_attn
 
     def gumbel_sigmoid(self, logit, temperature, training):
         if training:
