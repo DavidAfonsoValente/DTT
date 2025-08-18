@@ -7,9 +7,8 @@ import torch
 from src.utils import validate_bootstrap
 import wandb
 from torch.nn.functional import relu
-from src.datasets import collate_fn
 
-def train_bootstrap(model, dataset, config, accelerator):
+def train_bootstrap(model, dataset, config, accelerator, collate_fn):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
     optimizer = AdamW(model.parameters(), lr=config['lr'])
     
@@ -25,7 +24,7 @@ def train_bootstrap(model, dataset, config, accelerator):
         num_batches = 0
         
         for batch in tqdm(dataloader):
-            outputs = model(input_ids=batch['input_ids'], labels=batch['input_ids'], noisy_mask=batch['noisy_mask'])
+            outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'], noisy_mask=batch['noisy_mask'])
             loss = outputs['loss']
             
             gates = outputs['gates']

@@ -7,9 +7,9 @@ import torch
 from src.rewards import compute_reward
 from src.utils import validate_grpo
 import wandb
-from src.datasets import collate_fn
+from src.model import DTTModel
 
-def train_grpo(model, dataset, config, accelerator, ref_checkpoint):
+def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
     optimizer = AdamW(model.parameters(), lr=config['lr'])
     
@@ -73,7 +73,7 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint):
                     surr2 = torch.clamp(mean_ratio, 1 - config['epsilon'], 1 + config['epsilon']) * advantages[i]
                     ppo_loss = -torch.min(surr1, surr2)
                     
-                    kl = kl_div(logprobs_old, logprobs, log_target=True, reduction='mean')
+                    kl = torch.nn.functional.kl_div(logprobs_old, logprobs, log_target=True, reduction='mean')
                     loss = ppo_loss + config['beta_kl'] * kl
                     batch_loss += loss
                     

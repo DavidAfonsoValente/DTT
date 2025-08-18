@@ -3,7 +3,7 @@ import yaml
 from accelerate import Accelerator
 from transformers import GPT2Config, GPT2Tokenizer
 from src.model import DTTModel
-from src.datasets import DTTDataset
+from src.datasets import DTTDataset, collate_fn
 from src.bootstrap import train_bootstrap
 from src.grpo import train_grpo
 import argparse
@@ -32,15 +32,18 @@ tokenizer.add_special_tokens({
     'additional_special_tokens': ['[bot]', '[eot]'],
     'pad_token': '<pad>'
 })
-dataset = DTTDataset(args.dataset, tokenizer, data_dir=config.get('data_dir', 'data'))
+synthetic_ratio = 0.15 if args.stage == 1 else 0.0
+dataset = DTTDataset(args.dataset, tokenizer, synthetic_ratio=synthetic_ratio, data_dir=config.get('data_dir', 'data'))
 model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
 
+collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
+
 if args.stage == 1:
-    train_bootstrap(model, dataset, config, accelerator)
+    train_bootstrap(model, dataset, config, accelerator, collate)
 elif args.stage == 2:
     if args.ref_checkpoint is None:
         raise ValueError("Provide --ref_checkpoint for Stage 2")
-    train_grpo(model, dataset, config, accelerator, args.ref_checkpoint)
+    train_grpo(model, dataset, config, accelerator, args.ref_checkpoint, collate)
 
 if accelerator.is_local_main_process:
     wandb.finish()

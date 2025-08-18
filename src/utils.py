@@ -5,8 +5,9 @@ from src.rewards import compute_reward
 from src.datasets import DTTDataset, collate_fn
 
 def validate_bootstrap(model, config, accelerator, tokenizer):
-    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', data_dir=config.get('data_dir', 'data'))
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
+    val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
     structure_count = 0
     inner_gates_sum = 0.0
     num_samples = 0
@@ -29,8 +30,9 @@ def validate_bootstrap(model, config, accelerator, tokenizer):
     return {'is_valid': structure_rate >= 0.40 and mean_inner_gate >= 0.60, 'structure_rate': structure_rate, 'mean_inner_gate': mean_inner_gate}
 
 def validate_grpo(model, config, accelerator, tokenizer):
-    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', data_dir=config.get('data_dir', 'data'))
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
+    val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
     total_reward = 0.0
     num_samples = 0
     
