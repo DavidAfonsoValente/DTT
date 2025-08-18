@@ -30,10 +30,13 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False
         for batch_idx, batch in enumerate(tqdm(dataloader)):
             if debug and accelerator.is_local_main_process:
                 batch_start = time.time()
-                print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
-                print(f"Batch input_ids shape: {batch['input_ids'].shape}")
-                print(f"Batch labels shape: {batch['labels'].shape if batch['labels'] is not None else 'None'}")
-                print(f"Batch noisy_mask shape: {batch['noisy_mask'].shape if batch['noisy_mask'] is not None else 'None'}")
+                input_text = dataset.tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
+                print(f"Batch {batch_idx + 1}/{len(dataloader)}")
+                print(f"Input text: {input_text[:100]}...")
+                print(f"Ground truth answer: {batch['answer_gt'][0][:100]}...")
+                print(f"Input_ids shape: {batch['input_ids'].shape}")
+                print(f"Labels shape: {batch['labels'].shape if batch['labels'] is not None else 'None'}")
+                print(f"Noisy_mask shape: {batch['noisy_mask'].shape if batch['noisy_mask'] is not None else 'None'}")
             
             outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'], noisy_mask=batch['noisy_mask'])
             loss = outputs.loss
@@ -64,7 +67,7 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False
             num_batches += 1
             
             if debug and accelerator.is_local_main_process:
-                print(f"Batch processed in {time.time() - batch_start:.2f}s | Final Loss: {loss.item():.4f}")
+                print(f"Batch {batch_idx + 1} processed in {time.time() - batch_start:.2f}s | Final Loss: {loss.item():.4f}")
         
         avg_loss = epoch_loss / num_batches
         avg_gate_reg = epoch_gate_reg / num_batches

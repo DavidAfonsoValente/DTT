@@ -34,6 +34,14 @@ tokenizer.add_special_tokens({
 })
 synthetic_ratio = 0.15 if args.stage == 1 else 0.0
 dataset = DTTDataset(args.dataset, tokenizer, synthetic_ratio=synthetic_ratio, data_dir=config.get('data_dir', 'data'))
+
+if args.debug and accelerator.is_local_main_process:
+    print("Dataset loaded:")
+    for i, item in enumerate(dataset[:2]):  # Show first 2 samples
+        input_text = tokenizer.decode(item['input_ids'], skip_special_tokens=False)
+        print(f"Sample {i+1} input: {input_text[:100]}...")
+        print(f"Sample {i+1} ground truth answer: {item['answer_gt'][:100]}...")
+
 model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
 
 collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
