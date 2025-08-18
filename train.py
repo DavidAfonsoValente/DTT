@@ -28,7 +28,7 @@ if accelerator.is_local_main_process:
 
 tokenizer = DTTModel(GPT2Config.from_pretrained('gpt2')).tokenizer
 dataset = DTTDataset(args.dataset, tokenizer, data_dir=config.get('data_dir', 'data'))
-model = DTTModel.from_pretrained('gpt2')
+model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
 
 if args.stage == 1:
     train_bootstrap(model, dataset, config, accelerator)
