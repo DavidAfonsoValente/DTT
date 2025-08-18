@@ -54,7 +54,7 @@ bootstrap.py: Stage 1 supervised bootstrap loop.
 grpo.py: Stage 2 GRPO reinforcement loop.
 datasets.py: Dataset loading and preprocessing (HF for GSM8K/ProntoQA, JSON for ProsQA).
 utils.py: Validation helpers for structure/gate metrics and rewards.
-YAML configs: Specify hyperparameters for each dataset (e.g., gsm8k.yaml).
+YAML configs: Specify hyperparameters for each dataset (e.g., train_gsm8k.yaml).
 
 
 Distributed Training: Uses Accelerate for DDP on 4 GPUs.
@@ -70,9 +70,9 @@ Download ProsQA: Copy prosqa_*.json from Coconut GitHub to data/.
 
 Training Commands:
 GSM8K Stage 1: accelerate launch --num_processes 4 train.py --stage 1 --dataset gsm8k --config configs/train_gsm8k.yaml
-GSM8K Stage 2: accelerate launch --num_processes 4 train.py --stage 2 --dataset gsm8k --config configs/gsm8k.yaml --ref_checkpoint bootstrap_checkpoint
-ProsQA: Replace --dataset prosqa --config configs/prosqa.yaml.
-ProntoQA: Replace --dataset prontoqa --config configs/prontoqa.yaml.
+GSM8K Stage 2: accelerate launch --num_processes 4 train.py --stage 2 --dataset gsm8k --config configs/train_gsm8k.yaml --ref_checkpoint bootstrap_checkpoint
+ProsQA: Replace --dataset prosqa --config configs/train_prosqa.yaml.
+ProntoQA: Replace --dataset prontoqa --config configs/train_prontoqa.yaml.
 
 
 
