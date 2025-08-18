@@ -1,6 +1,6 @@
 dataset: gsm8k
 batch_size: 4
-epochs: 2
+epochs: 10
 lr: 1.0e-5
 lambda_gate: 0.1
 group_size: 8
