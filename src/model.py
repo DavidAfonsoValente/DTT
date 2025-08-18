@@ -1,4 +1,3 @@
-# src/model.py
 import torch
 import torch.nn as nn
 from torch.nn.functional import sigmoid, relu, cross_entropy, kl_div, softmax
@@ -87,7 +86,7 @@ class DTTModel(GPT2LMHeadModel):
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, input_embeds=None, noisy_mask=None, **kwargs):
         if noisy_mask is not None:
-            self.noisy_mask = noisy_mask.float()
+            self.noisy_mask = noisy_mask  # Keep as bool, remove .float()
 
         if input_embeds is not None:
             outputs = super().forward(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
