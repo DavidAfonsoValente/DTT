@@ -27,9 +27,13 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False
         epoch_gate_reg = 0.0
         num_batches = 0
         
-        for batch in tqdm(dataloader):
+        for batch_idx, batch in enumerate(tqdm(dataloader)):
             if debug and accelerator.is_local_main_process:
                 batch_start = time.time()
+                print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
+                print(f"Batch input_ids shape: {batch['input_ids'].shape}")
+                print(f"Batch labels shape: {batch['labels'].shape if batch['labels'] is not None else 'None'}")
+                print(f"Batch noisy_mask shape: {batch['noisy_mask'].shape if batch['noisy_mask'] is not None else 'None'}")
             
             outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'], noisy_mask=batch['noisy_mask'])
             loss = outputs.loss
@@ -43,6 +47,12 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False
                 gate_reg = config['lambda_gate'] * relu(0.7 - mean_inner_gate)
                 loss += gate_reg
                 gate_reg_value = gate_reg.item()
+                if debug and accelerator.is_local_main_process:
+                    print(f"Mean inner gate: {mean_inner_gate.item():.4f}")
+                    print(f"Gate regularization: {gate_reg_value:.4f}")
+            
+            if debug and accelerator.is_local_main_process:
+                print(f"Batch loss before backward: {loss.item():.4f}")
             
             accelerator.backward(loss)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -54,7 +64,7 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False
             num_batches += 1
             
             if debug and accelerator.is_local_main_process:
-                print(f"Batch processed in {time.time() - batch_start:.2f}s | Loss: {loss.item():.4f}")
+                print(f"Batch processed in {time.time() - batch_start:.2f}s | Final Loss: {loss.item():.4f}")
         
         avg_loss = epoch_loss / num_batches
         avg_gate_reg = epoch_gate_reg / num_batches
@@ -67,7 +77,7 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False
             })
         
         if debug and accelerator.is_local_main_process:
-            print(f"Epoch {epoch + 1} completed in {time.time() - epoch_start:.2f}s | Avg Loss: {avg_loss:.4f}")
+            print(f"Epoch {epoch + 1} completed in {time.time() - epoch_start:.2f}s | Avg Loss: {avg_loss:.4f} | Avg Gate Reg: {avg_gate_reg:.4f}")
         
         valid = validate_bootstrap(model, config, accelerator, dataset.tokenizer, debug=debug)
         if accelerator.is_local_main_process:

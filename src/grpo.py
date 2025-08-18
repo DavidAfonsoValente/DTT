@@ -77,29 +77,41 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
         epoch_kl = 0.0
         num_samples = 0
         
-        for batch in tqdm(dataloader):
+        for batch_idx, batch in enumerate(tqdm(dataloader)):
             if debug and accelerator.is_local_main_process:
                 batch_start = time.time()
+                print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
+                print(f"Batch input_ids shape: {batch['input_ids'].shape}")
+                print(f"Batch answer_gt: {batch['answer_gt']}")
             
             batch_loss = 0.0
             for prompt_idx in range(batch['input_ids'].size(0)):
                 prompt_ids = batch['input_ids'][prompt_idx:prompt_idx+1]
                 answer_gt = batch['answer_gt'][prompt_idx]
+                if debug and accelerator.is_local_main_process:
+                    print(f"  Prompt {prompt_idx + 1}: prompt_ids shape {prompt_ids.shape}, GT answer: {answer_gt}")
                 
                 completions = []
                 rewards = []
                 reward_dicts = []
                 weights = get_weights(step)
-                for _ in range(config['group_size']):
+                for gen_idx in range(config['group_size']):
                     if debug and accelerator.is_local_main_process:
                         gen_start = time.time()
                     gen_ids, gates = model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)
                     if debug and accelerator.is_local_main_process:
-                        print(f"Generation {_+1}/{config['group_size']} took {time.time() - gen_start:.2f}s")
+                        print(f"    Generation {gen_idx + 1}/{config['group_size']} took {time.time() - gen_start:.2f}s")
+                        gen_text = model.tokenizer.decode(gen_ids[0], skip_special_tokens=False)
+                        print(f"    Generated text: {gen_text[:100]}...")  # Truncated for brevity
+                    
                     reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id, weights=weights)
+                    if debug and accelerator.is_local_main_process:
+                        print(f"    Reward dict: {reward_dict}")
+                    
                     completions.append(gen_ids)
                     rewards.append(reward_dict['total'])
                     reward_dicts.append(reward_dict)
+                
                 num_samples += config['group_size']
                 epoch_reward += sum(rewards)
                 epoch_r_struct += sum(d['struct'] for d in reward_dicts)
@@ -110,6 +122,8 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                 mu = sum(rewards) / config['group_size']
                 sigma = (sum((r - mu)**2 for r in rewards) / config['group_size'])**0.5 + 1e-8
                 advantages = [(r - mu) / sigma for r in rewards]
+                if debug and accelerator.is_local_main_process:
+                    print(f"  Advantages: {advantages}")
                 
                 for i, comp_ids in enumerate(completions):
                     with torch.no_grad():
@@ -128,8 +142,13 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                     batch_loss += loss
                     
                     epoch_kl += kl.item()
+                    if debug and accelerator.is_local_main_process:
+                        print(f"    Completion {i + 1}: PPO loss {ppo_loss.item():.4f}, KL {kl.item():.4f}, Total loss {loss.item():.4f}")
             
             batch_loss /= batch['input_ids'].size(0)
+            if debug and accelerator.is_local_main_process:
+                print(f"  Batch loss: {batch_loss.item():.4f}")
+            
             accelerator.backward(batch_loss)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -151,6 +170,8 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                         "grpo/validation_avg_r_eff": val_metrics['avg_r_eff'],
                         "grpo/validation_avg_r_gate": val_metrics['avg_r_gate'],
                     })
+                    if debug:
+                        print(f"Validation metrics at step {step}: {val_metrics}")
                 if val_metrics['avg_reward'] < prev_val_reward * 1.02:
                     plateau_steps += 1000
                 else:
@@ -167,6 +188,8 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                     transition_metrics = prev_metrics
                     transition_step = step
                     next_transition_attempt = 0
+                    if debug and accelerator.is_local_main_process:
+                        print(f"Transitioned to phase {current_phase}")
 
                 # Degradation check
                 if prev_phase < current_phase and step - transition_step <= 5000:
@@ -179,11 +202,13 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                     if degrade:
                         current_phase -= 1
                         next_transition_attempt = step + 1000
+                        if debug and accelerator.is_local_main_process:
+                            print(f"Degradation detected, reverted to phase {current_phase}")
 
                 prev_metrics = val_metrics
             
             if debug and accelerator.is_local_main_process:
-                print(f"Batch processed in {time.time() - batch_start:.2f}s")
+                print(f"Batch {batch_idx + 1} processed in {time.time() - batch_start:.2f}s")
         
         avg_reward = epoch_reward / num_samples if num_samples > 0 else 0
         avg_r_struct = epoch_r_struct / num_samples if num_samples > 0 else 0
@@ -204,4 +229,4 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
             })
         
         if debug and accelerator.is_local_main_process:
-            print(f"Epoch {epoch + 1} completed in {time.time() - epoch_start:.2f}s | Avg Reward: {avg_reward:.4f}")
+            print(f"Epoch {epoch + 1} completed in {time.time() - epoch_start:.2f}s | Avg Reward: {avg_reward:.4f} | Avg KL: {avg_kl:.4f}")
