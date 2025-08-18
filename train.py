@@ -1,5 +1,6 @@
 import yaml
 from accelerate import Accelerator
+from transformers import GPT2Config
 from src.model import DTTModel
 from src.datasets import DTTDataset
 from src.bootstrap import train_bootstrap
