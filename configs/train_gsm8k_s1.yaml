@@ -1,6 +1,6 @@
 dataset: gsm8k
-batch_size: 2  # Per GPU
-accum_steps: 4  # For effective batch_size=32 (4 GPUs × 4 samples × 2 accumulations)
+batch_size: 1  # Per GPU
+accum_steps: 8  # For effective batch_size=32 (4 GPUs × 4 samples × 2 accumulations)
 epochs: 2
 lr: 1.0e-5
 lambda_gate: 0.1
