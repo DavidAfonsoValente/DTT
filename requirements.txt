@@ -1,6 +1,7 @@
-torch==2.0.1
-transformers==4.35.2
-datasets==2.15.0
-accelerate==0.25.0
-pyyaml==6.0.1
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+transformers==4.44.2
+datasets==2.21.0
+accelerate==0.44.0
+pyyaml==6.0.2
 wandb==0.17.7
