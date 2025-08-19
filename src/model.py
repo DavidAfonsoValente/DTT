@@ -232,16 +232,11 @@ class DTTModel(GPT2LMHeadModel):
                 if self.debug:
                     print(f"  Argmax next_token {next_token}")
 
-            if gate.mean() > 0.5:
-                if self.debug:
-                    print("  Using latent state (gate > 0.5)")
-                next_embed = gate.unsqueeze(-1) * hidden + (1 - gate).unsqueeze(-1) * self.transformer.wte(torch.full((batch_size, 1), self.dummy_id, device=hidden.device))
-                generated_ids = torch.cat([generated_ids, torch.full((batch_size, 1), self.dummy_id, device=generated_ids.device)], dim=1)
-            else:
-                if self.debug:
-                    print("  Using normal embedding (gate <= 0.5)")
-                next_embed = self.transformer.wte(next_token)
-                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            # Fixed: per-item decision, not mean
+            latent_mask = (gate > 0.5).unsqueeze(-1)
+            next_embed = latent_mask * hidden + (~latent_mask) * self.transformer.wte(next_token)
+            next_id = torch.where(latent_mask.squeeze(-1), torch.full((batch_size, 1), self.dummy_id, device=hidden.device), next_token)
+            generated_ids = torch.cat([generated_ids, next_id], dim=1)
 
             input_embeds = torch.cat([input_embeds, next_embed], dim=1)
             

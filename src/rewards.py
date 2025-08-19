@@ -1,4 +1,3 @@
-# src/rewards.py
 import torch
 
 def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset, dummy_id, weights=None):

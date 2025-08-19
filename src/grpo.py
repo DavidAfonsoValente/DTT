@@ -102,7 +102,7 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                 for gen_idx in range(config['group_size']):
                     if debug and accelerator.is_local_main_process:
                         gen_start = time.time()
-                    gen_ids, gates = model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)
+                    gen_ids, gates = ref_model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)  # Fixed: use ref_model
                     if debug and accelerator.is_local_main_process:
                         print(f"    Generation {gen_idx + 1}/{config['group_size']} took {time.time() - gen_start:.2f}s")
                         gen_text = model.tokenizer.decode(gen_ids[0], skip_special_tokens=False)

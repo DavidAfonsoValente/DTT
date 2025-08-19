@@ -1,4 +1,3 @@
-# src/datasets.py
 from datasets import load_dataset
 from torch.utils.data import Dataset
 import random
@@ -50,7 +49,7 @@ class DTTDataset(Dataset):
         labels = torch.full_like(input_ids, -100)
 
         if self.is_synthetic:
-            k = random.randint(0, 10) # Number of fillers
+            k = random.randint(0, 5)  # Updated to {0..5} as per description
             fillers_ids = [random.randint(0, self.vocab_size - 1) for _ in range(k)]
             fillers_text = ' '.join(self.tokenizer.decode([f]) for f in fillers_ids)
             suffix_text = f" [bot] {fillers_text} [eot] {answer_gt}"
