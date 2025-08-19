@@ -8,7 +8,7 @@ import wandb
 from torch.nn.functional import relu
 import time
 
-def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False):
+def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, debug=False):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
     optimizer = AdamW(model.parameters(), lr=config['lr'])
     
@@ -35,7 +35,11 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False
                 batch_start = time.time()
                 print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
                 print(f"Batch input_ids shape: {batch['input_ids'].shape}")
-                print(f"Batch labels shape: {batch['labels'].shape if batch['labels'] is not None else 'None'}")
+                input_text = tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
+                print(f"Decoded input text: {input_text[:200]}...")  # Truncated for brevity
+                if batch['labels'] is not None:
+                    labels_text = tokenizer.decode(batch['labels'][0][batch['labels'][0] != -100], skip_special_tokens=False)
+                    print(f"Decoded labels text: {labels_text[:200]}...")
                 print(f"Batch noisy_mask shape: {batch['noisy_mask'].shape if batch['noisy_mask'] is not None else 'None'}")
             
             outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'], noisy_mask=batch['noisy_mask'])

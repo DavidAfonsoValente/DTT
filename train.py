@@ -39,7 +39,7 @@ model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
 collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
 
 if args.stage == 1:
-    train_bootstrap(model, dataset, config, accelerator, collate, debug=args.debug)
+    train_bootstrap(model, dataset, config, accelerator, collate, tokenizer, debug=args.debug)
 elif args.stage == 2:
     if args.ref_checkpoint is None:
         raise ValueError("Provide --ref_checkpoint for Stage 2")
