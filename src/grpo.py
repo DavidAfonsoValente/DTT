@@ -44,6 +44,10 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
     ref_model = accelerator.prepare(ref_model)
     ref_model.eval()
     
+    if debug:
+        accelerator.unwrap_model(model).debug = True
+        accelerator.unwrap_model(ref_model).debug = True
+    
     if accelerator.is_local_main_process:
         wandb.log({"stage": "grpo_start", "epoch": 0})
     

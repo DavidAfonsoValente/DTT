@@ -14,6 +14,9 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, debug=False
     
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     
+    if debug:
+        accelerator.unwrap_model(model).debug = True
+    
     if accelerator.is_local_main_process:
         wandb.log({"stage": "bootstrap_start", "epoch": 0})
     
