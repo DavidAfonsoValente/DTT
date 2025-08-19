@@ -24,6 +24,11 @@ class CustomGPT2Attention(GPT2Attention):
         )
 
     def forward(self, hidden_states, layer_past=None, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, use_cache=False, output_attentions=False):
+        if self.model is not None:
+            model = self.model()
+            if model is not None and hasattr(model, 'debug') and model.debug:
+                print(f"CustomGPT2Attention forward: hidden_states shape {hidden_states.shape}")
+        
         query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
@@ -93,6 +98,7 @@ class DTTModel(GPT2LMHeadModel):
         self.eot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['eot'])
         self.dummy_id = self.tokenizer.pad_token_id
         self.temperature = 2.0
+        self.debug = False
 
         for i, layer in enumerate(self.transformer.h):
             custom_attn = CustomGPT2Attention(self.config, is_cross_attention=False, layer_idx=i)
@@ -100,33 +106,69 @@ class DTTModel(GPT2LMHeadModel):
             layer.attn = custom_attn
 
     def gumbel_sigmoid(self, logit, temperature, training):
+        if self.debug:
+            print(f"gumbel_sigmoid: logit mean {logit.mean().item():.4f}, temperature {temperature}, training {training}")
         if training:
             u = torch.rand_like(logit)
             gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+            if self.debug:
+                print(f"  Gumbel noise mean {gumbel_noise.mean().item():.4f}")
             return sigmoid((logit + gumbel_noise) / temperature)
         return sigmoid(logit)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, input_embeds=None, noisy_mask=None, **kwargs):
+        if self.debug:
+            print("Entering forward")
+            if input_ids is not None:
+                print(f"  input_ids shape {input_ids.shape}, sample {input_ids[0][:10]}...")
+            if input_embeds is not None:
+                print(f"  input_embeds shape {input_embeds.shape}")
+            if attention_mask is not None:
+                print(f"  attention_mask shape {attention_mask.shape}")
+            if labels is not None:
+                print(f"  labels shape {labels.shape}")
+            if noisy_mask is not None:
+                print(f"  noisy_mask shape {noisy_mask.shape}")
+
         if noisy_mask is not None:
             self.noisy_mask = noisy_mask  # Keep as bool, remove .float()
 
         if input_embeds is not None:
+            if self.debug:
+                print("Calling super().forward with input_embeds")
             transformer_outputs = super().forward(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
         else:
+            if self.debug:
+                print("Calling super().forward with input_ids")
             transformer_outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
+
+        if self.debug:
+            print(f"After transformer: hidden_states[-1] shape {transformer_outputs.hidden_states[-1].shape}, mean {transformer_outputs.hidden_states[-1].mean().item():.4f}")
+            print(f"  logits shape {transformer_outputs.logits.shape}")
 
         hidden_states = transformer_outputs.hidden_states[-1]
         gate_logits = torch.matmul(hidden_states, self.gate_weight.t()) + self.gate_bias
         gate_logits = gate_logits.squeeze(-1)
+        if self.debug:
+            print(f"Gate logits shape {gate_logits.shape}, mean {gate_logits.mean().item():.4f}")
+
         gates = self.gumbel_sigmoid(gate_logits, self.temperature, self.training)
+        if self.debug:
+            print(f"Gates shape {gates.shape}, mean {gates.mean().item():.4f}")
 
         loss = None
         if labels is not None:
+            if self.debug:
+                print("Computing loss")
             shift_logits = transformer_outputs.logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            if self.debug:
+                print(f"Loss: {loss.item():.4f}")
 
         self.noisy_mask = None
+        if self.debug:
+            print("Exiting forward")
         return CausalLMOutputWithGates(
             loss=loss,
             logits=transformer_outputs.logits,
@@ -138,22 +180,41 @@ class DTTModel(GPT2LMHeadModel):
         )
 
     def generate(self, input_ids, max_length=512, do_sample=True, top_p=0.95, temperature=1.0, return_gates=False, **kwargs):
+        if self.debug:
+            print("Entering generate")
+            print(f"  input_ids shape {input_ids.shape}, sample {input_ids[0][:10]}...")
+        
         batch_size = input_ids.size(0)
         input_embeds = self.transformer.wte(input_ids)
+        if self.debug:
+            print(f"  input_embeds shape {input_embeds.shape}")
         generated_ids = input_ids.clone()
         gates_list = []
-        debug = kwargs.get('debug', False)  # Assume debug passed via kwargs if needed; otherwise False
 
         for step in range(max_length - input_ids.size(1)):
-            if debug:
+            if self.debug:
                 step_start = time.time()
+                print(f"Generate step {step + 1}/{max_length - input_ids.size(1)}")
+                print(f"  Current input_embeds shape {input_embeds.shape}")
             outputs = self.forward(inputs_embeds=input_embeds)
+            if self.debug:
+                print(f"  outputs.logits shape {outputs.logits.shape}, mean {outputs.logits.mean().item():.4f}")
+                print(f"  outputs.hidden_states[-1] shape {outputs.hidden_states[-1].shape}")
+            
             hidden = outputs.hidden_states[-1][:, -1, :]
+            if self.debug:
+                print(f"  hidden (last token) shape {hidden.shape}, mean {hidden.mean().item():.4f}")
             gate_logit = torch.matmul(hidden, self.gate_weight.t()) + self.gate_bias
+            if self.debug:
+                print(f"  gate_logit {gate_logit.squeeze(-1)}")
             gate = self.gumbel_sigmoid(gate_logit.squeeze(-1), self.temperature, self.training)
+            if self.debug:
+                print(f"  gate {gate}")
             gates_list.append(gate.unsqueeze(1))
 
             next_token_logits = outputs.logits[:, -1, :] / temperature
+            if self.debug:
+                print(f"  next_token_logits shape {next_token_logits.shape}, mean {next_token_logits.mean().item():.4f}")
             if do_sample:
                 filtered_logits = next_token_logits.clone()
                 sorted_logits, sorted_indices = torch.sort(filtered_logits, descending=True)
@@ -164,24 +225,37 @@ class DTTModel(GPT2LMHeadModel):
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 filtered_logits[indices_to_remove] = float('-inf')
                 next_token = torch.multinomial(softmax(filtered_logits, dim=-1), num_samples=1)
+                if self.debug:
+                    print(f"  Sampled next_token {next_token}")
             else:
                 next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                if self.debug:
+                    print(f"  Argmax next_token {next_token}")
 
             if gate.mean() > 0.5:
+                if self.debug:
+                    print("  Using latent state (gate > 0.5)")
                 next_embed = gate.unsqueeze(-1) * hidden + (1 - gate).unsqueeze(-1) * self.transformer.wte(torch.full((batch_size, 1), self.dummy_id, device=hidden.device))
                 generated_ids = torch.cat([generated_ids, torch.full((batch_size, 1), self.dummy_id, device=generated_ids.device)], dim=1)
             else:
+                if self.debug:
+                    print("  Using normal embedding (gate <= 0.5)")
                 next_embed = self.transformer.wte(next_token)
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
             input_embeds = torch.cat([input_embeds, next_embed], dim=1)
             
-            if debug and step % 50 == 0:  # Print every 50 steps to avoid too much output
-                print(f"Generate step {step+1}/{max_length - input_ids.size(1)} took {time.time() - step_start:.4f}s")
+            if self.debug and step % 50 == 0:  # Print every 50 steps to avoid too much output
+                print(f"Step {step+1} took {time.time() - step_start:.4f}s")
 
+        if self.debug:
+            print("Exiting generate")
+            print(f"  generated_ids shape {generated_ids.shape}, sample {generated_ids[0][-10:]}...")
         if return_gates:
             return generated_ids, torch.cat(gates_list, dim=1)
         return generated_ids
 
     def set_temperature(self, tau):
+        if self.debug:
+            print(f"Setting temperature to {tau}")
         self.temperature = max(0.1, tau)
