@@ -1,8 +1,11 @@
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+transformers==4.46.1
+datasets==2.21.0
 accelerate==1.10.0
-datasets==4.0.0
 pyyaml==6.0.2
-torch==2.7.0+cu121
-torchvision==0.22.0+cu121
-transformers==4.55.2
-tqdm==4.67.1
-wandb==0.21.1
+wandb==0.17.7
+unsloth==2025.4.7
+unsloth-zoo==2025.4.4
+xformers==0.0.29.post1
+trl==0.15.2
