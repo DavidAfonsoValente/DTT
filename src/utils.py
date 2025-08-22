@@ -69,7 +69,7 @@ def validate_grpo(model, config, accelerator, tokenizer, debug=False):
             if debug:
                 print(f"Validation generate took {time.time() - gen_start:.2f}s")
                 gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=False)
-                print(f"Generated text: {gen_text[:100]}...")
+                print(f"Generated text: {gen_text[:512]}...")
             reward_dict = compute_reward(gen_ids[0], gates[0], tokenizer, batch['answer_gt'][0], model.bot_id, model.eot_id, config['dataset'], model.dummy_id)
             if debug:
                 print(f"Reward dict: {reward_dict}")
