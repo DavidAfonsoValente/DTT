@@ -115,7 +115,7 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
                 sample_outputs = model(input_ids=sample_input, attention_mask=sample_input.ne(tokenizer.pad_token_id))
             gate_after_prompt = sample_outputs.gates[0, -1].item()
             logit_bot = sample_outputs.logits[0, -1, model.bot_id].item()
-            prob_bot = softmax(sample_outputs.logits[0, -1], dim=-1)[model.bot_id].item()
+            prob_bot = torch.softmax(sample_outputs.logits[0, -1], dim=-1)[model.bot_id].item()
             print(f"Diagnostic on sample prompt: Gate after prompt: {gate_after_prompt:.4f}, Logit for [bot]: {logit_bot:.4f}, Prob for [bot]: {prob_bot:.4f}")
         
         valid = validate_bootstrap(model, config, accelerator, tokenizer, debug=debug)
