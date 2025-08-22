@@ -1,6 +1,3 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
-
 import yaml
 from accelerate import Accelerator
 from transformers import GPT2Config, GPT2Tokenizer
