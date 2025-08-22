@@ -1,12 +1,13 @@
 dataset: gsm8k
 batch_size: 32  # Per GPU
-accum_steps: 1  # For effective batch_size=32 (4 GPUs × 4 samples × 2 accumulations)
-epochs: 2
+accum_steps: 1  # For effective batch_size=32
+epochs: 10  # IMPROVED: Increased for better convergence
 lr: 1.0e-5
-lambda_gate: 0.1
+lambda_gate: 0.05  # IMPROVED: Lowered for gentler regularization
 group_size: 8
 epsilon: 0.2
 beta_kl: 0.01
 max_length: 512
 val_size: 256
 data_dir: data
+# Note: If structure rate still low, try synthetic_ratio: 0.5 in code (not here)

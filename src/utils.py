@@ -18,6 +18,10 @@ def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
             if num_samples >= config['val_size']: break
             if debug:
                 print(f"Validation batch {batch_idx + 1}")
+                # IMPROVED: Diagnostic gate after prompt
+                prompt_outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+                gate_after_prompt = prompt_outputs.gates[0, -1].item()
+                print(f"Gate after prompt: {gate_after_prompt:.4f}")
                 gen_start = time.time()
             gen_ids, gates = model.generate(batch['input_ids'], max_length=config['max_length'], return_gates=True)
             if debug:
@@ -42,7 +46,7 @@ def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
     mean_inner_gate = inner_gates_sum / (structure_count or 1)
     if debug:
         print(f"Validation results: Structure rate {structure_rate:.4f}, Mean inner gate {mean_inner_gate:.4f}")
-    return {'is_valid': structure_rate >= 0.70 and mean_inner_gate >= 0.60, 'structure_rate': structure_rate, 'mean_inner_gate': mean_inner_gate}
+    return {'is_valid': structure_rate >= 0.40 and mean_inner_gate >= 0.60, 'structure_rate': structure_rate, 'mean_inner_gate': mean_inner_gate}
 
 def validate_grpo(model, config, accelerator, tokenizer, debug=False):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))

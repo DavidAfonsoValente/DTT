@@ -29,7 +29,7 @@ class CustomGPT2Attention(GPT2Attention):
             if model is not None and hasattr(model, 'debug') and model.debug:
                 print(f"CustomGPT2Attention forward: hidden_states shape {hidden_states.shape}")
         
-        # FIX: Clip hidden_states to prevent early overflow
+        # Clip hidden_states to prevent early overflow
         hidden_states = torch.clamp(hidden_states, -1e4, 1e4)
         
         query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
@@ -50,7 +50,7 @@ class CustomGPT2Attention(GPT2Attention):
         attn_scores = torch.matmul(query, key.transpose(-1, -2))
         attn_scores = attn_scores / math.sqrt(self.head_dim)
         
-        # FIX: Clip attn_scores to avoid inf/NaN in softmax
+        # Clip attn_scores to avoid inf/NaN in softmax
         attn_scores = torch.clamp(attn_scores, -1e4, 1e4)
 
         # Apply causal mask
@@ -91,10 +91,10 @@ class CustomGPT2Attention(GPT2Attention):
 class DTTModel(GPT2LMHeadModel):
     def __init__(self, config):
         super().__init__(config)
-        # FIX: Smaller init for gate to avoid large logits
-        std = 0.02  # Matching transformers default
+        std = 0.02
         self.gate_weight = nn.Parameter(torch.randn(1, config.n_embd) * std)
-        self.gate_bias = nn.Parameter(torch.zeros(1) )
+        # IMPROVED: Bias towards low gates initially
+        self.gate_bias = nn.Parameter(torch.tensor(-1.0))
         self.special_tokens = {'bot': '[bot]', 'eot': '[eot]'}
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         self.tokenizer.add_special_tokens({
@@ -102,9 +102,8 @@ class DTTModel(GPT2LMHeadModel):
             'pad_token': '<pad>'
         })
         self.resize_token_embeddings(len(self.tokenizer))
-        # FIX: Re-init new embedding rows with smaller std
         with torch.no_grad():
-            self.transformer.wte.weight[-3:] *= 0.1  # Scale down new tokens
+            self.transformer.wte.weight[-3:] *= 0.1
             self.lm_head.weight[-3:] *= 0.1
         self.bot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['bot'])
         self.eot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['eot'])
@@ -126,7 +125,6 @@ class DTTModel(GPT2LMHeadModel):
             if self.debug:
                 print(f"  Gumbel noise mean {gumbel_noise.mean().item():.4f}")
             return sigmoid((logit + gumbel_noise) / temperature)
-        # Use sharper sigmoid for inference per description (τ=0 approximated)
         return sigmoid(logit / 0.1)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, input_embeds=None, noisy_mask=None, **kwargs):
@@ -144,9 +142,8 @@ class DTTModel(GPT2LMHeadModel):
                 print(f"  noisy_mask shape {noisy_mask.shape}")
 
         if noisy_mask is not None:
-            self.noisy_mask = noisy_mask  # Keep as bool
+            self.noisy_mask = noisy_mask
 
-        # FIX: Clamp inputs if provided
         if input_embeds is not None:
             input_embeds = torch.clamp(input_embeds, -1e4, 1e4)
         
@@ -163,7 +160,6 @@ class DTTModel(GPT2LMHeadModel):
             print(f"After transformer: hidden_states[-1] shape {transformer_outputs.hidden_states[-1].shape}, mean {transformer_outputs.hidden_states[-1].mean().item():.4f}")
             print(f"  logits shape {transformer_outputs.logits.shape}")
 
-        # FIX: Handle NaN in hidden states
         hidden_states = transformer_outputs.hidden_states[-1]
         if torch.isnan(hidden_states).any():
             if self.debug:
@@ -237,7 +233,6 @@ class DTTModel(GPT2LMHeadModel):
                 print(f"  gate {gate}")
             gates_list.append(gate.unsqueeze(1))
 
-            # FIX: Clamp logits to prevent NaN in softmax
             next_token_logits = outputs.logits[:, -1, :] / temperature
             next_token_logits = torch.clamp(next_token_logits, -1e4, 1e4)
             if self.debug:
@@ -252,7 +247,6 @@ class DTTModel(GPT2LMHeadModel):
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 filtered_logits[indices_to_remove] = float('-inf')
                 probs = softmax(filtered_logits, dim=-1)
-                # FIX: Handle NaN in probs
                 if torch.isnan(probs).any():
                     if self.debug:
                         print("WARNING: NaN in probs, replacing with uniform")
