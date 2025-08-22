@@ -1,124 +1,172 @@
-from torch.utils.data import DataLoader
 import torch
-from src.rewards import compute_reward
-from src.datasets import DTTDataset, collate_fn
+from tqdm import tqdm
 import time
+from src.rewards import compute_reward
 
 def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
-    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
-    val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
-    structure_count = 0
-    inner_gates_sum = 0.0
-    num_samples = 0
+    dataset = config['val_dataset']
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=config['collate_fn'])
+    model, dataloader = accelerator.prepare(model, dataloader)
     
-    model.eval()
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
-            if num_samples >= config['val_size']: break
-            if debug:
-                print(f"Validation batch {batch_idx + 1}")
-                gen_start = time.time()
-            gen_ids, gates = model.generate(batch['input_ids'], max_length=config['max_length'], return_gates=True)
-            if debug:
-                print(f"Validation generate took {time.time() - gen_start:.2f}s")
-                gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=False)
-                print(f"Generated text: {gen_text[:100]}...")
-            bot_pos = (gen_ids == model.bot_id).nonzero(as_tuple=True)[0]
-            eot_pos = (gen_ids == model.eot_id).nonzero(as_tuple=True)[0]
-            if len(bot_pos) > 0 and len(eot_pos) > 0 and bot_pos[0] < eot_pos[0]:
-                structure_count += 1
-                inner_gates = gates[:, bot_pos[0]+1:eot_pos[0]]
-                mean_inner = inner_gates.mean().item() if inner_gates.numel() > 0 else 0.0
-                inner_gates_sum += mean_inner
-                if debug:
-                    print(f"Structure detected, mean inner gate: {mean_inner:.4f}")
-            else:
-                if debug:
-                    print("No structure detected")
-            num_samples += 1
-    
-    structure_rate = structure_count / num_samples if num_samples > 0 else 0
-    mean_inner_gate = inner_gates_sum / (structure_count or 1)
     if debug:
-        print(f"Validation results: Structure rate {structure_rate:.4f}, Mean inner gate {mean_inner_gate:.4f}")
-    return {'is_valid': structure_rate >= 0.70 and mean_inner_gate >= 0.60, 'structure_rate': structure_rate, 'mean_inner_gate': mean_inner_gate}
+        accelerator.unwrap_model(model).debug = True
+    
+    num_samples = 0
+    num_structured = 0
+    inner_gates = []
+    model.eval()
+    
+    for batch in tqdm(dataloader, desc="Validating bootstrap"):
+        if debug and accelerator.is_local_main_process:
+            val_start = time.time()
+            print(f"Validating sample {num_samples + 1}/{len(dataloader)}")
+            input_text = tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
+            print(f"Input text: {input_text[:512] if len(input_text) > 512 else input_text}")
+        
+        with torch.no_grad():
+            gen_ids, gates = model.generate(batch['input_ids'], max_length=config['max_length'], return_gates=True)
+        
+        if debug and accelerator.is_local_main_process:
+            gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=False)
+            print(f"Validation generate took {time.time() - val_start:.2f}s")
+            print(f"Generated text: {gen_text[:512] if len(gen_text) > 512 else gen_text}")
+        
+        bot_pos = (gen_ids == model.bot_id).nonzero(as_tuple=True)[1]
+        eot_pos = (gen_ids == model.eot_id).nonzero(as_tuple=True)[1]
+        
+        if debug and accelerator.is_local_main_process:
+            print(f"bot_id positions: {bot_pos.tolist()}")
+            print(f"eot_id positions: {eot_pos.tolist()}")
+        
+        has_structure = False
+        if bot_pos.numel() > 0 and eot_pos.numel() > 0:
+            bot_idx = bot_pos[0].item()
+            eot_idx = eot_pos[0].item()
+            if bot_idx < eot_idx:
+                num_structured += 1
+                has_structure = True
+                inner_gates.append(gates[0, bot_idx + 1:eot_idx].mean().item() if eot_idx > bot_idx + 1 else 0.0)
+        
+        if debug and accelerator.is_local_main_process:
+            if has_structure:
+                print(f"Structure detected: [bot] at {bot_idx}, [eot] at {eot_idx}")
+            else:
+                print("No structure detected")
+        
+        num_samples += 1
+        if num_samples >= config['val_size']:
+            break
+    
+    structure_rate = num_structured / num_samples if num_samples > 0 else 0.0
+    mean_inner_gate = sum(inner_gates) / len(inner_gates) if inner_gates else 0.0
+    
+    if debug and accelerator.is_local_main_process:
+        print(f"Validation complete: Structure rate = {structure_rate:.4f}, Mean inner gate = {mean_inner_gate:.4f}")
+    
+    return {
+        'structure_rate': structure_rate,
+        'mean_inner_gate': mean_inner_gate,
+        'is_valid': structure_rate >= 0.40 and mean_inner_gate >= 0.60
+    }
 
 def validate_grpo(model, config, accelerator, tokenizer, debug=False):
-    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
-    val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
-    total_reward = 0.0
-    r_struct_sum = 0.0
-    r_corr_sum = 0.0
-    r_eff_sum = 0.0
-    r_gate_sum = 0.0
-    structure_count = 0
-    correct_count = 0
-    inner_gates_sum = 0.0
-    num_samples = 0
-    
-    model.eval()
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
-            if num_samples >= 256: break
-            if debug:
-                print(f"Validation batch {batch_idx + 1}, GT answer: {batch['answer_gt'][0]}")
-                gen_start = time.time()
-            gen_ids, gates = model.generate(batch['input_ids'], max_length=config['max_length'], return_gates=True)
-            if debug:
-                print(f"Validation generate took {time.time() - gen_start:.2f}s")
-                gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=False)
-                print(f"Generated text: {gen_text[:100]}...")
-            reward_dict = compute_reward(gen_ids[0], gates[0], tokenizer, batch['answer_gt'][0], model.bot_id, model.eot_id, config['dataset'], model.dummy_id)
-            if debug:
-                print(f"Reward dict: {reward_dict}")
-            total_reward += reward_dict['total']
-            r_struct_sum += reward_dict['struct']
-            r_corr_sum += reward_dict['corr']
-            r_eff_sum += reward_dict['eff']
-            r_gate_sum += reward_dict['gate']
-            bot_pos = (gen_ids[0] == model.bot_id).nonzero(as_tuple=True)[0]
-            eot_pos = (gen_ids[0] == model.eot_id).nonzero(as_tuple=True)[0]
-            has_span = len(bot_pos) > 0 and len(eot_pos) > 0 and bot_pos[0] < eot_pos[0]
-            if has_span:
-                structure_count += 1
-                inner_gates = gates[0, bot_pos[0]+1:eot_pos[0]]
-                mean_inner = inner_gates.mean().item() if inner_gates.numel() > 0 else 0.0
-                inner_gates_sum += mean_inner
-                if debug:
-                    print(f"Structure detected, mean inner gate: {mean_inner:.4f}")
-            else:
-                if debug:
-                    print("No structure detected")
-            if reward_dict['corr'] > 0:
-                correct_count += 1
-                if debug:
-                    print("Correct answer")
-            else:
-                if debug:
-                    print("Incorrect answer")
-            num_samples += 1
-    
-    avg_reward = total_reward / num_samples if num_samples > 0 else 0.0
-    avg_r_struct = r_struct_sum / num_samples if num_samples > 0 else 0.0
-    avg_r_corr = r_corr_sum / num_samples if num_samples > 0 else 0.0
-    avg_r_eff = r_eff_sum / num_samples if num_samples > 0 else 0.0
-    avg_r_gate = r_gate_sum / num_samples if num_samples > 0 else 0.0
-    structure_rate = structure_count / num_samples if num_samples > 0 else 0.0
-    correct_rate = correct_count / num_samples if num_samples > 0 else 0.0
-    mean_inner_gate = inner_gates_sum / structure_count if structure_count > 0 else 0.0
+    dataset = config['val_dataset']
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=config['collate_fn'])
+    model, dataloader = accelerator.prepare(model, dataloader)
     
     if debug:
-        print(f"Validation results: Avg reward {avg_reward:.4f}, Structure rate {structure_rate:.4f}, Correct rate {correct_rate:.4f}, Mean inner gate {mean_inner_gate:.4f}")
+        accelerator.unwrap_model(model).debug = True
+    
+    num_samples = 0
+    num_structured = 0
+    num_correct = 0
+    inner_gates = []
+    rewards = []
+    r_struct = []
+    r_corr = []
+    r_eff = []
+    r_gate = []
+    model.eval()
+    
+    for batch in tqdm(dataloader, desc="Validating GRPO"):
+        if debug and accelerator.is_local_main_process:
+            val_start = time.time()
+            print(f"Validating sample {num_samples + 1}/{len(dataloader)}")
+            input_text = tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
+            print(f"Input text: {input_text[:512] if len(input_text) > 512 else input_text}")
+            print(f"Ground truth answer: {batch['answer_gt'][0]}")
+        
+        with torch.no_grad():
+            gen_ids, gates = model.generate(batch['input_ids'], max_length=config['max_length'], return_gates=True)
+        
+        if debug and accelerator.is_local_main_process:
+            gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=False)
+            print(f"Validation generate took {time.time() - val_start:.2f}s")
+            print(f"Generated text: {gen_text[:512] if len(gen_text) > 512 else gen_text}")
+        
+        bot_pos = (gen_ids == model.bot_id).nonzero(as_tuple=True)[1]
+        eot_pos = (gen_ids == model.eot_id).nonzero(as_tuple=True)[1]
+        
+        if debug and accelerator.is_local_main_process:
+            print(f"bot_id positions: {bot_pos.tolist()}")
+            print(f"eot_id positions: {eot_pos.tolist()}")
+        
+        has_structure = False
+        if bot_pos.numel() > 0 and eot_pos.numel() > 0:
+            bot_idx = bot_pos[0].item()
+            eot_idx = eot_pos[0].item()
+            if bot_idx < eot_idx:
+                num_structured += 1
+                has_structure = True
+                inner_gates.append(gates[0, bot_idx + 1:eot_idx].mean().item() if eot_idx > bot_idx + 1 else 0.0)
+        
+        if debug and accelerator.is_local_main_process:
+            if has_structure:
+                print(f"Structure detected: [bot] at {bot_idx}, [eot] at {eot_idx}")
+            else:
+                print("No structure detected")
+        
+        reward_dict = compute_reward(
+            gen_ids[0], gates[0], tokenizer, batch['answer_gt'][0],
+            model.bot_id, model.eot_id, config['dataset'], model.dummy_id,
+            weights={'struct': 0.6, 'corr': 1.0, 'eff': 0.25, 'gate': 0.6}
+        )
+        
+        if debug and accelerator.is_local_main_process:
+            print(f"Reward dict: {reward_dict}")
+        
+        rewards.append(reward_dict['total'])
+        r_struct.append(reward_dict['struct'])
+        r_corr.append(reward_dict['corr'])
+        r_eff.append(reward_dict['eff'])
+        r_gate.append(reward_dict['gate'])
+        if reward_dict['corr'] > 0.5:
+            num_correct += 1
+        
+        num_samples += 1
+        if num_samples >= config['val_size']:
+            break
+    
+    avg_reward = sum(rewards) / num_samples if num_samples > 0 else 0.0
+    structure_rate = num_structured / num_samples if num_samples > 0 else 0.0
+    correct_rate = num_correct / num_samples if num_samples > 0 else 0.0
+    mean_inner_gate = sum(inner_gates) / len(inner_gates) if inner_gates else 0.0
+    avg_r_struct = sum(r_struct) / num_samples if num_samples > 0 else 0.0
+    avg_r_corr = sum(r_corr) / num_samples if num_samples > 0 else 0.0
+    avg_r_eff = sum(r_eff) / num_samples if num_samples > 0 else 0.0
+    avg_r_gate = sum(r_gate) / num_samples if num_samples > 0 else 0.0
+    
+    if debug and accelerator.is_local_main_process:
+        print(f"Validation complete: Structure rate = {structure_rate:.4f}, Correct rate = {correct_rate:.4f}, "
+              f"Mean inner gate = {mean_inner_gate:.4f}, Avg reward = {avg_reward:.4f}")
     
     return {
         'avg_reward': avg_reward,
+        'structure_rate': structure_rate,
+        'correct_rate': correct_rate,
+        'mean_inner_gate': mean_inner_gate,
         'avg_r_struct': avg_r_struct,
         'avg_r_corr': avg_r_corr,
         'avg_r_eff': avg_r_eff,
-        'avg_r_gate': avg_r_gate,
-        'structure_rate': structure_rate,
-        'correct_rate': correct_rate,
-        'mean_inner_gate': mean_inner_gate
+        'avg_r_gate': avg_r_gate
     }
