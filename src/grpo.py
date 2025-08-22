@@ -16,24 +16,17 @@ def smooth(k, a, b):
     return 1 / (1 + math.exp(- (k - mid) / scale))
 
 def get_weights(step):
-    if step < 1500:
-        return {'struct': 1.0, 'corr': 0.4, 'eff': 0.0, 'gate': 0.6}
-    elif step < 4000:
-        s = smooth(step, 1500, 3500)
-        w_struct = 1.0 - 0.3 * s
-        w_corr = 0.4 + 0.6 * s
-        w_eff = 0.0 + 0.15 * s
-        w_gate = 0.6 - 0.1 * s
+    if step < 2000:  # Phase 1
+        return {'struct': 1.0, 'corr': 0.6, 'eff': 0.1, 'gate': 0.3}
+    elif step < 6000:  # Phase 2
+        s = smooth(step, 2000, 4000)
+        w_struct = 1.0 - 0.4 * s
+        w_corr = 0.6 + 0.4 * s
+        w_eff = 0.1 + 0.15 * s
+        w_gate = 0.3 + 0.3 * s
         return {'struct': w_struct, 'corr': w_corr, 'eff': w_eff, 'gate': w_gate}
-    elif step < 7000:
-        s = smooth(step, 4000, 6500)
-        w_struct = 0.7 - 0.1 * s
-        w_corr = 1.0
-        w_eff = 0.15 + 0.15 * s
-        w_gate = 0.5 + 0.1 * s
-        return {'struct': w_struct, 'corr': w_corr, 'eff': w_eff, 'gate': w_gate}
-    else:
-        return {'struct': 0.6, 'corr': 1.0, 'eff': 0.3, 'gate': 0.6}
+    else:  # Phase 3
+        return {'struct': 0.6, 'corr': 1.0, 'eff': 0.25, 'gate': 0.6}
 
 def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, debug=False):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
@@ -55,13 +48,14 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
     prev_val_reward = -float('inf')
     plateau_steps = 0
     current_phase = 1
-    phase_thresholds = [0, 1500, 4000, 7000]
+    phase_thresholds = [0, 2000, 6000, float('inf')]
     phase_conditions = [
         None,
-        lambda m: m['structure_rate'] >= 0.7 and m['mean_inner_gate'] >= 0.6,
-        lambda m: m['structure_rate'] >= 0.85 and m['correct_rate'] >= 0.4,
-        lambda m: m['structure_rate'] >= 0.9 and m['correct_rate'] >= 0.6,
+        lambda m: m['structure_rate'] >= 0.6 and m['correct_rate'] >= 0.3,
+        lambda m: m['structure_rate'] >= 0.8 and m['correct_rate'] >= 0.5,
+        lambda m: True
     ]
+    beta_kl_values = [0.02, 0.01, 0.005]  # Per phase
     next_transition_attempt = 0
     prev_metrics = None
     transition_metrics = None
@@ -102,11 +96,11 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                 for gen_idx in range(config['group_size']):
                     if debug and accelerator.is_local_main_process:
                         gen_start = time.time()
-                    gen_ids, gates = ref_model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)  # Fixed: use ref_model
+                    gen_ids, gates = ref_model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)
                     if debug and accelerator.is_local_main_process:
                         print(f"    Generation {gen_idx + 1}/{config['group_size']} took {time.time() - gen_start:.2f}s")
                         gen_text = model.tokenizer.decode(gen_ids[0], skip_special_tokens=False)
-                        print(f"    Generated text: {gen_text[:100]}...")  # Truncated for brevity
+                        print(f"    Generated text: {gen_text[:100]}...")
                     
                     reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id, weights=weights)
                     if debug and accelerator.is_local_main_process:
@@ -142,7 +136,8 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                     ppo_loss = -torch.min(surr1, surr2)
                     
                     kl = torch.nn.functional.kl_div(logprobs_old, logprobs, log_target=True, reduction='mean')
-                    loss = ppo_loss + config['beta_kl'] * kl
+                    beta_kl = beta_kl_values[current_phase - 1]
+                    loss = ppo_loss + beta_kl * kl
                     batch_loss += loss
                     
                     epoch_kl += kl.item()
@@ -181,22 +176,21 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                 else:
                     plateau_steps = 0
                 if plateau_steps >= 5000:
-                    model.set_temperature(model.temperature / 2)
+                    model.set_temperature(model.temperature * 0.8)  # Reduce by 20% per description
                     plateau_steps = 0
                 prev_val_reward = val_metrics['avg_reward']
 
-                # Phase transition logic
                 prev_phase = current_phase
-                if step >= next_transition_attempt and current_phase < 4 and step >= phase_thresholds[current_phase] and phase_conditions[current_phase](val_metrics):
+                if step >= next_transition_attempt and current_phase < 3 and step >= phase_thresholds[current_phase] and phase_conditions[current_phase](val_metrics):
                     current_phase += 1
                     transition_metrics = prev_metrics
                     transition_step = step
                     next_transition_attempt = 0
                     if debug and accelerator.is_local_main_process:
                         print(f"Transitioned to phase {current_phase}")
+                        print(f"Current beta_kl: {beta_kl_values[current_phase - 1]}")
 
-                # Degradation check
-                if prev_phase < current_phase and step - transition_step <= 5000:
+                if prev_phase < current_phase and step - transition_step <= 500:
                     degrade = False
                     key_metrics = ['structure_rate', 'correct_rate']
                     for km in key_metrics:
@@ -208,6 +202,7 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                         next_transition_attempt = step + 1000
                         if debug and accelerator.is_local_main_process:
                             print(f"Degradation detected, reverted to phase {current_phase}")
+                            print(f"Current beta_kl: {beta_kl_values[current_phase - 1]}")
 
                 prev_metrics = val_metrics
             

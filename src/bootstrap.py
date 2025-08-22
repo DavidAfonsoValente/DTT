@@ -52,12 +52,17 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
             gate_reg_value = 0.0
             if noisy_mask is not None:
                 inner_gates = gates[noisy_mask]
+                outer_gates = gates[~noisy_mask]
                 mean_inner_gate = inner_gates.mean() if inner_gates.numel() > 0 else torch.tensor(0.0)
-                gate_reg = config['lambda_gate'] * relu(0.7 - mean_inner_gate)
+                mean_outer_gate = outer_gates.mean() if outer_gates.numel() > 0 else torch.tensor(0.0)
+                gate_reg_inner = config['lambda_gate'] * relu(0.7 - mean_inner_gate)
+                gate_reg_outer = config['lambda_gate'] * 0.5 * relu(mean_outer_gate - 0.3)  # Pull outer gates down
+                gate_reg = gate_reg_inner + gate_reg_outer
                 loss += gate_reg
                 gate_reg_value = gate_reg.item()
                 if debug and accelerator.is_local_main_process:
                     print(f"Mean inner gate: {mean_inner_gate.item():.4f}")
+                    print(f"Mean outer gate: {mean_outer_gate.item():.4f}")
                     print(f"Gate regularization: {gate_reg_value:.4f}")
             
             # Scale loss for accumulation

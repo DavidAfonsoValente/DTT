@@ -114,7 +114,8 @@ class DTTModel(GPT2LMHeadModel):
             if self.debug:
                 print(f"  Gumbel noise mean {gumbel_noise.mean().item():.4f}")
             return sigmoid((logit + gumbel_noise) / temperature)
-        return sigmoid(logit)
+        # Use sharper sigmoid for inference per description (τ=0 approximated)
+        return sigmoid(logit / 0.1)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, input_embeds=None, noisy_mask=None, **kwargs):
         if self.debug:
@@ -131,7 +132,7 @@ class DTTModel(GPT2LMHeadModel):
                 print(f"  noisy_mask shape {noisy_mask.shape}")
 
         if noisy_mask is not None:
-            self.noisy_mask = noisy_mask  # Keep as bool, remove .float()
+            self.noisy_mask = noisy_mask  # Keep as bool
 
         if input_embeds is not None:
             if self.debug:
@@ -179,20 +180,19 @@ class DTTModel(GPT2LMHeadModel):
             gates=gates,
         )
 
-    def generate(self, input_ids, max_length=512, do_sample=True, top_p=0.95, temperature=1.0, return_gates=False, **kwargs):
+    def generate(self, input_ids, max_length=512, do_sample=True, top_p=0.95, temperature=1.0, return_gates=False, min_dummy_streak=10, **kwargs):
         if self.debug:
             print("Entering generate")
             print(f"  input_ids shape {input_ids.shape}, sample {input_ids[0][:10]}...")
         
-        # Move input_ids to the model's device
         input_ids = input_ids.to(self.device)
-        
         batch_size = input_ids.size(0)
         input_embeds = self.transformer.wte(input_ids)
         if self.debug:
             print(f"  input_embeds shape {input_embeds.shape}")
         generated_ids = input_ids.clone()
         gates_list = []
+        dummy_streak = torch.zeros(batch_size, device=self.device, dtype=torch.long)
 
         for step in range(max_length - input_ids.size(1)):
             if self.debug:
@@ -235,15 +235,21 @@ class DTTModel(GPT2LMHeadModel):
                 if self.debug:
                     print(f"  Argmax next_token {next_token}")
 
-            # Fixed: per-item decision, not mean
             latent_mask = (gate > 0.5).unsqueeze(-1)
             next_embed = latent_mask * hidden + (~latent_mask) * self.transformer.wte(next_token)
             next_id = torch.where(latent_mask.squeeze(-1), torch.full((batch_size, 1), self.dummy_id, device=hidden.device), next_token)
             generated_ids = torch.cat([generated_ids, next_id], dim=1)
-
             input_embeds = torch.cat([input_embeds, next_embed], dim=1)
             
-            if self.debug and step % 50 == 0:  # Print every 50 steps to avoid too much output
+            # Update dummy streak
+            is_dummy = (next_id == self.dummy_id).squeeze(-1)
+            dummy_streak = torch.where(is_dummy, dummy_streak + 1, torch.zeros_like(dummy_streak))
+            if (dummy_streak >= min_dummy_streak).all():
+                if self.debug:
+                    print(f"Stopping: {min_dummy_streak} consecutive dummy tokens")
+                break
+            
+            if self.debug and step % 50 == 0:
                 print(f"Step {step+1} took {time.time() - step_start:.4f}s")
 
         if self.debug:

@@ -1,7 +1,7 @@
-from datasets import load_dataset
-from torch.utils.data import Dataset
-import random
 import torch
+from torch.utils.data import Dataset
+from datasets import load_dataset
+import random
 import os
 from torch.nn.utils.rnn import pad_sequence
 
@@ -49,7 +49,7 @@ class DTTDataset(Dataset):
         labels = torch.full_like(input_ids, -100)
 
         if self.is_synthetic:
-            k = random.randint(0, 5)  # Updated to {0..5} as per description
+            k = random.randint(0, 5)
             fillers_ids = [random.randint(0, self.vocab_size - 1) for _ in range(k)]
             fillers_text = ' '.join(self.tokenizer.decode([f]) for f in fillers_ids)
             suffix_text = f" [bot] {fillers_text} [eot] {answer_gt}"
@@ -63,6 +63,7 @@ class DTTDataset(Dataset):
             if bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos:
                 noisy_mask[bot_pos + 1:eot_pos] = True
             labels = input_ids.clone()
+            labels[noisy_mask] = -100  # Ignore loss on random fillers
 
         return {'input_ids': input_ids, 'labels': labels, 'noisy_mask': noisy_mask, 'answer_gt': answer_gt}
 
