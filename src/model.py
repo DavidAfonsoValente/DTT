@@ -184,6 +184,9 @@ class DTTModel(GPT2LMHeadModel):
             print("Entering generate")
             print(f"  input_ids shape {input_ids.shape}, sample {input_ids[0][:10]}...")
         
+        # Move input_ids to the model's device
+        input_ids = input_ids.to(self.device)
+        
         batch_size = input_ids.size(0)
         input_embeds = self.transformer.wte(input_ids)
         if self.debug:
