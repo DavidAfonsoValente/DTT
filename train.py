@@ -24,8 +24,9 @@ is_main = accelerator.is_local_main_process
 
 if torch.cuda.is_available():
     current_device = torch.cuda.current_device()
+    num_devices = torch.cuda.device_count()
     device_name = torch.cuda.get_device_name(current_device)
-    print(f"[Proc {process_idx}/{num_procs}] Using CUDA device {current_device}: {device_name}", flush=True)
+    print(f"[Proc {process_idx}/{num_procs}] Using CUDA device {current_device}: {device_name} with {num_devices} devices", flush=True)
 else:
     print(f"[Proc {process_idx}/{num_procs}] Using device: {accelerator.device}", flush=True)
 
