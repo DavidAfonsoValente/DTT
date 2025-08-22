@@ -17,7 +17,9 @@ parser.add_argument('--ref_checkpoint', type=str, default=None)
 parser.add_argument('--debug', action='store_true', default=False)
 args = parser.parse_args()
 
-accelerator = Accelerator()
+# FIX: Disable mixed precision to avoid FP16 NaNs
+accelerator = Accelerator(mixed_precision="no")
+
 process_idx = accelerator.process_index
 num_procs = accelerator.num_processes
 is_main = accelerator.is_local_main_process
@@ -29,7 +31,6 @@ if torch.cuda.is_available():
     print(f"[Proc {process_idx}/{num_procs}] Using CUDA device {current_device}: {device_name} with {num_devices} devices", flush=True)
 else:
     print(f"[Proc {process_idx}/{num_procs}] Using device: {accelerator.device}", flush=True)
-
 
 with open(args.config, 'r') as f:
     config = yaml.safe_load(f)
