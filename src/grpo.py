@@ -80,7 +80,9 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                 batch_start = time.time()
                 print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
                 print(f"Batch input_ids shape: {batch['input_ids'].shape}")
+                input_text = model.tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
                 print(f"Batch answer_gt: {batch['answer_gt']}")
+                print(f"Decoded input text: {input_text[:512] if len(input_text) > 512 else input_text}")
             
             batch_loss = 0.0
             for prompt_idx in range(batch['input_ids'].size(0)):
@@ -100,7 +102,7 @@ def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, 
                     if debug and accelerator.is_local_main_process:
                         print(f"    Generation {gen_idx + 1}/{config['group_size']} took {time.time() - gen_start:.2f}s")
                         gen_text = model.tokenizer.decode(gen_ids[0], skip_special_tokens=False)
-                        print(f"    Generated text: {gen_text[:100]}...")
+                        print(f"    Generated text: {gen_text[:512] if len(gen_text) > 512 else gen_text}")
                     
                     reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id, weights=weights)
                     if debug and accelerator.is_local_main_process:

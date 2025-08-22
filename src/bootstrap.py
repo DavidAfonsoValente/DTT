@@ -38,10 +38,10 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
                 print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
                 print(f"Batch input_ids shape: {batch['input_ids'].shape}")
                 input_text = tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
-                print(f"Decoded input text: {input_text[:200]}...")
+                print(f"Decoded input text: {input_text[:512] if len(input_text) > 512 else input_text}")
                 if batch['labels'] is not None:
                     labels_text = tokenizer.decode(batch['labels'][0][batch['labels'][0] != -100], skip_special_tokens=False)
-                    print(f"Decoded labels text: {labels_text[:200]}...")
+                    print(f"Decoded labels text: {labels_text[:512] if len(labels_text) > 512 else labels_text}")
                 print(f"Batch noisy_mask shape: {batch['noisy_mask'].shape if batch['noisy_mask'] is not None else 'None'}")
             
             outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'], noisy_mask=batch['noisy_mask'])
