@@ -8,6 +8,7 @@ import wandb
 from torch.nn.functional import relu
 import time
 import math
+from torch.nn.functional import softmax
 
 def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, debug=False):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
