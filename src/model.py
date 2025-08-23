@@ -18,10 +18,7 @@ class CausalLMOutputWithGates(CausalLMOutputWithCrossAttentions):
 class CustomGPT2Attention(GPT2Attention):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__(config, is_cross_attention, layer_idx)
-        self.model = None  # Set later
-        self.bias = torch.tril(torch.ones((config.n_ctx, config.n_ctx), dtype=torch.bool)).view(
-            1, 1, config.n_ctx, config.n_ctx
-        )
+        self.model = None
 
     def forward(self, hidden_states, layer_past=None, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, use_cache=False, output_attentions=False):
         if self.model is not None:
@@ -29,7 +26,6 @@ class CustomGPT2Attention(GPT2Attention):
             if model is not None and hasattr(model, 'debug') and model.debug:
                 print(f"CustomGPT2Attention forward: hidden_states shape {hidden_states.shape}")
         
-        # Clip hidden_states to prevent early overflow
         hidden_states = torch.clamp(hidden_states, -1e4, 1e4)
         
         query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
@@ -50,16 +46,15 @@ class CustomGPT2Attention(GPT2Attention):
         attn_scores = torch.matmul(query, key.transpose(-1, -2))
         attn_scores = attn_scores / math.sqrt(self.head_dim)
         
-        # Clip attn_scores to avoid inf/NaN in softmax
         attn_scores = torch.clamp(attn_scores, -1e4, 1e4)
 
-        # Apply causal mask
         query_length, key_length = query.size(-2), key.size(-2)
-        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+        causal_mask = torch.tril(torch.ones((key_length, key_length), dtype=torch.bool, device=attn_scores.device)).view(1, 1, key_length, key_length)
+        causal_mask = causal_mask[:, :, key_length - query_length : key_length, :key_length]
+
         mask_value = torch.finfo(attn_scores.dtype).min
         attn_scores = torch.where(causal_mask, attn_scores, mask_value)
 
-        # Apply noisy scaling if noisy_mask is set
         if self.model is not None:
             model = self.model()
             if model is not None and hasattr(model, 'noisy_mask') and model.noisy_mask is not None:
@@ -67,7 +62,6 @@ class CustomGPT2Attention(GPT2Attention):
                 noisy_mask_exp = model.noisy_mask.unsqueeze(1).unsqueeze(2).expand(-1, self.num_heads, seq_len, seq_len)
                 attn_scores = torch.where(noisy_mask_exp & noisy_mask_exp.transpose(-2, -1), attn_scores * 0.3, attn_scores)
 
-        # Apply attention mask if provided
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
 
@@ -93,7 +87,6 @@ class DTTModel(GPT2LMHeadModel):
         super().__init__(config)
         std = 0.02
         self.gate_weight = nn.Parameter(torch.randn(1, config.n_embd) * std)
-        # IMPROVED: Bias towards low gates initially
         self.gate_bias = nn.Parameter(torch.tensor(-1.0))
         self.special_tokens = {'bot': '[bot]', 'eot': '[eot]'}
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
@@ -265,7 +258,6 @@ class DTTModel(GPT2LMHeadModel):
             generated_ids = torch.cat([generated_ids, next_id], dim=1)
             input_embeds = torch.cat([input_embeds, next_embed], dim=1)
             
-            # Update dummy streak
             is_dummy = (next_id == self.dummy_id).squeeze(-1)
             dummy_streak = torch.where(is_dummy, dummy_streak + 1, torch.zeros_like(dummy_streak))
             if (dummy_streak >= min_dummy_streak).all():
