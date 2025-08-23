@@ -107,11 +107,11 @@ class DTTModel(GPT2LMHeadModel):
     def gumbel_sigmoid(self, logit, temperature, training):
         if self.debug:
             print(f"gumbel_sigmoid: logit mean {logit.mean().item():.4f}, temperature {temperature}, training {training}")
+            if training:
+                print(f"  Gumbel noise mean {gumbel_noise.mean().item():.4f}")
         if training:
             u = torch.rand_like(logit)
             gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
-            if self.debug:
-                print(f"  Gumbel noise mean {gumbel_noise.mean().item():.4f}")
             return sigmoid((logit + gumbel_noise) / temperature)
         return sigmoid(logit / 0.1)
 
