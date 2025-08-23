@@ -8,6 +8,8 @@ def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
     val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
+    # FIXED: Prepare val_loader to move batches to device
+    val_loader = accelerator.prepare(val_loader)
     structure_count = 0
     inner_gates_sum = 0.0
     num_samples = 0
@@ -18,7 +20,7 @@ def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
             if num_samples >= config['val_size']: break
             if debug:
                 print(f"Validation batch {batch_idx + 1}")
-                # IMPROVED: Diagnostic gate after prompt
+                # Diagnostic gate after prompt
                 prompt_outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
                 gate_after_prompt = prompt_outputs.gates[0, -1].item()
                 print(f"Gate after prompt: {gate_after_prompt:.4f}")
@@ -52,6 +54,8 @@ def validate_grpo(model, config, accelerator, tokenizer, debug=False):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
     val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
+    # FIXED: Prepare val_loader to move batches to device
+    val_loader = accelerator.prepare(val_loader)
     total_reward = 0.0
     r_struct_sum = 0.0
     r_corr_sum = 0.0
