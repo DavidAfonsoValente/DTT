@@ -1,5 +1,6 @@
 dataset: gsm8k
 batch_size: 32  # Per GPU
+valid_batch_size: 32  # Per GPU
 accum_steps: 1  # For effective batch_size=32
 epochs: 10  # IMPROVED: Increased for better convergence
 lr: 1.0e-5

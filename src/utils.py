@@ -4,10 +4,10 @@ from src.rewards import compute_reward
 from src.datasets import DTTDataset, collate_fn
 import time
 
-def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
+def validate_bootstrap(model, config, accelerator, tokenizer, batch_size=1, debug=False):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
     val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=val_collate)
+    val_loader = DataLoader(val_dataset, batch_size, shuffle=False, collate_fn=val_collate)
     # FIXED: Prepare val_loader to move batches to device
     val_loader = accelerator.prepare(val_loader)
     structure_count = 0

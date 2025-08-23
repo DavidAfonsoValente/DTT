@@ -118,7 +118,7 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
             prob_bot = torch.softmax(sample_outputs.logits[0, -1], dim=-1)[model.bot_id].item()
             print(f"Diagnostic on sample prompt: Gate after prompt: {gate_after_prompt:.4f}, Logit for [bot]: {logit_bot:.4f}, Prob for [bot]: {prob_bot:.4f}")
         
-        valid = validate_bootstrap(model, config, accelerator, tokenizer, debug=debug)
+        valid = validate_bootstrap(model, config, accelerator, tokenizer, batch_size=config['valid_batch_size'], debug=debug)
         if accelerator.is_local_main_process:
             wandb.log({
                 "bootstrap/validation_structure_rate": valid['structure_rate'],
