@@ -105,12 +105,12 @@ class DTTModel(GPT2LMHeadModel):
             layer.attn = custom_attn
 
     def gumbel_sigmoid(self, logit, temperature, training):
-        if self.debug:
+        if self.debug and training:  # CHANGED: Only print during training
             print(f"gumbel_sigmoid: logit mean {logit.mean().item():.4f}, temperature {temperature}, training {training}")
         if training:
             u = torch.rand_like(logit)
             gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
-            if self.debug:
+            if self.debug and training:  # CHANGED: Only print during training
                 print(f"  Gumbel noise mean {gumbel_noise.mean().item():.4f}")
             return sigmoid((logit + gumbel_noise) / temperature)
         return sigmoid(logit / 0.1)
@@ -127,36 +127,38 @@ class DTTModel(GPT2LMHeadModel):
         else:
             transformer_outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
 
-        if self.debug:
+        if self.debug and self.training:  # CHANGED: Only print during training
             print(f"After transformer: hidden_states[-1] shape {transformer_outputs.hidden_states[-1].shape}, mean {transformer_outputs.hidden_states[-1].mean().item():.4f}")
             print(f"  logits shape {transformer_outputs.logits.shape}")
 
         hidden_states = transformer_outputs.hidden_states[-1]
         if torch.isnan(hidden_states).any():
-            if self.debug:
+            if self.debug and self.training:  # CHANGED: Only print during training
                 print("WARNING: NaN detected in hidden states, replacing with 0")
             hidden_states = torch.nan_to_num(hidden_states)
 
         gate_logits = torch.matmul(hidden_states, self.gate_weight.t()) + self.gate_bias
         gate_logits = gate_logits.squeeze(-1)
-        if self.debug:
+        if self.debug and self.training:  # CHANGED: Only print during training
             print(f"Gate logits shape {gate_logits.shape}, mean {gate_logits.mean().item():.4f}")
 
         gates = self.gumbel_sigmoid(gate_logits, self.temperature, self.training)
-        if self.debug:
+        if self.debug and self.training:  # CHANGED: Only print during training
             print(f"Gates shape {gates.shape}, mean {gates.mean().item():.4f}")
 
         loss = None
         if labels is not None:
-            if self.debug:
+            if self.debug and self.training:  # CHANGED: Only print during training
                 print("Computing loss")
             shift_logits = transformer_outputs.logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            if self.debug:
+            if self.debug and self.training:  # CHANGED: Only print during training
                 print(f"Loss: {loss.item():.4f}")
 
         self.noisy_mask = None
+        if self.debug and self.training:  # CHANGED: Only print during training
+            print("Exiting forward")
         return CausalLMOutputWithGates(
             loss=loss,
             logits=transformer_outputs.logits,
