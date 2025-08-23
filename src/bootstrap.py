@@ -7,7 +7,7 @@ from src.utils import validate_bootstrap
 import wandb
 from torch.nn.functional import relu
 import time
-import math  # IMPROVED: For annealing formula
+import math
 
 def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, debug=False):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
@@ -22,14 +22,9 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
     if accelerator.is_local_main_process:
         wandb.log({"stage": "bootstrap_start", "epoch": 0})
     
-    # IMPROVED: Add step counter for annealing
     global_step = 0
     
     for epoch in range(config['epochs']):
-        if debug and accelerator.is_local_main_process:
-            print(f"Starting epoch {epoch + 1}/{config['epochs']}")
-            epoch_start = time.time()
-        
         model.train()
         epoch_loss = 0.0
         epoch_gate_reg = 0.0
@@ -38,15 +33,11 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
         
         for batch_idx, batch in enumerate(tqdm(dataloader)):
             if debug and accelerator.is_local_main_process:
-                batch_start = time.time()
-                print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
-                print(f"Batch input_ids shape: {batch['input_ids'].shape}")
                 input_text = tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
                 print(f"Decoded input text: {input_text[:512] if len(input_text) > 512 else input_text}")
                 if batch['labels'] is not None:
                     labels_text = tokenizer.decode(batch['labels'][0][batch['labels'][0] != -100], skip_special_tokens=False)
                     print(f"Decoded labels text: {labels_text[:512] if len(labels_text) > 512 else labels_text}")
-                print(f"Batch noisy_mask shape: {batch['noisy_mask'].shape if batch['noisy_mask'] is not None else 'None'}")
             
             outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'], noisy_mask=batch['noisy_mask'])
             loss = outputs.loss
@@ -60,9 +51,7 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
                 mean_inner_gate = inner_gates.mean() if inner_gates.numel() > 0 else torch.tensor(0.0)
                 mean_outer_gate = outer_gates.mean() if outer_gates.numel() > 0 else torch.tensor(0.0)
                 gate_reg_inner = config['lambda_gate'] * relu(0.7 - mean_inner_gate)
-                # IMPROVED: Remove outer reg to match description; comment out
-                # gate_reg_outer = config['lambda_gate'] * 0.5 * relu(mean_outer_gate - 0.3)
-                gate_reg = gate_reg_inner  # + gate_reg_outer
+                gate_reg = gate_reg_inner
                 loss += gate_reg
                 gate_reg_value = gate_reg.item()
                 if debug and accelerator.is_local_main_process:
@@ -77,22 +66,14 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-                global_step += 1  # IMPROVED: Increment per update
-                # IMPROVED: Anneal temperature every 100 steps
+                global_step += 1
                 if global_step % 100 == 0:
                     new_tau = max(0.1, 2.0 * (0.9 ** (global_step / 1000)))
                     model.set_temperature(new_tau)
-                    if debug and accelerator.is_local_main_process:
-                        print(f"Annealed temperature to {new_tau} at step {global_step}")
-                if debug and accelerator.is_local_main_process:
-                    print(f"Gradient update after {accum_steps} accumulations")
             
             epoch_loss += loss.item() * accum_steps
             epoch_gate_reg += gate_reg_value
             num_batches += 1
-            
-            if debug and accelerator.is_local_main_process:
-                print(f"Batch processed in {time.time() - batch_start:.2f}s | Final Loss: {loss.item() * accum_steps:.4f}")
         
         avg_loss = epoch_loss / num_batches
         avg_gate_reg = epoch_gate_reg / num_batches
@@ -105,20 +86,16 @@ def train_bootstrap(model, dataset, config, accelerator, collate_fn, tokenizer, 
             })
         
         if debug and accelerator.is_local_main_process:
-            print(f"Epoch {epoch + 1} completed in {time.time() - epoch_start:.2f}s | Avg Loss: {avg_loss:.4f} | Avg Gate Reg: {avg_gate_reg:.4f}")
-        
-        # IMPROVED: After epoch, diagnostic forward on sample prompt
-        if debug and accelerator.is_local_main_process:
             sample_batch = next(iter(dataloader))
-            sample_input = sample_batch['input_ids'][:1]  # First prompt
+            sample_input = sample_batch['input_ids'][:1]
             with torch.no_grad():
                 sample_outputs = model(input_ids=sample_input, attention_mask=sample_input.ne(tokenizer.pad_token_id))
             gate_after_prompt = sample_outputs.gates[0, -1].item()
             logit_bot = sample_outputs.logits[0, -1, model.bot_id].item()
-            prob_bot = torch.softmax(sample_outputs.logits[0, -1], dim=-1)[model.bot_id].item()
+            prob_bot = softmax(sample_outputs.logits[0, -1], dim=-1)[model.bot_id].item()
             print(f"Diagnostic on sample prompt: Gate after prompt: {gate_after_prompt:.4f}, Logit for [bot]: {logit_bot:.4f}, Prob for [bot]: {prob_bot:.4f}")
         
-        valid = validate_bootstrap(model, config, accelerator, tokenizer, batch_size=config['valid_batch_size'], debug=debug)
+        valid = validate_bootstrap(model, config, accelerator, tokenizer, debug=debug)
         if accelerator.is_local_main_process:
             wandb.log({
                 "bootstrap/validation_structure_rate": valid['structure_rate'],
