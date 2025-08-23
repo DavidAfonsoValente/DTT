@@ -23,9 +23,10 @@ def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
                 if debug:
                     for i in range(batch['input_ids'].size(0)):
                         input_text = tokenizer.decode(batch['input_ids'][i], skip_special_tokens=False)
-                        print(f"Decoded input text [{i}]: {input_text[:512]}...")
+                        print(f"Decoded input text [{i}]: {input_text[:512] if len(input_text) > 512 else input_text}")
                 
                 prompt_outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+                gates_after_prompt = prompt_outputs.gates[:, -1]
                 
                 gen_start = time.time()
                 gen_ids, gates = [], []
@@ -84,7 +85,7 @@ def validate_grpo(model, config, accelerator, tokenizer, debug=False):
                 if debug:
                     for i in range(batch['input_ids'].size(0)):
                         input_text = tokenizer.decode(batch['input_ids'][i], skip_special_tokens=False)
-                        print(f"Decoded input text [{i}]: {input_text[:512]}...")
+                        print(f"Decoded input text [{i}]: {input_text[:512] if len(input_text) > 512 else input_text}")
                 
                 gen_start = time.time()
                 gen_ids, gates = [], []
@@ -121,7 +122,7 @@ def validate_grpo(model, config, accelerator, tokenizer, debug=False):
     avg_r_struct = r_struct_sum / num_samples if num_samples > 0 else 0.0
     avg_r_corr = r_corr_sum / num_samples if num_samples > 0 else 0.0
     avg_r_eff = r_eff_sum / num_samples if num_samples > 0 else 0.0
-    avg_r_gate = r_gate_sum / num_samples if num_samples > 0 else 0.0
+    r_gate_sum = r_gate_sum / num_samples if num_samples > 0 else 0.0
     structure_rate = structure_count / num_samples if num_samples > 0 else 0.0
     correct_rate = correct_count / num_samples if num_samples > 0 else 0.0
     mean_inner_gate = inner_gates_sum / structure_count if structure_count > 0 else 0.0
@@ -131,7 +132,7 @@ def validate_grpo(model, config, accelerator, tokenizer, debug=False):
         'avg_r_struct': avg_r_struct,
         'avg_r_corr': avg_r_corr,
         'avg_r_eff': avg_r_eff,
-        'avg_r_gate': avg_r_gate,
+        'avg_r_gate': r_gate_sum,
         'structure_rate': structure_rate,
         'correct_rate': correct_rate,
         'mean_inner_gate': mean_inner_gate
