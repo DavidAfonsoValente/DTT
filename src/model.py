@@ -107,8 +107,9 @@ class DTTModel(GPT2LMHeadModel):
 
         for step in range(max_length - input_ids.size(1)):
             if step == 0:
-                outputs = self(input_ids=input_ids, attention_mask=attention_mask)
-                hidden = outputs.hidden_states[-1][:, -1, :]
+                # Ensure hidden_states are returned
+                outputs = self(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                hidden = outputs.hidden_states[-1][:, -1, :]  # Last layer, last token
                 gate_logit = self.gate_network(hidden).squeeze(-1)
                 g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, training=training)
                 gates_list.append(g_prev.unsqueeze(1))
