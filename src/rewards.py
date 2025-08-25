@@ -1,53 +1,142 @@
 import torch
+import re
 
-def compute_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset, dummy_id, weights=None):
-    if weights is None:
-        weights = {'struct': 1.0, 'corr': 1.0, 'eff': 1.0, 'gate': 1.0}
+def compute_stage1_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset):
     bot_pos = (completion_ids == bot_id).nonzero(as_tuple=True)[0]
+    bot_pos = bot_pos[0].item() if len(bot_pos) > 0 else -1
     eot_pos = (completion_ids == eot_id).nonzero(as_tuple=True)[0]
-    has_span = len(bot_pos) > 0 and len(eot_pos) > 0 and bot_pos[0] < eot_pos[0]
-    
-    r_struct = 0.2 if has_span else -1.0
-    
-    if has_span:
-        span_ids = completion_ids[bot_pos[0] + 1:eot_pos[0]]
-        think_len = (span_ids != dummy_id).sum().item()  # Surface tokens only
-        r_eff = -0.01 * think_len
-        pred_ids = [id.item() for id in completion_ids[eot_pos[0] + 1:] if id != dummy_id]
-        pred_answer = tokenizer.decode(pred_ids).strip()
+    eot_pos = eot_pos[0].item() if len(eot_pos) > 0 else -1
+
+    # Structure
+    if bot_pos == -1 and eot_pos == -1:
+        r_struct = -2.0
+    elif bot_pos == -1 or eot_pos == -1:
+        r_struct = 0.5
+    elif eot_pos <= bot_pos:
+        r_struct = -1.0
     else:
-        r_eff = 0.0
-        pred_ids = [id.item() for id in completion_ids if id != dummy_id]
-        pred_answer = tokenizer.decode(pred_ids).strip()
-    
+        r_struct = 2.0
+
+    has_span = bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos
+
+    # Basic correctness (ignore inside-span content)
+    if has_span:
+        pred_answer = tokenizer.decode(completion_ids[eot_pos + 1 :]).strip()
+    else:
+        pred_answer = tokenizer.decode(completion_ids).strip()
+
     if dataset == 'gsm8k':
         try:
-            pred_num = float(pred_answer.split('####')[-1].strip() if '####' in pred_answer else pred_answer)
+            pred_num = float(re.findall(r'[\d\.-]+$', pred_answer)[-1]) if re.findall(r'[\d\.-]+$', pred_answer) else 0.0
             gt_num = float(answer_gt)
-            r_corr = 1.0 if abs(pred_num - gt_num) < 1e-3 else -0.5
+            is_approx_correct = abs(pred_num - gt_num) < 10.0
         except:
-            r_corr = -0.5
+            is_approx_correct = False
+    elif dataset == 'prontoqa':
+        is_approx_correct = pred_answer.lower().strip() in ['true', 'false']
+    elif dataset == 'prosqa':
+        is_approx_correct = len(pred_answer.strip()) > 0
     else:
-        r_corr = 1.0 if pred_answer == answer_gt.strip() else -0.5
-    
+        is_approx_correct = False
+
+    r_basic = 1.0 if is_approx_correct else 0.0
+
+    # Gate
     if has_span:
-        inner_gates = gates[bot_pos[0] + 1:eot_pos[0]]
-        outer_gates = torch.cat([gates[:bot_pos[0]], gates[eot_pos[0]:]])
-        g_in = inner_gates.mean() if len(inner_gates) > 0 else torch.tensor(0.0)
-        g_out = outer_gates.mean() if len(outer_gates) > 0 else torch.tensor(0.0)
-        r_gate = 0.5 * g_in - 0.2 * g_out
+        inner_gates = gates[bot_pos + 1 : eot_pos]
+        outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
+        outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
+        outer_gates = torch.cat([outer_gates_before, outer_gates_after])
+        g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
+        g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
+        r_gate = 1.5 * g_in - 0.5 * g_out
     else:
-        r_gate = -0.2
-    
-    components = [r_struct, r_corr, r_eff, r_gate.item() if isinstance(r_gate, torch.Tensor) else r_gate]
-    clipped = [min(max(c, -1.5), 1.5) for c in components]
-    total_reward = sum(weights[k] * clipped[i] for i, k in enumerate(['struct', 'corr', 'eff', 'gate']))
-    
-    # Return dict for logging components
+        r_gate = -0.5
+
+    total = r_struct + r_gate + 0.3 * r_basic
     return {
-        'total': total_reward,
-        'struct': clipped[0],
-        'corr': clipped[1],
-        'eff': clipped[2],
-        'gate': clipped[3]
+        'total': total,
+        'struct': r_struct,
+        'basic': r_basic,
+        'gate': r_gate
+    }
+
+def compute_stage2_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset):
+    bot_pos = (completion_ids == bot_id).nonzero(as_tuple=True)[0]
+    bot_pos = bot_pos[0].item() if len(bot_pos) > 0 else -1
+    eot_pos = (completion_ids == eot_id).nonzero(as_tuple=True)[0]
+    eot_pos = eot_pos[0].item() if len(eot_pos) > 0 else -1
+
+    # Structure (scaled)
+    if bot_pos == -1 and eot_pos == -1:
+        r_struct = -2.0
+    elif bot_pos == -1 or eot_pos == -1:
+        r_struct = 0.5
+    elif eot_pos <= bot_pos:
+        r_struct = -1.0
+    else:
+        r_struct = 2.0
+    r_struct *= 0.6
+
+    has_span = bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos
+
+    # Efficiency
+    if has_span:
+        think_len = eot_pos - bot_pos - 1
+        r_eff = -0.03 * think_len - 0.01 * max(0, think_len - 10)
+        pred_answer = tokenizer.decode(completion_ids[eot_pos + 1 :]).strip()
+    else:
+        r_eff = 0.0
+        pred_answer = tokenizer.decode(completion_ids).strip()
+
+    # Correctness
+    if dataset == 'gsm8k':
+        try:
+            pred_num = float(re.findall(r'[\d\.-]+$', pred_answer)[-1]) if re.findall(r'[\d\.-]+$', pred_answer) else 0.0
+            gt_num = float(answer_gt)
+            diff = abs(pred_num - gt_num)
+            if diff < 1e-3:
+                r_corr = 3.0
+            elif diff < 10.0:
+                r_corr = 1.0
+            else:
+                r_corr = -1.5
+        except:
+            r_corr = -1.5
+    elif dataset == 'prontoqa':
+        if pred_answer.lower().strip() == answer_gt.lower().strip():
+            r_corr = 3.0
+        elif pred_answer.lower().strip() in ['true', 'false']:
+            r_corr = 1.0
+        else:
+            r_corr = -1.5
+    elif dataset == 'prosqa':
+        if pred_answer.strip() == answer_gt.strip():
+            r_corr = 3.0
+        elif len(pred_answer.strip()) > 0:
+            r_corr = 1.0
+        else:
+            r_corr = -1.5
+    else:
+        r_corr = -1.5
+
+    # Gate (scaled)
+    if has_span:
+        inner_gates = gates[bot_pos + 1 : eot_pos]
+        outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
+        outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
+        outer_gates = torch.cat([outer_gates_before, outer_gates_after])
+        g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
+        g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
+        r_gate = (1.5 * g_in - 0.5 * g_out) * 0.8
+    else:
+        r_gate = -0.5
+
+    total = r_struct + r_corr + r_eff + r_gate
+    return {
+        'total': total,
+        'struct': r_struct,
+        'corr': r_corr,
+        'eff': r_eff,
+        'gate': r_gate
     }

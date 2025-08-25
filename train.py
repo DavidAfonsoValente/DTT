@@ -1,62 +1,47 @@
 import yaml
 from accelerate import Accelerator
-from transformers import GPT2Config, GPT2Tokenizer
+from transformers import GPT2Tokenizer
 from src.model import DTTModel
 from src.datasets import DTTDataset, collate_fn
-from src.bootstrap import train_bootstrap
 from src.grpo import train_grpo
 import argparse
 import torch
 import wandb
+import os
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--stage', type=int, choices=[1,2], required=True)
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
 parser.add_argument('--config', type=str, required=True)
-parser.add_argument('--ref_checkpoint', type=str, default=None)
 parser.add_argument('--debug', action='store_true', default=False)
 args = parser.parse_args()
 
-# FIX: Disable mixed precision to avoid FP16 NaNs
 accelerator = Accelerator(mixed_precision="no")
 
-process_idx = accelerator.process_index
-num_procs = accelerator.num_processes
-is_main = accelerator.is_local_main_process
-
 if torch.cuda.is_available():
-    current_device = torch.cuda.current_device()
-    num_devices = torch.cuda.device_count()
-    device_name = torch.cuda.get_device_name(current_device)
-    print(f"[Proc {process_idx}/{num_procs}] Using CUDA device {current_device}: {device_name} with {num_devices} devices", flush=True)
-else:
-    print(f"[Proc {process_idx}/{num_procs}] Using device: {accelerator.device}", flush=True)
+    print(f"Using CUDA device {torch.cuda.current_device()}", flush=True)
 
 with open(args.config, 'r') as f:
     config = yaml.safe_load(f)
 config['dataset'] = args.dataset
 
-# Init wandb on main process
 if accelerator.is_local_main_process:
-    wandb.init(project="dtt-training", config=config, name=f"{args.dataset}-stage{args.stage}")
+    wandb.init(project="dtt-training", config=config, name=f"{args.dataset}-grpo")
 
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 tokenizer.add_special_tokens({
     'additional_special_tokens': ['[bot]', '[eot]'],
     'pad_token': '<pad>'
 })
-synthetic_ratio = 0.15 if args.stage == 1 else 0.0
-dataset = DTTDataset(args.dataset, tokenizer, synthetic_ratio=synthetic_ratio, data_dir=config.get('data_dir', 'data'))
-model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
+dataset = DTTDataset(args.dataset, tokenizer, data_dir=config.get('data_dir', 'data'))
+model = DTTModel.from_pretrained('gpt2')
+ref_model = DTTModel.from_pretrained('gpt2')
+ref_model.load_state_dict(model.state_dict())
 
 collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
 
-if args.stage == 1:
-    train_bootstrap(model, dataset, config, accelerator, collate, tokenizer, debug=args.debug)
-elif args.stage == 2:
-    if args.ref_checkpoint is None:
-        raise ValueError("Provide --ref_checkpoint for Stage 2")
-    train_grpo(model, dataset, config, accelerator, args.ref_checkpoint, collate, debug=args.debug)
+os.makedirs('checkpoints', exist_ok=True)
+
+train_grpo(model, ref_model, dataset, config, accelerator, collate, tokenizer, debug=args.debug)
 
 if accelerator.is_local_main_process:
     wandb.finish()

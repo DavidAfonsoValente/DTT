@@ -1,11 +1,11 @@
 dataset: prontoqa
 batch_size: 16
-epochs: 2
+valid_batch_size: 8
+epochs: 20
 lr: 1.0e-5
-lambda_gate: 0.1
 group_size: 8
 epsilon: 0.2
-beta_kl: 0.01
-max_length: 512
+mu: 4
+max_length: 256
 val_size: 256
 data_dir: data

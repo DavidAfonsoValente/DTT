@@ -1,140 +1,100 @@
 from torch.utils.data import DataLoader
 import torch
-from src.rewards import compute_reward
+from src.rewards import compute_stage1_reward, compute_stage2_reward
 from src.datasets import DTTDataset, collate_fn
-import time
+from tqdm import tqdm
 
-def validate_bootstrap(model, config, accelerator, tokenizer, debug=False):
-    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
-    val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
-    batch_size = config.get('val_batch_size', 8)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=val_collate)
+def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
+    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', data_dir=config.get('data_dir', 'data'))
+    val_loader = DataLoader(val_dataset, batch_size=config.get('valid_batch_size', 8), shuffle=False, collate_fn=lambda batch: collate_fn(batch, tokenizer.pad_token_id))
     val_loader = accelerator.prepare(val_loader)
-    structure_count = 0
-    inner_gates_sum = 0.0
-    num_samples = 0
-
     model.eval()
-    with torch.no_grad():
-        if accelerator.is_local_main_process:
-            for batch_idx, batch in enumerate(val_loader):
-                if num_samples >= config['val_size']:
-                    break
-                if debug:
-                    for i in range(batch['input_ids'].size(0)):
-                        input_text = tokenizer.decode(batch['input_ids'][i], skip_special_tokens=False)
-                        print(f"Decoded input text [{i}]: {input_text[:512] if len(input_text) > 512 else input_text}")
-                
-                prompt_outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-                gates_after_prompt = prompt_outputs.gates[:, -1]
-                
-                gen_start = time.time()
-                gen_ids, gates = [], []
-                for i in range(batch['input_ids'].size(0)):
-                    single_input = batch['input_ids'][i:i+1]
-                    single_gen_ids, single_gates = model.generate(single_input, max_length=config['max_length'], return_gates=True)
-                    gen_ids.append(single_gen_ids)
-                    gates.append(single_gates)
-                gen_ids = torch.cat(gen_ids, dim=0)
-                gates = torch.cat(gates, dim=0)
-                
-                for i in range(gen_ids.size(0)):
-                    bot_pos = (gen_ids[i] == model.bot_id).nonzero(as_tuple=True)[0]
-                    eot_pos = (gen_ids[i] == model.eot_id).nonzero(as_tuple=True)[0]
-                    if len(bot_pos) > 0 and len(eot_pos) > 0 and bot_pos[0] < eot_pos[0]:
-                        structure_count += 1
-                        inner_gates = gates[i, bot_pos[0]+1:eot_pos[0]]
-                        mean_inner = inner_gates.mean().item() if inner_gates.numel() > 0 else 0.0
-                        inner_gates_sum += mean_inner
-                    num_samples += 1
-                    if num_samples >= config['val_size']:
-                        break
 
-    structure_rate = structure_count / num_samples if num_samples > 0 else 0
-    mean_inner_gate = inner_gates_sum / (structure_count or 1)
-    
-    results = {
-        'is_valid': structure_rate >= 0.40 and mean_inner_gate >= 0.60,
-        'structure_rate': structure_rate,
-        'mean_inner_gate': mean_inner_gate
-    }
-    return accelerator.gather(results) if accelerator.num_processes > 1 else results
-
-def validate_grpo(model, config, accelerator, tokenizer, debug=False):
-    val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', synthetic_ratio=0, data_dir=config.get('data_dir', 'data'))
-    val_collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
-    batch_size = config.get('val_batch_size', 8)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=val_collate)
-    val_loader = accelerator.prepare(val_loader)
+    num_samples = 0
     total_reward = 0.0
-    r_struct_sum = 0.0
-    r_corr_sum = 0.0
-    r_eff_sum = 0.0
-    r_gate_sum = 0.0
-    structure_count = 0
-    correct_count = 0
-    inner_gates_sum = 0.0
-    num_samples = 0
+    num_struct_correct = 0
+    total_inner_gate = 0.0
+    total_outer_gate = 0.0
+    num_spans = 0
+    num_correct = 0
+    total_think_len = 0.0
 
-    model.eval()
     with torch.no_grad():
-        if accelerator.is_local_main_process:
-            for batch_idx, batch in enumerate(val_loader):
-                if num_samples >= 256:
-                    break
-                if debug:
-                    for i in range(batch['input_ids'].size(0)):
-                        input_text = tokenizer.decode(batch['input_ids'][i], skip_special_tokens=False)
-                        print(f"Decoded input text [{i}]: {input_text[:512] if len(input_text) > 512 else input_text}")
-                
-                gen_start = time.time()
-                gen_ids, gates = [], []
-                for i in range(batch['input_ids'].size(0)):
-                    single_input = batch['input_ids'][i:i+1]
-                    single_gen_ids, single_gates = model.generate(single_input, max_length=config['max_length'], return_gates=True)
-                    gen_ids.append(single_gen_ids)
-                    gates.append(single_gates)
-                gen_ids = torch.cat(gen_ids, dim=0)
-                gates = torch.cat(gates, dim=0)
-                
-                for i in range(gen_ids.size(0)):
-                    reward_dict = compute_reward(gen_ids[i], gates[i], tokenizer, batch['answer_gt'][i], model.bot_id, model.eot_id, config['dataset'], model.dummy_id)
-                    total_reward += reward_dict['total']
-                    r_struct_sum += reward_dict['struct']
-                    r_corr_sum += reward_dict['corr']
-                    r_eff_sum += reward_dict['eff']
-                    r_gate_sum += reward_dict['gate']
-                    bot_pos = (gen_ids[i] == model.bot_id).nonzero(as_tuple=True)[0]
-                    eot_pos = (gen_ids[i] == model.eot_id).nonzero(as_tuple=True)[0]
-                    has_span = len(bot_pos) > 0 and len(eot_pos) > 0 and bot_pos[0] < eot_pos[0]
-                    if has_span:
-                        structure_count += 1
-                        inner_gates = gates[i, bot_pos[0]+1:eot_pos[0]]
-                        mean_inner = inner_gates.mean().item() if inner_gates.numel() > 0 else 0.0
-                        inner_gates_sum += mean_inner
-                    if reward_dict['corr'] > 0:
-                        correct_count += 1
-                    num_samples += 1
-                    if num_samples >= 256:
-                        break
+        for batch in tqdm(val_loader, desc="Validation", disable=not accelerator.is_local_main_process):
+            batch_size = batch['input_ids'].size(0)
+            for prompt_idx in range(batch_size):
+                prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
+                answer_gt = batch['answer_gt'][prompt_idx]
 
+                gen_ids, gen_gates = model.generate(
+                    prompt_ids, max_length=config['max_length'], do_sample=False, return_gates=True, training=False
+                )
+
+                gen_ids_without_prompt = gen_ids[0, len(prompt_ids[0]):]
+                gen_gates_without_prompt = gen_gates[0, len(prompt_ids[0])-1:]
+
+                if stage == 1:
+                    reward_dict = compute_stage1_reward(
+                        gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset']
+                    )
+                    is_correct = reward_dict['basic'] > 0
+                else:
+                    reward_dict = compute_stage2_reward(
+                        gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset']
+                    )
+                    is_correct = reward_dict['corr'] > 1.0  # Exact match
+
+                total_reward += reward_dict['total']
+                if reward_dict['struct'] == 2.0:  # Proper [bot]...[eot]
+                    num_struct_correct += 1
+                    bot_pos = (gen_ids_without_prompt == model.bot_id).nonzero(as_tuple=True)[0][0].item()
+                    eot_pos = (gen_ids_without_prompt == model.eot_id).nonzero(as_tuple=True)[0][0].item()
+                    inner_gates = gen_gates_without_prompt[bot_pos + 1 : eot_pos]
+                    outer_gates = torch.cat([gen_gates_without_prompt[:bot_pos], gen_gates_without_prompt[eot_pos:]])
+                    total_inner_gate += inner_gates.mean().item()
+                    total_outer_gate += outer_gates.mean().item()
+                    think_len = eot_pos - bot_pos - 1
+                    total_think_len += think_len
+                    num_spans += 1
+
+                if is_correct:
+                    num_correct += 1
+
+                num_samples += 1
+
+    structure_rate = num_struct_correct / num_samples if num_samples > 0 else 0.0
+    mean_inner_gate = total_inner_gate / num_spans if num_spans > 0 else 0.0
+    mean_outer_gate = total_outer_gate / num_spans if num_spans > 0 else 0.0
+    gate_ratio = mean_inner_gate / (mean_outer_gate + 0.1) if mean_outer_gate > 0 else 0.0
+    accuracy = num_correct / num_samples if num_samples > 0 else 0.0
+    avg_think_len = total_think_len / num_spans if num_spans > 0 else 0.0
     avg_reward = total_reward / num_samples if num_samples > 0 else 0.0
-    avg_r_struct = r_struct_sum / num_samples if num_samples > 0 else 0.0
-    avg_r_corr = r_corr_sum / num_samples if num_samples > 0 else 0.0
-    avg_r_eff = r_eff_sum / num_samples if num_samples > 0 else 0.0
-    r_gate_sum = r_gate_sum / num_samples if num_samples > 0 else 0.0
-    structure_rate = structure_count / num_samples if num_samples > 0 else 0.0
-    correct_rate = correct_count / num_samples if num_samples > 0 else 0.0
-    mean_inner_gate = inner_gates_sum / structure_count if structure_count > 0 else 0.0
 
-    results = {
-        'avg_reward': avg_reward,
-        'avg_r_struct': avg_r_struct,
-        'avg_r_corr': avg_r_corr,
-        'avg_r_eff': avg_r_eff,
-        'avg_r_gate': r_gate_sum,
+    if debug and accelerator.is_local_main_process:
+        print(f"[DEBUG] Validation metrics: structure_rate={structure_rate:.3f}, gate_ratio={gate_ratio:.3f}, accuracy={accuracy:.3f}")
+
+    return {
         'structure_rate': structure_rate,
-        'correct_rate': correct_rate,
-        'mean_inner_gate': mean_inner_gate
+        'gate_ratio': gate_ratio,
+        'basic_accuracy': accuracy if stage == 1 else 0.0,
+        'accuracy': accuracy,
+        'avg_think_len': avg_think_len,
+        'avg_reward': avg_reward
     }
-    return accelerator.gather(results) if accelerator.num_processes > 1 else results
+
+def should_transition(metrics, history):
+    if metrics['structure_rate'] < 0.75 or metrics['gate_ratio'] < 3.0 or metrics['basic_accuracy'] < 0.4:
+        return False
+
+    if len(history['structure_rate']) < 3:
+        return False
+
+    recent_struct = history['structure_rate'][-3:]
+    recent_gate = history['gate_ratio'][-3:]
+    recent_acc = history['basic_accuracy'][-3:]
+
+    stable_struct = max(recent_struct) - min(recent_struct) < 0.05
+    stable_gate = max(recent_gate) - min(recent_gate) < 0.5
+    stable_acc = max(recent_acc) - min(recent_acc) < 0.05
+
+    return stable_struct and stable_gate and stable_acc

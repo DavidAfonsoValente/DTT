@@ -3,231 +3,241 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
-from src.rewards import compute_reward
-from src.utils import validate_grpo
+from src.rewards import compute_stage1_reward, compute_stage2_reward
+from src.utils import validate_grpo, should_transition
 import wandb
-from src.model import DTTModel
 import math
-import time
+import os
 
-def smooth(k, a, b):
-    mid = (a + b) / 2
-    scale = (b - a) / 6
-    return 1 / (1 + math.exp(- (k - mid) / scale))
+def get_beta_kl(stage):
+    return 0.02 if stage == 1 else 0.01
 
-def get_weights(step):
-    if step < 2000:  # Phase 1
-        return {'struct': 1.0, 'corr': 0.6, 'eff': 0.1, 'gate': 0.3}
-    elif step < 6000:  # Phase 2
-        s = smooth(step, 2000, 4000)
-        w_struct = 1.0 - 0.4 * s
-        w_corr = 0.6 + 0.4 * s
-        w_eff = 0.1 + 0.15 * s
-        w_gate = 0.3 + 0.3 * s
-        return {'struct': w_struct, 'corr': w_corr, 'eff': w_eff, 'gate': w_gate}
-    else:  # Phase 3
-        return {'struct': 0.6, 'corr': 1.0, 'eff': 0.25, 'gate': 0.6}
+def update_temperature(model, step, stage, transition_step=0):
+    if stage == 1:
+        tau = max(0.8, 2.0 * (0.995 ** (step / 50)))
+    else:
+        tau = max(0.1, 0.8 * (0.99 ** ((step - transition_step) / 100)))
+    model.set_temperature(tau)
+    return tau
 
-def train_grpo(model, dataset, config, accelerator, ref_checkpoint, collate_fn, debug=False):
+def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_without_prompt, gen_gates_without_prompt, training):
+    # Sequential computation to match blended dynamics
+    batch_size = 1  # Assume single example
+    device = model.device
+    input_embeds = model.transformer.wte(prompt_ids.to(device))
+    past_key_values = None
+    past_key_values_ref = None
+    logprobs = []
+    kl_terms = []
+    position_id = prompt_ids.size(0)
+    attention_mask = torch.ones(batch_size, prompt_ids.size(0), dtype=torch.long, device=device)
+
+    # Process prompt (non-blended)
+    with torch.no_grad():
+        outputs = model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
+        past_key_values = outputs.past_key_values
+        outputs_ref = ref_model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
+        past_key_values_ref = outputs_ref.past_key_values
+
+    for t, next_id in enumerate(gen_ids_without_prompt):
+        g = gen_gates_without_prompt[t]
+        e = torch.sqrt(1 - g).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0)) + torch.sqrt(g).unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+        current_position_id = torch.tensor([[position_id]], device=device)
+        current_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
+        outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=current_mask, past_key_values=past_key_values, use_cache=True)
+        past_key_values = outputs.past_key_values
+        log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
+        logp = log_soft[0, next_id]
+        logprobs.append(logp)
+
+        outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=current_mask, past_key_values=past_key_values_ref, use_cache=True)
+        past_key_values_ref = outputs_ref.past_key_values
+        log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
+        kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
+        kl_terms.append(kl)
+
+        position_id += 1
+
+    logprobs = torch.stack(logprobs)
+    avg_kl = torch.mean(torch.stack(kl_terms))
+    return logprobs, avg_kl
+
+def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, tokenizer, debug=False):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
     optimizer = AdamW(model.parameters(), lr=config['lr'])
-    
+
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    ref_model = DTTModel.from_pretrained(ref_checkpoint)
     ref_model = accelerator.prepare(ref_model)
     ref_model.eval()
-    
+
     if debug:
         accelerator.unwrap_model(model).debug = True
-        accelerator.unwrap_model(ref_model).debug = True
-    
+
     if accelerator.is_local_main_process:
-        wandb.log({"stage": "grpo_start", "epoch": 0})
-    
+        wandb.log({"stage": 1, "epoch": 0})
+
     step = 0
-    prev_val_reward = -float('inf')
-    plateau_steps = 0
-    current_phase = 1
-    phase_thresholds = [0, 2000, 6000, float('inf')]
-    phase_conditions = [
-        None,
-        lambda m: m['structure_rate'] >= 0.6 and m['correct_rate'] >= 0.3,
-        lambda m: m['structure_rate'] >= 0.8 and m['correct_rate'] >= 0.5,
-        lambda m: True
-    ]
-    beta_kl_values = [0.02, 0.01, 0.005]  # Per phase
-    next_transition_attempt = 0
-    prev_metrics = None
-    transition_metrics = None
+    stage = 1
     transition_step = 0
-    
+    transition_history = {'structure_rate': [], 'gate_ratio': [], 'basic_accuracy': []}
+
+    max_steps = config['epochs'] * len(dataloader)
+    pbar = tqdm(total=max_steps, desc="Training", disable=not accelerator.is_local_main_process)
+
     for epoch in range(config['epochs']):
-        if debug and accelerator.is_local_main_process:
-            print(f"Starting epoch {epoch + 1}/{config['epochs']}")
-            epoch_start = time.time()
-        
         model.train()
-        epoch_reward = 0.0
-        epoch_r_struct = 0.0
-        epoch_r_corr = 0.0
-        epoch_r_eff = 0.0
-        epoch_r_gate = 0.0
+        epoch_reward_total = 0.0
+        epoch_struct = 0.0
+        epoch_gate = 0.0
+        epoch_basic = 0.0
+        epoch_corr = 0.0
+        epoch_eff = 0.0
+        epoch_loss = 0.0
         epoch_kl = 0.0
-        num_samples = 0
-        
-        for batch_idx, batch in enumerate(tqdm(dataloader)):
-            if debug and accelerator.is_local_main_process:
-                batch_start = time.time()
-                print(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
-                print(f"Batch input_ids shape: {batch['input_ids'].shape}")
-                input_text = model.tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False)
-                print(f"Batch answer_gt: {batch['answer_gt']}")
-                print(f"Decoded input text: {input_text[:512] if len(input_text) > 512 else input_text}")
-            
-            batch_loss = 0.0
-            for prompt_idx in range(batch['input_ids'].size(0)):
-                prompt_ids = batch['input_ids'][prompt_idx:prompt_idx+1]
+        num_batches = 0
+
+        for batch in dataloader:
+            batch_size = batch['input_ids'].size(0)
+            completions = []
+            gates_list = []
+            rewards = []
+            reward_dicts = []
+            advantages = []
+            prompts = []
+
+            for prompt_idx in range(batch_size):
+                prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
                 answer_gt = batch['answer_gt'][prompt_idx]
-                if debug and accelerator.is_local_main_process:
-                    print(f"  Prompt {prompt_idx + 1}: prompt_ids shape {prompt_ids.shape}, GT answer: {answer_gt}")
-                
-                completions = []
-                rewards = []
-                reward_dicts = []
-                weights = get_weights(step)
+                group_completions = []
+                group_gates = []
+                group_rewards = []
+
                 for gen_idx in range(config['group_size']):
-                    if debug and accelerator.is_local_main_process:
-                        gen_start = time.time()
-                    gen_ids, gates = ref_model.generate(prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.95, return_gates=True)
-                    if debug and accelerator.is_local_main_process:
-                        print(f"    Generation {gen_idx + 1}/{config['group_size']} took {time.time() - gen_start:.2f}s")
-                        gen_text = model.tokenizer.decode(gen_ids[0], skip_special_tokens=False)
-                        print(f"    Generated text: {gen_text[:512] if len(gen_text) > 512 else gen_text}")
-                    
-                    reward_dict = compute_reward(gen_ids[0], gates[0], model.tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset'], model.dummy_id, weights=weights)
-                    if debug and accelerator.is_local_main_process:
-                        print(f"    Reward dict: {reward_dict}")
-                    
-                    completions.append(gen_ids)
-                    rewards.append(reward_dict['total'])
-                    reward_dicts.append(reward_dict)
-                
-                num_samples += config['group_size']
-                epoch_reward += sum(rewards)
-                epoch_r_struct += sum(d['struct'] for d in reward_dicts)
-                epoch_r_corr += sum(d['corr'] for d in reward_dicts)
-                epoch_r_eff += sum(d['eff'] for d in reward_dicts)
-                epoch_r_gate += sum(d['gate'] for d in reward_dicts)
-                
-                mu = sum(rewards) / config['group_size']
-                sigma = (sum((r - mu)**2 for r in rewards) / config['group_size'])**0.5 + 1e-8
-                advantages = [(r - mu) / sigma for r in rewards]
-                if debug and accelerator.is_local_main_process:
-                    print(f"  Advantages: {advantages}")
-                
-                for i, comp_ids in enumerate(completions):
                     with torch.no_grad():
-                        outputs_old = ref_model(comp_ids, labels=comp_ids)
-                    outputs = model(comp_ids, labels=comp_ids)
-                    logprobs = outputs.logits[:, :-1, :].log_softmax(-1).gather(2, comp_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
-                    logprobs_old = outputs_old.logits[:, :-1, :].log_softmax(-1).gather(2, comp_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
-                    ratios = torch.exp(logprobs - logprobs_old)
-                    mean_ratio = ratios.mean()
-                    surr1 = mean_ratio * advantages[i]
-                    surr2 = torch.clamp(mean_ratio, 1 - config['epsilon'], 1 + config['epsilon']) * advantages[i]
-                    ppo_loss = -torch.min(surr1, surr2)
-                    
-                    kl = torch.nn.functional.kl_div(logprobs_old, logprobs, log_target=True, reduction='mean')
-                    beta_kl = beta_kl_values[current_phase - 1]
-                    loss = ppo_loss + beta_kl * kl
-                    batch_loss += loss
-                    
-                    epoch_kl += kl.item()
-                    if debug and accelerator.is_local_main_process:
-                        print(f"    Completion {i + 1}: PPO loss {ppo_loss.item():.4f}, KL {kl.item():.4f}, Total loss {loss.item():.4f}")
-            
-            batch_loss /= batch['input_ids'].size(0)
-            if debug and accelerator.is_local_main_process:
-                print(f"  Batch loss: {batch_loss.item():.4f}")
-            
-            accelerator.backward(batch_loss)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            
+                        gen_ids, gen_gates = model.generate(
+                            prompt_ids, max_length=config['max_length'], do_sample=True, temperature=0.8, top_p=0.9, return_gates=True, training=True
+                        )
+                    gen_ids_without_prompt = gen_ids[0, len(prompt_ids[0]):]
+                    gen_gates_without_prompt = gen_gates[0, len(prompt_ids[0])-1:]  # Gates for generated steps
+
+                    if stage == 1:
+                        reward_dict = compute_stage1_reward(
+                            gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset']
+                        )
+                    else:
+                        reward_dict = compute_stage2_reward(
+                            gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset']
+                        )
+                    group_completions.append(gen_ids_without_prompt)
+                    group_gates.append(gen_gates_without_prompt)
+                    group_rewards.append(reward_dict['total'])
+                    reward_dicts.append(reward_dict)
+
+                mu = sum(group_rewards) / config['group_size']
+                sigma = math.sqrt(sum((r - mu) ** 2 for r in group_rewards) / config['group_size'] + 1e-8)
+                group_advantages = [(r - mu) / sigma for r in group_rewards]
+
+                completions.extend(group_completions)
+                gates_list.extend(group_gates)
+                advantages.extend(group_advantages)
+                rewards.extend(group_rewards)
+                prompts.extend([prompt_ids[0]] * config['group_size'])
+
+            # Aggregate for epoch
+            epoch_reward_total += sum(rewards)
+            epoch_struct += sum(d['struct'] for d in reward_dicts)
+            epoch_gate += sum(d['gate'] for d in reward_dicts)
+            if stage == 1:
+                epoch_basic += sum(d['basic'] for d in reward_dicts)
+            else:
+                epoch_corr += sum(d['corr'] for d in reward_dicts)
+                epoch_eff += sum(d['eff'] for d in reward_dicts)
+            num_batches += config['group_size'] * batch_size
+
+            for _ in range(config['mu']):
+                batch_loss = 0.0
+                batch_kl = 0.0
+                for i in range(len(completions)):
+                    A = advantages[i]
+                    prompt = prompts[i]
+                    comp = completions[i]
+                    gates = gates_list[i]
+
+                    logprobs, avg_kl = compute_sequence_logprobs_and_kl(
+                        model, ref_model, prompt, comp, gates, model.training
+                    )
+
+                    ratios = torch.exp(logprobs.mean())  # Average for surrogate (scalar A)
+                    surr1 = ratios * A
+                    surr2 = torch.clamp(ratios, 1 - config['epsilon'], 1 + config['epsilon']) * A
+                    ppo_term = torch.min(surr1, surr2)
+
+                    batch_kl += avg_kl.item()
+
+                    beta_kl = get_beta_kl(stage)
+                    loss_i = -ppo_term + beta_kl * avg_kl
+                    batch_loss += loss_i
+
+                batch_loss /= len(completions)
+                accelerator.backward(batch_loss)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+                epoch_loss += batch_loss.item()
+                epoch_kl += batch_kl / len(completions)
+
             step += 1
-            if step % 1000 == 0:
-                model.set_temperature(max(0.1, 2.0 * (0.9 ** (step / 1000))))
-                val_metrics = validate_grpo(model, config, accelerator, model.tokenizer, debug=debug)
+            pbar.update(1)
+
+            if step % 50 == 0:
+                tau = update_temperature(model, step, stage, transition_step)
                 if accelerator.is_local_main_process:
-                    wandb.log({
-                        "grpo/step": step,
-                        "grpo/validation_reward": val_metrics['avg_reward'],
-                        "grpo/validation_structure_rate": val_metrics['structure_rate'],
-                        "grpo/validation_correct_rate": val_metrics['correct_rate'],
-                        "grpo/validation_mean_inner_gate": val_metrics['mean_inner_gate'],
-                        "grpo/validation_avg_r_struct": val_metrics['avg_r_struct'],
-                        "grpo/validation_avg_r_corr": val_metrics['avg_r_corr'],
-                        "grpo/validation_avg_r_eff": val_metrics['avg_r_eff'],
-                        "grpo/validation_avg_r_gate": val_metrics['avg_r_gate'],
-                    })
-                    if debug:
-                        print(f"Validation metrics at step {step}: {val_metrics}")
-                if val_metrics['avg_reward'] < prev_val_reward * 1.02:
-                    plateau_steps += 1000
-                else:
-                    plateau_steps = 0
-                if plateau_steps >= 5000:
-                    model.set_temperature(model.temperature * 0.8)  # Reduce by 20% per description
-                    plateau_steps = 0
-                prev_val_reward = val_metrics['avg_reward']
+                    wandb.log({"temperature": tau, "step": step})
 
-                prev_phase = current_phase
-                if step >= next_transition_attempt and current_phase < 3 and step >= phase_thresholds[current_phase] and phase_conditions[current_phase](val_metrics):
-                    current_phase += 1
-                    transition_metrics = prev_metrics
+            if step % 200 == 0 and stage == 1:
+                metrics = validate_grpo(model, config, accelerator, tokenizer, stage, debug=debug)
+                transition_history['structure_rate'].append(metrics['structure_rate'])
+                transition_history['gate_ratio'].append(metrics['gate_ratio'])
+                transition_history['basic_accuracy'].append(metrics['basic_accuracy'])
+
+                if should_transition(metrics, transition_history):
+                    stage = 2
                     transition_step = step
-                    next_transition_attempt = 0
-                    if debug and accelerator.is_local_main_process:
-                        print(f"Transitioned to phase {current_phase}")
-                        print(f"Current beta_kl: {beta_kl_values[current_phase - 1]}")
+                    ref_model.load_state_dict(model.state_dict())
+                    if accelerator.is_local_main_process:
+                        wandb.log({"stage": stage, "transition_step": step})
 
-                if prev_phase < current_phase and step - transition_step <= 500:
-                    degrade = False
-                    key_metrics = ['structure_rate', 'correct_rate']
-                    for km in key_metrics:
-                        if val_metrics[km] < transition_metrics[km] * 0.85:
-                            degrade = True
-                            break
-                    if degrade:
-                        current_phase -= 1
-                        next_transition_attempt = step + 1000
-                        if debug and accelerator.is_local_main_process:
-                            print(f"Degradation detected, reverted to phase {current_phase}")
-                            print(f"Current beta_kl: {beta_kl_values[current_phase - 1]}")
+            if step % 1000 == 0:
+                ref_model.load_state_dict(model.state_dict())
+                if accelerator.is_main_process:
+                    torch.save(model.state_dict(), f"checkpoints/model_step_{step}.pth")
 
-                prev_metrics = val_metrics
-            
-            if debug and accelerator.is_local_main_process:
-                print(f"Batch {batch_idx + 1} processed in {time.time() - batch_start:.2f}s")
-        
-        avg_reward = epoch_reward / num_samples if num_samples > 0 else 0
-        avg_r_struct = epoch_r_struct / num_samples if num_samples > 0 else 0
-        avg_r_corr = epoch_r_corr / num_samples if num_samples > 0 else 0
-        avg_r_eff = epoch_r_eff / num_samples if num_samples > 0 else 0
-        avg_r_gate = epoch_r_gate / num_samples if num_samples > 0 else 0
-        avg_kl = epoch_kl / num_samples if num_samples > 0 else 0
-        
+            if step % 500 == 0:
+                metrics = validate_grpo(model, config, accelerator, tokenizer, stage, debug=debug)
+                if accelerator.is_local_main_process:
+                    wandb.log(metrics | {"step": step})
+
+        # Epoch logs
+        avg_reward = epoch_reward_total / num_batches if num_batches > 0 else 0.0
+        avg_struct = epoch_struct / num_batches if num_batches > 0 else 0.0
+        avg_gate = epoch_gate / num_batches if num_batches > 0 else 0.0
+        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
+        avg_kl = epoch_kl / num_batches if num_batches > 0 else 0.0
+        log_dict = {
+            "epoch": epoch,
+            "avg_reward": avg_reward,
+            "avg_struct": avg_struct,
+            "avg_gate": avg_gate,
+            "avg_loss": avg_loss,
+            "avg_kl": avg_kl
+        }
+        if stage == 1:
+            log_dict["avg_basic"] = epoch_basic / num_batches if num_batches > 0 else 0.0
+        else:
+            log_dict["avg_corr"] = epoch_corr / num_batches if num_batches > 0 else 0.0
+            log_dict["avg_eff"] = epoch_eff / num_batches if num_batches > 0 else 0.0
         if accelerator.is_local_main_process:
-            wandb.log({
-                "grpo/epoch": epoch + 1,
-                "grpo/avg_reward": avg_reward,
-                "grpo/avg_r_struct": avg_r_struct,
-                "grpo/avg_r_corr": avg_r_corr,
-                "grpo/avg_r_eff": avg_r_eff,
-                "grpo/avg_r_gate": avg_r_gate,
-                "grpo/avg_kl": avg_kl
-            })
-        
-        if debug and accelerator.is_local_main_process:
-            print(f"Epoch {epoch + 1} completed in {time.time() - epoch_start:.2f}s | Avg Reward: {avg_reward:.4f} | Avg KL: {avg_kl:.4f}")
+            wandb.log(log_dict)
+
+    pbar.close()

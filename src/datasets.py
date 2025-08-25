@@ -1,20 +1,13 @@
-import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset
-import random
 import os
 from torch.nn.utils.rnn import pad_sequence
 
 class DTTDataset(Dataset):
-    def __init__(self, dataset_name, tokenizer, split='train', synthetic_ratio=0.15, data_dir='data'):
+    def __init__(self, dataset_name, tokenizer, split='train', data_dir='data'):
         self.tokenizer = tokenizer
         self.dataset_name = dataset_name
-        self.vocab_size = len(tokenizer) - 3  # Adjusted for added tokens
-        self.bot_id = tokenizer.convert_tokens_to_ids('[bot]')
-        self.eot_id = tokenizer.convert_tokens_to_ids('[eot]')
         self.data_dir = data_dir
-        self.is_synthetic = synthetic_ratio > 0
-        self.synthetic_ratio = synthetic_ratio
         if split == 'valid':
             split = 'test' if dataset_name in ['gsm8k', 'prontoqa'] else 'validation'
 
@@ -25,14 +18,10 @@ class DTTDataset(Dataset):
         elif dataset_name == 'prosqa':
             file_path = os.path.join(data_dir, f'prosqa_{split}.json')
             if not os.path.exists(file_path):
-                raise ValueError(f"ProsQA file {file_path} not found. Download prosqa_{split}.json from https://github.com/facebookresearch/coconut/data")
+                raise ValueError(f"ProsQA file {file_path} not found.")
             self.data = load_dataset('json', data_files=file_path, split='train')
         else:
             raise ValueError(f"Unknown dataset: {dataset_name}")
-
-        if self.is_synthetic:
-            num_samples = int(len(self.data) * self.synthetic_ratio)
-            self.data = self.data.shuffle(seed=42).select(range(num_samples))
 
     def __len__(self):
         return len(self.data)
@@ -45,31 +34,10 @@ class DTTDataset(Dataset):
 
         question_ids = self.tokenizer.encode(question, return_tensors='pt').squeeze()
         input_ids = question_ids.clone()
-        noisy_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        labels = torch.full_like(input_ids, -100)
 
-        if self.is_synthetic:
-            k = random.randint(0, 5)
-            fillers_ids = [random.randint(0, self.vocab_size - 1) for _ in range(k)]
-            fillers_text = ' '.join(self.tokenizer.decode([f]) for f in fillers_ids)
-            suffix_text = f" [bot] {fillers_text} [eot] {answer_gt}"
-            suffix_ids = self.tokenizer.encode(suffix_text, return_tensors='pt').squeeze()
-            input_ids = torch.cat([input_ids, suffix_ids])
-            bot_pos = (input_ids == self.bot_id).nonzero(as_tuple=True)[0]
-            bot_pos = bot_pos[0].item() if bot_pos.numel() > 0 else -1
-            eot_pos = (input_ids == self.eot_id).nonzero(as_tuple=True)[0]
-            eot_pos = eot_pos[0].item() if eot_pos.numel() > 0 else -1
-            noisy_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-            if bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos:
-                noisy_mask[bot_pos + 1:eot_pos] = True
-            labels = input_ids.clone()
-            labels[noisy_mask] = -100  # Ignore loss on random fillers
+        return {'input_ids': input_ids, 'answer_gt': answer_gt}
 
-        return {'input_ids': input_ids, 'labels': labels, 'noisy_mask': noisy_mask, 'answer_gt': answer_gt}
-
-def collate_fn(batch, pad_token_id, ignore_index=-100):
+def collate_fn(batch, pad_token_id):
     input_ids = pad_sequence([b['input_ids'] for b in batch], batch_first=True, padding_value=pad_token_id)
-    labels = pad_sequence([b['labels'] for b in batch], batch_first=True, padding_value=ignore_index)
-    noisy_mask = pad_sequence([b['noisy_mask'] for b in batch], batch_first=True, padding_value=False)
     attention_mask = input_ids.ne(pad_token_id)
-    return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels, 'noisy_mask': noisy_mask, 'answer_gt': [b['answer_gt'] for b in batch]}
+    return {'input_ids': input_ids, 'attention_mask': attention_mask, 'answer_gt': [b['answer_gt'] for b in batch]}

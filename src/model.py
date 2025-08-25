@@ -1,221 +1,168 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import sigmoid, relu, cross_entropy, kl_div, softmax
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
-from transformers.modeling_utils import ModuleUtilsMixin
-from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
-import weakref
-from typing import Optional, Tuple
-from dataclasses import dataclass
+from torch.nn import functional as F
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
-import math
-import time
+from typing import Optional
+from dataclasses import dataclass
 
 @dataclass
 class CausalLMOutputWithGates(CausalLMOutputWithCrossAttentions):
     gates: Optional[torch.FloatTensor] = None
 
-class CustomGPT2Attention(GPT2Attention):
-    def __init__(self, config, is_cross_attention=False, layer_idx=None):
-        super().__init__(config, is_cross_attention, layer_idx)
-        self.model = None
-
-    def forward(self, hidden_states, layer_past=None, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, use_cache=False, output_attentions=False):
-        hidden_states = torch.clamp(hidden_states, -1e4, 1e4)
-        
-        query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
-        query = self._split_heads(query, self.num_heads, self.head_dim)
-        key = self._split_heads(key, self.num_heads, self.head_dim)
-        value = self._split_heads(value, self.num_heads, self.head_dim)
-
-        if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
-
-        if use_cache is True:
-            present = (key, value)
-        else:
-            present = None
-
-        attn_scores = torch.matmul(query, key.transpose(-1, -2))
-        attn_scores = attn_scores / math.sqrt(self.head_dim)
-        
-        attn_scores = torch.clamp(attn_scores, -1e4, 1e4)
-
-        query_length, key_length = query.size(-2), key.size(-2)
-        causal_mask = torch.tril(torch.ones((key_length, key_length), dtype=torch.bool, device=attn_scores.device)).view(1, 1, key_length, key_length)
-        causal_mask = causal_mask[:, :, key_length - query_length : key_length, :key_length]
-
-        mask_value = torch.finfo(attn_scores.dtype).min
-        attn_scores = torch.where(causal_mask, attn_scores, mask_value)
-
-        if self.model is not None:
-            model = self.model()
-            if model is not None and hasattr(model, 'noisy_mask') and model.noisy_mask is not None:
-                seq_len = attn_scores.size(-1)
-                noisy_mask_exp = model.noisy_mask.unsqueeze(1).unsqueeze(2).expand(-1, self.num_heads, seq_len, seq_len)
-                attn_scores = torch.where(noisy_mask_exp & noisy_mask_exp.transpose(-2, -1), attn_scores * 0.3, attn_scores)
-
-        if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask
-
-        attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
-        attn_probs = self.attn_dropout(attn_probs)
-
-        if head_mask is not None:
-            attn_probs = attn_probs * head_mask
-
-        attn_output = torch.matmul(attn_probs, value)
-        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
-        attn_output = self.c_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output)
-
-        outputs = (attn_output, present)
-        if output_attentions:
-            outputs += (attn_scores,)
-
-        return outputs
-
 class DTTModel(GPT2LMHeadModel):
     def __init__(self, config):
         super().__init__(config)
-        std = 0.02
-        self.gate_weight = nn.Parameter(torch.randn(1, config.n_embd) * std)
-        self.gate_bias = nn.Parameter(torch.tensor(-1.0))
-        self.special_tokens = {'bot': '[bot]', 'eot': '[eot]'}
+        self.gate_network = nn.Linear(config.n_embd, 1)
+        nn.init.xavier_normal_(self.gate_network.weight)
+        self.gate_network.bias.data.fill_(-5.0)  # Initial token-dominant (low g)
+
+        self.temperature = 2.0
+
         self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         self.tokenizer.add_special_tokens({
-            'additional_special_tokens': list(self.special_tokens.values()),
+            'additional_special_tokens': ['[bot]', '[eot]'],
             'pad_token': '<pad>'
         })
         self.resize_token_embeddings(len(self.tokenizer))
+
         with torch.no_grad():
-            self.transformer.wte.weight[-3:] *= 0.1
-            self.lm_head.weight[-3:] *= 0.1
-        self.bot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['bot'])
-        self.eot_id = self.tokenizer.convert_tokens_to_ids(self.special_tokens['eot'])
-        self.dummy_id = self.tokenizer.pad_token_id
-        self.temperature = 2.0
+            mean_emb = self.transformer.wte.weight[:-2].mean(dim=0)
+            noise = torch.randn_like(mean_emb) * 0.02
+            self.transformer.wte.weight[-2] = mean_emb + noise
+            self.transformer.wte.weight[-1] = mean_emb + noise.clone()
+
+        self.bot_id = self.tokenizer.convert_tokens_to_ids('[bot]')
+        self.eot_id = self.tokenizer.convert_tokens_to_ids('[eot]')
+        self.pad_id = self.tokenizer.pad_token_id
         self.debug = False
 
-        for i, layer in enumerate(self.transformer.h):
-            custom_attn = CustomGPT2Attention(self.config, is_cross_attention=False, layer_idx=i)
-            custom_attn.model = weakref.ref(self)
-            layer.attn = custom_attn
+    def set_temperature(self, tau):
+        self.temperature = max(0.1, tau)
 
     def gumbel_sigmoid(self, logit, temperature, training):
-        if self.debug and training:  # CHANGED: Only print during training
-            print(f"gumbel_sigmoid: logit mean {logit.mean().item():.4f}, temperature {temperature}, training {training}")
         if training:
             u = torch.rand_like(logit)
             gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
-            if self.debug and training:  # CHANGED: Only print during training
-                print(f"  Gumbel noise mean {gumbel_noise.mean().item():.4f}")
-            return sigmoid((logit + gumbel_noise) / temperature)
-        return sigmoid(logit / 0.1)
-
-    def forward(self, input_ids=None, attention_mask=None, labels=None, input_embeds=None, noisy_mask=None, **kwargs):
-        if noisy_mask is not None:
-            self.noisy_mask = noisy_mask
-
-        if input_embeds is not None:
-            input_embeds = torch.clamp(input_embeds, -1e4, 1e4)
-        
-        if input_embeds is not None:
-            transformer_outputs = super().forward(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
+            return F.sigmoid((logit + gumbel_noise) / temperature)
         else:
-            transformer_outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **kwargs)
+            return F.sigmoid(logit)
 
-        if self.debug and self.training:  # CHANGED: Only print during training
-            print(f"After transformer: hidden_states[-1] shape {transformer_outputs.hidden_states[-1].shape}, mean {transformer_outputs.hidden_states[-1].mean().item():.4f}")
-            print(f"  logits shape {transformer_outputs.logits.shape}")
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        batch_size, seq_len = input_ids.shape
+        position_ids = torch.arange(0, seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        gates = []
+        logits = []
+        past_key_values = None
+        h_prev = None
+        g_prev = torch.zeros(batch_size, device=input_ids.device)  # Initial no blend
+        extended_attention_mask = self.transformer.get_extended_attention_mask(attention_mask, input_ids.shape) if attention_mask is not None else None
 
-        hidden_states = transformer_outputs.hidden_states[-1]
-        if torch.isnan(hidden_states).any():
-            if self.debug and self.training:  # CHANGED: Only print during training
-                print("WARNING: NaN detected in hidden states, replacing with 0")
-            hidden_states = torch.nan_to_num(hidden_states)
+        for t in range(seq_len):
+            current_input_id = input_ids[:, t:t+1]
+            current_position_id = position_ids[:, t:t+1]
+            current_mask = extended_attention_mask[:, :, t:t+1, :t+1] if extended_attention_mask is not None else None
 
-        gate_logits = torch.matmul(hidden_states, self.gate_weight.t()) + self.gate_bias
-        gate_logits = gate_logits.squeeze(-1)
-        if self.debug and self.training:  # CHANGED: Only print during training
-            print(f"Gate logits shape {gate_logits.shape}, mean {gate_logits.mean().item():.4f}")
+            e = self.transformer.wte(current_input_id)
+            if t > 0:
+                sqrt_g = torch.sqrt(g_prev).unsqueeze(-1)
+                sqrt_1_g = torch.sqrt(1 - g_prev).unsqueeze(-1)
+                e = sqrt_g * h_prev.unsqueeze(1) + sqrt_1_g * e
 
-        gates = self.gumbel_sigmoid(gate_logits, self.temperature, self.training)
-        if self.debug and self.training:  # CHANGED: Only print during training
-            print(f"Gates shape {gates.shape}, mean {gates.mean().item():.4f}")
+            transformer_outputs = self.transformer(inputs_embeds=e, position_ids=current_position_id, attention_mask=current_mask, past_key_values=past_key_values, use_cache=True, **kwargs)
+            past_key_values = transformer_outputs.past_key_values
+            hidden_state = transformer_outputs.last_hidden_state[:, -1, :]
+            gate_logit = self.gate_network(hidden_state).squeeze(-1)
+            g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, self.training)
+            gates.append(g_prev.unsqueeze(1))
+            logit = self.lm_head(hidden_state)
+            logits.append(logit)
+
+            h_prev = hidden_state
+
+        logits = torch.cat(logits, dim=1)
+        gates = torch.cat(gates, dim=1)
 
         loss = None
         if labels is not None:
-            if self.debug and self.training:  # CHANGED: Only print during training
-                print("Computing loss")
-            shift_logits = transformer_outputs.logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            if self.debug and self.training:  # CHANGED: Only print during training
-                print(f"Loss: {loss.item():.4f}")
+            shift_logits = logits[:, :-1, :]
+            shift_labels = labels[:, 1:]
+            loss = F.cross_entropy(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
-        self.noisy_mask = None
-        if self.debug and self.training:  # CHANGED: Only print during training
-            print("Exiting forward")
-        return CausalLMOutputWithGates(
-            loss=loss,
-            logits=transformer_outputs.logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
-            gates=gates,
-        )
+        return CausalLMOutputWithGates(loss=loss, logits=logits, gates=gates)
 
-    def generate(self, input_ids, max_length=512, do_sample=True, top_p=0.95, temperature=1.0, return_gates=False, min_dummy_streak=10, **kwargs):
+    def generate(self, input_ids, max_length=256, do_sample=True, temperature=0.8, top_p=0.95, return_gates=False, return_logprobs=False, training=False):
+        if self.debug:
+            print(f"[DEBUG] Starting generation with input_ids shape: {input_ids.shape}, do_sample={do_sample}, training={training}")
         input_ids = input_ids.to(self.device)
         batch_size = input_ids.size(0)
-        input_embeds = self.transformer.wte(input_ids)
         generated_ids = input_ids.clone()
         gates_list = []
-        dummy_streak = torch.zeros(batch_size, device=self.device, dtype=torch.long)
+        logprobs_list = [] if return_logprobs else None
+        past_key_values = None
+        h_prev = None
+        g_prev = torch.zeros(batch_size, device=self.device)
+        position_ids = torch.arange(0, input_ids.size(1), dtype=torch.long, device=self.device).unsqueeze(0).expand(batch_size, -1)
+        attention_mask = torch.ones(batch_size, input_ids.size(1), dtype=torch.long, device=self.device)
 
         for step in range(max_length - input_ids.size(1)):
-            outputs = self.forward(inputs_embeds=input_embeds)
-            hidden = outputs.hidden_states[-1][:, -1, :]
-            gate_logit = torch.matmul(hidden, self.gate_weight.t()) + self.gate_bias
-            gate = self.gumbel_sigmoid(gate_logit.squeeze(-1), self.temperature, self.training)
-            gates_list.append(gate.unsqueeze(1))
+            if step == 0:
+                outputs = self(input_ids=input_ids, attention_mask=attention_mask)
+                hidden = outputs.hidden_states[-1][:, -1, :]
+                gate_logit = self.gate_network(hidden).squeeze(-1)
+                g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, training=training)
+                gates_list.append(g_prev.unsqueeze(1))
+                next_token_logits = outputs.logits[:, -1, :] / temperature
+                past_key_values = outputs.past_key_values
+            else:
+                e = torch.sqrt(1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(1)) + torch.sqrt(g_prev).unsqueeze(-1) * h_prev.unsqueeze(1)
+                current_position_id = (position_ids[:, -1] + 1).unsqueeze(1)
+                current_mask = torch.ones(batch_size, 1, dtype=torch.long, device=self.device)
+                transformer_outputs = self.transformer(inputs_embeds=e, position_ids=current_position_id, attention_mask=current_mask, past_key_values=past_key_values, use_cache=True)
+                past_key_values = transformer_outputs.past_key_values
+                hidden = transformer_outputs.last_hidden_state[:, -1, :]
+                gate_logit = self.gate_network(hidden).squeeze(-1)
+                g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, training=training)
+                gates_list.append(g_prev.unsqueeze(1))
+                next_token_logits = self.lm_head(hidden) / temperature
 
-            next_token_logits = outputs.logits[:, -1, :] / temperature
             next_token_logits = torch.clamp(next_token_logits, -1e4, 1e4)
             if do_sample:
                 filtered_logits = next_token_logits.clone()
                 sorted_logits, sorted_indices = torch.sort(filtered_logits, descending=True)
-                cumulative_probs = torch.cumsum(softmax(sorted_logits, dim=-1), dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 filtered_logits[indices_to_remove] = float('-inf')
-                probs = softmax(filtered_logits, dim=-1)
-                if torch.isnan(probs).any():
-                    probs = torch.nan_to_num(probs, nan=1.0 / probs.size(-1))
-                next_token = torch.multinomial(probs, num_samples=1)
+                probs = F.softmax(filtered_logits, dim=-1)
+                probs = torch.nan_to_num(probs, nan=1.0 / probs.size(-1))
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                next_token = torch.argmax(next_token_logits, dim=-1)
 
-            latent_mask = (gate > 0.5).unsqueeze(-1)
-            next_embed = latent_mask * hidden + (~latent_mask) * self.transformer.wte(next_token)
-            next_id = torch.where(latent_mask.squeeze(-1), torch.full((batch_size, 1), self.dummy_id, device=hidden.device), next_token)
-            generated_ids = torch.cat([generated_ids, next_id], dim=1)
-            input_embeds = torch.cat([input_embeds, next_embed], dim=1)
-            
-            is_dummy = (next_id == self.dummy_id).squeeze(-1)
-            dummy_streak = torch.where(is_dummy, dummy_streak + 1, torch.zeros_like(dummy_streak))
-            if (dummy_streak >= min_dummy_streak).all():
+            if return_logprobs:
+                log_softmax = F.log_softmax(filtered_logits if do_sample else next_token_logits, dim=-1)
+                logp = log_softmax[torch.arange(batch_size), next_token]
+                logprobs_list.append(logp)
+
+            generated_ids = torch.cat([generated_ids, next_token.unsqueeze(1)], dim=1)
+            position_ids = torch.cat([position_ids, (position_ids[:, -1] + 1).unsqueeze(1)], dim=1)
+            attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=self.device)], dim=1)
+            h_prev = hidden
+
+            if step > 10 and torch.all(generated_ids[:, -10:] == generated_ids[:, -1]):
                 break
 
-        if return_gates:
-            return generated_ids, torch.cat(gates_list, dim=1)
-        return generated_ids
+        if self.debug:
+            print(f"[DEBUG] Generation completed with {generated_ids.size(1) - input_ids.size(1)} steps")
 
-    def set_temperature(self, tau):
-        self.temperature = max(0.1, tau)
+        returns = [generated_ids]
+        if return_gates:
+            gates_cat = torch.cat(gates_list, dim=1) if gates_list else torch.empty(batch_size, 0, device=self.device)
+            returns.append(gates_cat)
+        if return_logprobs:
+            logprobs_cat = torch.stack(logprobs_list, dim=1) if logprobs_list else torch.empty(batch_size, 0, device=self.device)
+            returns.append(logprobs_cat)
+        return returns if len(returns) > 1 else returns[0]
