@@ -113,20 +113,22 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                 group_rewards = []
 
                 for gen_idx in range(config['group_size']):
+                    # Unwrap the model to access the custom generate method
+                    unwrapped_model = accelerator.unwrap_model(model)
                     with torch.no_grad():
-                        gen_ids, gen_gates = model.generate(
+                        gen_ids, gen_gates = unwrapped_model.generate(
                             prompt_ids, max_length=config['max_length'], do_sample=True, temperature=0.8, top_p=0.9, return_gates=True, training=True
                         )
                     gen_ids_without_prompt = gen_ids[0, len(prompt_ids[0]):]
-                    gen_gates_without_prompt = gen_gates[0, len(prompt_ids[0])-1:]  # Gates for generated steps
+                    gen_gates_without_prompt = gen_gates[0, len(prompt_ids[0])-1:]
 
                     if stage == 1:
                         reward_dict = compute_stage1_reward(
-                            gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset']
+                            gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, unwrapped_model.bot_id, unwrapped_model.eot_id, config['dataset']
                         )
                     else:
                         reward_dict = compute_stage2_reward(
-                            gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset']
+                            gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, unwrapped_model.bot_id, unwrapped_model.eot_id, config['dataset']
                         )
                     group_completions.append(gen_ids_without_prompt)
                     group_gates.append(gen_gates_without_prompt)
