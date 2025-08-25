@@ -128,7 +128,7 @@ class DTTModel(GPT2LMHeadModel):
             g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, self.training)
             gates.append(g_prev.unsqueeze(1))
             logit = self.lm_head(hidden_state)
-            logits.append(logit)
+            logits.append(logit.unsqueeze(1))
             h_prev = hidden_state
 
         logits = torch.cat(logits, dim=1)
@@ -139,9 +139,9 @@ class DTTModel(GPT2LMHeadModel):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[:, :-1, :]
-            shift_labels = labels[:, 1:]
-            loss = F.cross_entropy(shift_logits.contiguous().view(-1, shift_logits.size(-1)), shift_labels.contiguous().view(-1))
+            shift_logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
+            shift_labels = labels[:, 1:].contiguous().view(-1)
+            loss = F.cross_entropy(shift_logits, shift_labels)
 
         return CausalLMOutputWithGates(
             loss=loss,
