@@ -71,9 +71,25 @@ class DTTModel(GPT2LMHeadModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+                if attention_mask is not None and attention_mask.dim() == 1:
+                    attention_mask = attention_mask.unsqueeze(0)
+                if position_ids is not None and position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0)
+                if labels is not None and labels.dim() == 1:
+                    labels = labels.unsqueeze(0)
             batch_size, seq_len = input_ids.shape
             device = input_ids.device
         elif inputs_embeds is not None:
+            if inputs_embeds.dim() == 2:
+                inputs_embeds = inputs_embeds.unsqueeze(0)
+                if attention_mask is not None and attention_mask.dim() == 1:
+                    attention_mask = attention_mask.unsqueeze(0)
+                if position_ids is not None and position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0)
+                if labels is not None and labels.dim() == 1:
+                    labels = labels.unsqueeze(0)
             batch_size, seq_len, _ = inputs_embeds.shape
             device = inputs_embeds.device
         else:
