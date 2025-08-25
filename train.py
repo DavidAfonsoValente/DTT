@@ -33,8 +33,8 @@ tokenizer.add_special_tokens({
     'pad_token': '<pad>'
 })
 dataset = DTTDataset(args.dataset, tokenizer, data_dir=config.get('data_dir', 'data'))
-model = DTTModel.from_pretrained('gpt2')
-ref_model = DTTModel.from_pretrained('gpt2')
+model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
+ref_model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
 ref_model.load_state_dict(model.state_dict())
 
 collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
