@@ -36,13 +36,12 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     position_id = prompt_len
 
     # Process prompt (non-blended)
+    outputs = model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
+    past_key_values = outputs.past_key_values
+
     with torch.no_grad():
-        if model.debug:
-            print(f"[DEBUG] Processing prompt in logprobs: prompt_ids.shape={prompt_ids.shape}, attention_mask.shape={attention_mask.shape}")
-        outputs = model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
-        past_key_values = outputs.past_key_values
         outputs_ref = ref_model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
-        past_key_values_ref = outputs_ref.past_key_values
+    past_key_values_ref = outputs_ref.past_key_values
 
     if len(gen_ids_without_prompt) == 0:
         return torch.tensor([], device=device), torch.tensor(0.0, device=device)
@@ -52,15 +51,14 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
         e = torch.sqrt(1 - g).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0)) + torch.sqrt(g).unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
         attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
         current_position_id = torch.tensor([[position_id]], device=device)
-        if model.debug:
-            print(f"[DEBUG] Logprobs gen step {t}: inputs_embeds.shape={e.shape}, attention_mask.shape={attention_mask.shape}")
         outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
         past_key_values = outputs.past_key_values
         log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
         logp = log_soft[0, next_id]
         logprobs.append(logp)
 
-        outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values_ref, use_cache=True)
+        with torch.no_grad():
+            outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values_ref, use_cache=True)
         past_key_values_ref = outputs_ref.past_key_values
         log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
         kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
@@ -133,7 +131,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     unwrapped_model = accelerator.unwrap_model(model)
                     with torch.no_grad():
                         gen_ids, gen_gates = unwrapped_model.generate(
-                            prompt_ids, max_length=config['max_length'], do_sample=True, temperature=0.8, top_p=0.9, return_gates=True, training=True
+                            prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.9, temperature=0.8, return_gates=True, training=True
                         )
                     gen_ids_without_prompt = gen_ids[0, prompt_ids.size(1):]
                     gen_gates_without_prompt = gen_gates[0, :]
