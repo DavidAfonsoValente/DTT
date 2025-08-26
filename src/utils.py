@@ -24,19 +24,21 @@ def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
         for batch in tqdm(val_loader, desc="Validation", disable=not accelerator.is_local_main_process):
             batch_size = batch['input_ids'].size(0)
             for prompt_idx in range(batch_size):
-                prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
-                if prompt_ids.size(1) == 0:
+                prompt_mask_row = batch['attention_mask'][prompt_idx]
+                effective_len = prompt_mask_row.sum().item()
+                if effective_len == 0:
                     if debug:
                         print(f"[DEBUG] Skipping empty prompt at validation batch index {prompt_idx}")
                     continue
+                prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1, :effective_len]
                 answer_gt = batch['answer_gt'][prompt_idx]
 
                 gen_ids, gen_gates = model.generate(
                     prompt_ids, max_length=config['max_length'], do_sample=False, return_gates=True, training=False
                 )
 
-                gen_ids_without_prompt = gen_ids[0, len(prompt_ids[0]):]
-                gen_gates_without_prompt = gen_gates[0, len(prompt_ids[0])-1:]
+                gen_ids_without_prompt = gen_ids[0, prompt_ids.size(1):]
+                gen_gates_without_prompt = gen_gates[0, prompt_ids.size(1)-1:]
 
                 if stage == 1:
                     reward_dict = compute_stage1_reward(
@@ -55,9 +57,9 @@ def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
                     bot_pos = (gen_ids_without_prompt == model.bot_id).nonzero(as_tuple=True)[0][0].item()
                     eot_pos = (gen_ids_without_prompt == model.eot_id).nonzero(as_tuple=True)[0][0].item()
                     inner_gates = gen_gates_without_prompt[bot_pos + 1 : eot_pos]
-                    outer_gates = torch.cat([gen_gates_without_prompt[:bot_pos], gen_gates_without_prompt[eot_pos:]])
+                    outer_gates = torch.cat([gen_gates_without_prompt[:bot_pos], gen_gates_without_prompt[eot_pos:]] if eot_pos < len(gen_gates_without_prompt) else gen_gates_without_prompt[:bot_pos])
                     total_inner_gate += inner_gates.mean().item()
-                    total_outer_gate += outer_gates.mean().item()
+                    total_outer_gate += outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
                     think_len = eot_pos - bot_pos - 1
                     total_think_len += think_len
                     num_spans += 1

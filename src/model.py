@@ -1,3 +1,4 @@
+# src/model.py
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -166,11 +167,13 @@ class DTTModel(GPT2LMHeadModel):
             gates=gates,
         )
 
-    def generate(self, input_ids, max_length=256, do_sample=True, temperature=0.8, top_p=0.95, return_gates=False, return_logprobs=False, training=False):
+    def generate(self, input_ids, max_length=256, do_sample=True, temperature=0.8, top_p=0.95, return_gates=False, return_logprobs=False, training=False, attention_mask=None):
         if self.debug:
             print(f"[DEBUG] Starting generation with input_ids shape: {input_ids.shape}, do_sample={do_sample}, training={training}")
         input_ids = input_ids.to(self.device)
         batch_size = input_ids.size(0)
+        if attention_mask is None:
+            attention_mask = input_ids.ne(self.pad_id).long()
         generated_ids = input_ids.clone()
         gates_list = []
         logprobs_list = [] if return_logprobs else None
@@ -178,7 +181,7 @@ class DTTModel(GPT2LMHeadModel):
         h_prev = None
         g_prev = torch.zeros(batch_size, device=self.device)
         position_ids = torch.arange(0, input_ids.size(1), dtype=torch.long, device=self.device).unsqueeze(0).expand(batch_size, -1)
-        attention_mask = torch.ones(batch_size, input_ids.size(1), dtype=torch.long, device=self.device)
+        attention_mask = attention_mask.to(self.device)
 
         for step in range(max_length - input_ids.size(1)):
             if step == 0:

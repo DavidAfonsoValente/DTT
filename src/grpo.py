@@ -10,6 +10,8 @@ import wandb
 import math
 import os
 
+torch._dynamo.config.suppress_errors = True
+
 def get_beta_kl(stage):
     return 0.02 if stage == 1 else 0.01
 
@@ -30,8 +32,8 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     past_key_values_ref = None
     logprobs = []
     kl_terms = []
-    position_id = prompt_ids.size(0)
-    attention_mask = torch.ones(batch_size, prompt_ids.size(0), dtype=torch.long, device=device)
+    position_id = prompt_ids.size(1)
+    attention_mask = torch.ones(batch_size, prompt_ids.size(1), dtype=torch.long, device=device)
 
     # Process prompt (non-blended)
     with torch.no_grad():
@@ -107,11 +109,13 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
             prompts = []
 
             for prompt_idx in range(batch_size):
-                prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
-                if prompt_ids.size(1) == 0:
+                prompt_mask_row = batch['attention_mask'][prompt_idx]
+                effective_len = prompt_mask_row.sum().item()
+                if effective_len == 0:
                     if debug:
                         print(f"[DEBUG] Skipping empty prompt at batch index {prompt_idx}")
                     continue
+                prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1, :effective_len]
                 answer_gt = batch['answer_gt'][prompt_idx]
                 group_completions = []
                 group_gates = []
@@ -124,8 +128,8 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                         gen_ids, gen_gates = unwrapped_model.generate(
                             prompt_ids, max_length=config['max_length'], do_sample=True, temperature=0.8, top_p=0.9, return_gates=True, training=True
                         )
-                    gen_ids_without_prompt = gen_ids[0, len(prompt_ids[0]):]
-                    gen_gates_without_prompt = gen_gates[0, len(prompt_ids[0])-1:]
+                    gen_ids_without_prompt = gen_ids[0, prompt_ids.size(1):]
+                    gen_gates_without_prompt = gen_gates[0, prompt_ids.size(1)-1:]
 
                     if stage == 1:
                         reward_dict = compute_stage1_reward(
@@ -159,7 +163,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
             else:
                 epoch_corr += sum(d['corr'] for d in reward_dicts)
                 epoch_eff += sum(d['eff'] for d in reward_dicts)
-            num_batches += config['group_size'] * batch_size
+            num_batches += len(rewards)
 
             for _ in range(config['mu']):
                 batch_loss = 0.0
@@ -171,7 +175,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     gates = gates_list[i]
 
                     logprobs, avg_kl = compute_sequence_logprobs_and_kl(
-                        model, ref_model, prompt, comp, gates, model.training
+                        model, ref_model, prompt.unsqueeze(0), comp, gates, model.training
                     )
 
                     ratios = torch.exp(logprobs.mean())  # Average for surrogate (scalar A)
@@ -185,14 +189,15 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     loss_i = -ppo_term + beta_kl * avg_kl
                     batch_loss += loss_i
 
-                batch_loss /= len(completions)
-                accelerator.backward(batch_loss)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+                if len(completions) > 0:
+                    batch_loss /= len(completions)
+                    accelerator.backward(batch_loss)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                epoch_loss += batch_loss.item()
-                epoch_kl += batch_kl / len(completions)
+                    epoch_loss += batch_loss.item()
+                    epoch_kl += batch_kl / len(completions)
 
             step += 1
             pbar.update(1)
