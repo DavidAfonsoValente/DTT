@@ -96,6 +96,14 @@ class DTTModel(GPT2LMHeadModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
+        if seq_len == 0:
+            return CausalLMOutputWithGates(
+                loss=None,
+                logits=torch.empty(batch_size, 0, self.config.vocab_size, device=device, dtype=self.dtype),
+                hidden_states=None,
+                gates=torch.empty(batch_size, 0, device=device, dtype=self.dtype),
+            )
+
         if position_ids is None:
             position_ids = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
 
@@ -172,6 +180,9 @@ class DTTModel(GPT2LMHeadModel):
             print(f"[DEBUG] Starting generation with input_ids shape: {input_ids.shape}, do_sample={do_sample}, training={training}")
         input_ids = input_ids.to(self.device)
         batch_size = input_ids.size(0)
+        prompt_len = input_ids.size(1)
+        if prompt_len == 0:
+            return input_ids, torch.empty(batch_size, 0, device=self.device) if return_gates else input_ids
         if attention_mask is None:
             attention_mask = input_ids.ne(self.pad_id).long()
         generated_ids = input_ids.clone()
@@ -180,10 +191,10 @@ class DTTModel(GPT2LMHeadModel):
         past_key_values = None
         h_prev = None
         g_prev = torch.zeros(batch_size, device=self.device)
-        position_ids = torch.arange(0, input_ids.size(1), dtype=torch.long, device=self.device).unsqueeze(0).expand(batch_size, -1)
+        position_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(batch_size, -1)
         attention_mask = attention_mask.to(self.device)
 
-        for step in range(max_length - input_ids.size(1)):
+        for step in range(max_length - prompt_len):
             if step == 0:
                 outputs = self(input_ids=input_ids, attention_mask=attention_mask)  # hidden_states forced
                 hidden = outputs.hidden_states[-1][:, -1, :]  # Last layer, last token
