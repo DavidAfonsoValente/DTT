@@ -7,6 +7,8 @@ from src.rewards import compute_stage1_reward, compute_stage2_reward
 from src.utils import validate_grpo, should_transition
 import wandb
 import math
+from typing import Optional
+import torch.nn.functional as F
 import os
 
 torch._dynamo.config.suppress_errors = True
