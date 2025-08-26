@@ -9,6 +9,7 @@ from src.utils import validate_grpo, should_transition
 import wandb
 import math
 import os
+import torch.nn.functional as F
 
 #torch._dynamo.config.suppress_errors = True
 
