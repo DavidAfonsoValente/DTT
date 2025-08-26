@@ -38,7 +38,7 @@ def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
                 )
 
                 gen_ids_without_prompt = gen_ids[0, prompt_ids.size(1):]
-                gen_gates_without_prompt = gen_gates[0, prompt_ids.size(1)-1:]
+                gen_gates_without_prompt = gen_gates[0, :]
 
                 if stage == 1:
                     reward_dict = compute_stage1_reward(
@@ -57,8 +57,10 @@ def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
                     bot_pos = (gen_ids_without_prompt == model.bot_id).nonzero(as_tuple=True)[0][0].item()
                     eot_pos = (gen_ids_without_prompt == model.eot_id).nonzero(as_tuple=True)[0][0].item()
                     inner_gates = gen_gates_without_prompt[bot_pos + 1 : eot_pos]
-                    outer_gates = torch.cat([gen_gates_without_prompt[:bot_pos], gen_gates_without_prompt[eot_pos:]] if eot_pos < len(gen_gates_without_prompt) else gen_gates_without_prompt[:bot_pos])
-                    total_inner_gate += inner_gates.mean().item()
+                    outer_gates_before = gen_gates_without_prompt[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gen_gates_without_prompt.device)
+                    outer_gates_after = gen_gates_without_prompt[eot_pos:] if eot_pos < len(gen_gates_without_prompt) else torch.tensor([], device=gen_gates_without_prompt.device)
+                    outer_gates = torch.cat([outer_gates_before, outer_gates_after])
+                    total_inner_gate += inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
                     total_outer_gate += outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
                     think_len = eot_pos - bot_pos - 1
                     total_think_len += think_len

@@ -25,15 +25,15 @@ def update_temperature(model, step, stage, transition_step=0):
 
 def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_without_prompt, gen_gates_without_prompt, training):
     # Sequential computation to match blended dynamics
-    batch_size = 1  # Assume single example
+    batch_size = prompt_ids.size(0)  # Typically 1
     device = model.device
-    input_embeds = model.transformer.wte(prompt_ids.to(device))
+    prompt_len = prompt_ids.size(1)
+    attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
     past_key_values = None
     past_key_values_ref = None
     logprobs = []
     kl_terms = []
-    position_id = prompt_ids.size(1)
-    attention_mask = torch.ones(batch_size, prompt_ids.size(1), dtype=torch.long, device=device)
+    position_id = prompt_len
 
     # Process prompt (non-blended)
     with torch.no_grad():
@@ -45,15 +45,15 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     for t, next_id in enumerate(gen_ids_without_prompt):
         g = gen_gates_without_prompt[t]
         e = torch.sqrt(1 - g).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0)) + torch.sqrt(g).unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+        attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
         current_position_id = torch.tensor([[position_id]], device=device)
-        current_mask = torch.ones(batch_size, 1, dtype=torch.long, device=device)
-        outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=current_mask, past_key_values=past_key_values, use_cache=True)
+        outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
         past_key_values = outputs.past_key_values
         log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
         logp = log_soft[0, next_id]
         logprobs.append(logp)
 
-        outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=current_mask, past_key_values=past_key_values_ref, use_cache=True)
+        outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values_ref, use_cache=True)
         past_key_values_ref = outputs_ref.past_key_values
         log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
         kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
@@ -129,7 +129,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                             prompt_ids, max_length=config['max_length'], do_sample=True, temperature=0.8, top_p=0.9, return_gates=True, training=True
                         )
                     gen_ids_without_prompt = gen_ids[0, prompt_ids.size(1):]
-                    gen_gates_without_prompt = gen_gates[0, prompt_ids.size(1)-1:]
+                    gen_gates_without_prompt = gen_gates[0, :]
 
                     if stage == 1:
                         reward_dict = compute_stage1_reward(
