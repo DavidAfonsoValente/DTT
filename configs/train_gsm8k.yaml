@@ -6,6 +6,6 @@ lr: 1.0e-5
 group_size: 2
 epsilon: 0.2
 mu: 4
-max_length: 10
+max_length: 256
 val_size: 256
 data_dir: data
