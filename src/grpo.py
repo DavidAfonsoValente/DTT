@@ -10,7 +10,7 @@ import wandb
 import math
 import os
 
-torch._dynamo.config.suppress_errors = True
+#torch._dynamo.config.suppress_errors = True
 
 def get_beta_kl(stage):
     return 0.02 if stage == 1 else 0.01
