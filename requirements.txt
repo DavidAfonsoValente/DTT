@@ -1,10 +1,7 @@
-torch
-transformers
-accelerate
-datasets
-wandb
-tqdm
-pyyaml
-scipy
-numpy
-bitsandbytes
+torch==2.8.0
+transformers==4.55.4
+accelerate==1.10.1
+datasets==4.0.0
+wandb==0.21.1
+tqdm==4.67.1
+pyyaml==6.0.2
