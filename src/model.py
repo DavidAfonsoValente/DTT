@@ -117,7 +117,9 @@ class DTTModel(GPT2LMHeadModel):
         past_key_values = past_key_values or None
         gates = []
         logits = []
-        all_hidden_states = [[] for _ in range(len(self.transformer.h) + 1)] if output_hidden_states else None  # embed + layers
+        all_hidden_states = [] if output_hidden_states else None
+        if output_hidden_states:
+            all_hidden_states = []
 
         for t in range(seq_len):
             current_position_id = position_ids[:, t:t+1]
@@ -137,7 +139,7 @@ class DTTModel(GPT2LMHeadModel):
             transformer_outputs = self.transformer(
                 inputs_embeds=e,
                 position_ids=current_position_id,
-                attention_mask=current_mask,
+                attention_mask=attention_mask if past_key_values is not None else current_mask,  # Use full mask when using past
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 output_hidden_states=output_hidden_states,
@@ -146,8 +148,7 @@ class DTTModel(GPT2LMHeadModel):
             past_key_values = transformer_outputs.past_key_values
             hidden_state = transformer_outputs.last_hidden_state[:, -1, :]
             if output_hidden_states:
-                for i, layer_hidden in enumerate(transformer_outputs.hidden_states):
-                    all_hidden_states[i].append(layer_hidden)
+                all_hidden_states.append(transformer_outputs.hidden_states)
 
             gate_logit = self.gate_network(hidden_state).squeeze(-1)
             g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, self.training)
@@ -160,7 +161,11 @@ class DTTModel(GPT2LMHeadModel):
         gates = torch.cat(gates, dim=1)
 
         if output_hidden_states:
-            all_hidden_states = tuple(torch.cat(layer_states, dim=1) for layer_states in all_hidden_states)
+            # Post-process hidden states to concatenate along seq_len dim
+            processed_hidden_states = []
+            for layer_hidden in zip(*all_hidden_states):
+                processed_hidden_states.append(torch.cat(layer_hidden, dim=1))
+            all_hidden_states = tuple(processed_hidden_states)
 
         loss = None
         if labels is not None:
@@ -206,11 +211,11 @@ class DTTModel(GPT2LMHeadModel):
             else:
                 e = torch.sqrt(1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(1)) + torch.sqrt(g_prev).unsqueeze(-1) * h_prev.unsqueeze(1)
                 current_position_id = (position_ids[:, -1] + 1).unsqueeze(1)
-                current_mask = torch.ones(batch_size, 1, dtype=torch.long, device=self.device)
+                attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=self.device)], dim=1)
                 transformer_outputs = self.transformer(
                     inputs_embeds=e,
                     position_ids=current_position_id,
-                    attention_mask=current_mask,
+                    attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     use_cache=True,
                     output_hidden_states=True  # Enable hidden states
@@ -245,7 +250,6 @@ class DTTModel(GPT2LMHeadModel):
 
             generated_ids = torch.cat([generated_ids, next_token.unsqueeze(1)], dim=1)
             position_ids = torch.cat([position_ids, (position_ids[:, -1] + 1).unsqueeze(1)], dim=1)
-            attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=self.device)], dim=1)
             h_prev = hidden
 
             if step > 10 and torch.all(generated_ids[:, -10:] == generated_ids[:, -1]):

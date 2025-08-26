@@ -42,6 +42,9 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
         outputs_ref = ref_model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
         past_key_values_ref = outputs_ref.past_key_values
 
+    if len(gen_ids_without_prompt) == 0:
+        return torch.tensor([], device=device), torch.tensor(0.0, device=device)
+
     for t, next_id in enumerate(gen_ids_without_prompt):
         g = gen_gates_without_prompt[t]
         e = torch.sqrt(1 - g).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0)) + torch.sqrt(g).unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
