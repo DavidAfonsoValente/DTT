@@ -9,6 +9,10 @@ import torch
 import wandb
 import os
 
+import torch._dynamo as dynamo
+dynamo.config.cache_size_limit = 64  # Increase from default 8 to handle more shape variations
+dynamo.config.suppress_errors = True  # Fallback to eager mode on compilation failures
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
 parser.add_argument('--config', type=str, required=True)

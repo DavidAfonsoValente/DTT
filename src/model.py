@@ -192,7 +192,7 @@ class DTTModel(GPT2LMHeadModel):
         )
 
     @torch._dynamo.disable
-    def generate(self, input_ids, max_length=256, do_sample=True, temperature=0.8, top_p=0.95, return_gates=False, return_logprobs=False, training=False, attention_mask=None):
+    def generate(self, input_ids, max_length=256, do_sample=True, temperature=0.8, top_p=0.95, return_gates=False, return_logprobs=False, training=False, attention_mask: Optional[torch.Tensor] = None):
         if self.debug:
             print(f"[DEBUG] Starting generation with input_ids shape: {input_ids.shape}, do_sample={do_sample}, training={training}")
         input_ids = input_ids.to(self.device)
@@ -202,6 +202,7 @@ class DTTModel(GPT2LMHeadModel):
             return input_ids, torch.empty(batch_size, 0, device=self.device) if return_gates else input_ids
         if attention_mask is None:
             attention_mask = input_ids.ne(self.pad_id).long()
+        attention_mask = attention_mask.to(self.device)
         generated_ids = input_ids.clone()
         gates_list = []
         logprobs_list = [] if return_logprobs else None
@@ -209,7 +210,7 @@ class DTTModel(GPT2LMHeadModel):
         h_prev = None
         g_prev = torch.zeros(batch_size, device=self.device)
         position_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(batch_size, -1)
-        attention_mask = attention_mask.to(self.device)
+        
 
         for step in range(max_length - prompt_len):
             if step == 0:

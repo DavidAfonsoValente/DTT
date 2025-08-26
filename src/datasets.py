@@ -8,6 +8,7 @@ class DTTDataset(Dataset):
         self.tokenizer = tokenizer
         self.dataset_name = dataset_name
         self.data_dir = data_dir
+        self.max_prompt_len = 128  # Fixed length; can move to config if desired
         if split == 'valid':
             split = 'test' if dataset_name in ['gsm8k', 'prontoqa'] else 'validation'
 
@@ -32,12 +33,13 @@ class DTTDataset(Dataset):
         answer = item['answer'] if 'answer' in item else (item['answers'][0] if 'answers' in item else item.get('explanation', ''))
         answer_gt = answer.split('####')[-1].strip() if self.dataset_name == 'gsm8k' else answer
 
-        question_ids = self.tokenizer.encode(question, return_tensors='pt').squeeze()
-        input_ids = question_ids.clone()
+        enc = self.tokenizer(question, max_length=self.max_prompt_len, truncation=True, padding='max_length', return_tensors='pt')
+        input_ids = enc['input_ids'].squeeze()
+        attention_mask = enc['attention_mask'].squeeze()
 
-        return {'input_ids': input_ids, 'answer_gt': answer_gt}
+        return {'input_ids': input_ids, 'attention_mask': attention_mask, 'answer_gt': answer_gt}
 
 def collate_fn(batch, pad_token_id):
-    input_ids = pad_sequence([b['input_ids'] for b in batch], batch_first=True, padding_value=pad_token_id)
-    attention_mask = input_ids.ne(pad_token_id)
+    input_ids = torch.stack([b['input_ids'] for b in batch])
+    attention_mask = torch.stack([b['attention_mask'] for b in batch])
     return {'input_ids': input_ids, 'attention_mask': attention_mask, 'answer_gt': [b['answer_gt'] for b in batch]}

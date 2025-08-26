@@ -1,4 +1,3 @@
-# src/grpo.py
 from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -9,9 +8,8 @@ from src.utils import validate_grpo, should_transition
 import wandb
 import math
 import os
-import torch.nn.functional as F
 
-#torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.suppress_errors = True
 
 def get_beta_kl(stage):
     return 0.02 if stage == 1 else 0.01
@@ -24,12 +22,15 @@ def update_temperature(model, step, stage, transition_step=0):
     model.set_temperature(tau)
     return tau
 
-def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_without_prompt, gen_gates_without_prompt, training):
+def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_without_prompt, gen_gates_without_prompt, training, attention_mask: Optional[torch.Tensor] = None):
     # Sequential computation to match blended dynamics
     batch_size = prompt_ids.size(0)  # Typically 1
     device = model.device
     prompt_len = prompt_ids.size(1)
-    attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
+    if attention_mask is None:
+        attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
+    else:
+        attention_mask = attention_mask.to(device)
     past_key_values = None
     past_key_values_ref = None
     logprobs = []
@@ -121,7 +122,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     if debug:
                         print(f"[DEBUG] Skipping empty prompt at batch index {prompt_idx}")
                     continue
-                prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1, :effective_len]
+                prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
                 answer_gt = batch['answer_gt'][prompt_idx]
                 group_completions = []
                 group_gates = []
@@ -132,9 +133,10 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     unwrapped_model = accelerator.unwrap_model(model)
                     with torch.no_grad():
                         gen_ids, gen_gates = unwrapped_model.generate(
-                            prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.9, temperature=0.8, return_gates=True, training=True
+                            prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.9, temperature=0.8, return_gates=True, training=True,
+                            attention_mask=batch['attention_mask'][prompt_idx : prompt_idx + 1]
                         )
-                    gen_ids_without_prompt = gen_ids[0, prompt_ids.size(1):]
+                    gen_ids_without_prompt = gen_ids[0, effective_len:]
                     gen_gates_without_prompt = gen_gates[0, :]
 
                     if stage == 1:
@@ -181,13 +183,22 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     gates = gates_list[i]
 
                     logprobs, avg_kl = compute_sequence_logprobs_and_kl(
-                        model, ref_model, prompt.unsqueeze(0), comp, gates, model.training
+                        model, ref_model, prompt.unsqueeze(0), comp, gates, model.training,
+                        attention_mask=batch['attention_mask'][i : i + 1]
                     )
 
-                    ratios = torch.exp(logprobs.mean())  # Average for surrogate (scalar A)
-                    surr1 = ratios * A
-                    surr2 = torch.clamp(ratios, 1 - config['epsilon'], 1 + config['epsilon']) * A
-                    ppo_term = torch.min(surr1, surr2)
+                    if logprobs.numel() == 0:
+                        # Handle empty generation: neutral ratio, no PPO update
+                        ratios = torch.tensor(1.0, device=model.device)
+                        ppo_term = torch.tensor(0.0, device=model.device)
+                    else:
+                        logprob_mean = logprobs.mean()
+                        if torch.isnan(logprob_mean):
+                            logprob_mean = torch.tensor(0.0, device=model.device)  # Fallback for any nan
+                        ratios = torch.exp(logprob_mean)
+                        surr1 = ratios * A
+                        surr2 = torch.clamp(ratios, 1 - config['epsilon'], 1 + config['epsilon']) * A
+                        ppo_term = torch.min(surr1, surr2)
 
                     batch_kl += avg_kl.item()
 
