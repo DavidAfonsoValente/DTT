@@ -1,3 +1,4 @@
+# src/grpo.py
 from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -107,6 +108,10 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
 
             for prompt_idx in range(batch_size):
                 prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
+                if prompt_ids.size(1) == 0:
+                    if debug:
+                        print(f"[DEBUG] Skipping empty prompt at batch index {prompt_idx}")
+                    continue
                 answer_gt = batch['answer_gt'][prompt_idx]
                 group_completions = []
                 group_gates = []

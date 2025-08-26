@@ -1,3 +1,4 @@
+# src/utils.py
 from torch.utils.data import DataLoader
 import torch
 from src.rewards import compute_stage1_reward, compute_stage2_reward
@@ -24,6 +25,10 @@ def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
             batch_size = batch['input_ids'].size(0)
             for prompt_idx in range(batch_size):
                 prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
+                if prompt_ids.size(1) == 0:
+                    if debug:
+                        print(f"[DEBUG] Skipping empty prompt at validation batch index {prompt_idx}")
+                    continue
                 answer_gt = batch['answer_gt'][prompt_idx]
 
                 gen_ids, gen_gates = model.generate(
