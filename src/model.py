@@ -1,4 +1,3 @@
-# src/model.py
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -110,8 +109,6 @@ class DTTModel(GPT2LMHeadModel):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_len), device=device)
 
-        extended_attention_mask = self.get_extended_attention_mask(attention_mask, (batch_size, seq_len))
-
         g_prev = torch.zeros(batch_size, device=device)
         h_prev = None
         past_key_values = past_key_values or None
@@ -122,8 +119,10 @@ class DTTModel(GPT2LMHeadModel):
             all_hidden_states = []
 
         for t in range(seq_len):
+            if self.debug:
+                print(f"[DEBUG] Forward loop t={t}/{seq_len-1}, batch_size={batch_size}")
+
             current_position_id = position_ids[:, t:t+1]
-            current_mask = extended_attention_mask[:, :, t:t+1, :t+1] if extended_attention_mask is not None else None
 
             if input_ids is not None:
                 current_input_id = input_ids[:, t:t+1]
@@ -136,10 +135,21 @@ class DTTModel(GPT2LMHeadModel):
                 sqrt_1_g = torch.sqrt(1 - g_prev).unsqueeze(-1)
                 e = sqrt_g * h_prev.unsqueeze(1) + sqrt_1_g * e
 
+            # FIX: Slice attention_mask to current length (t+1) to match effective k_len
+            current_attention_mask = attention_mask[:, :(t + 1)] if attention_mask is not None else None
+
+            if self.debug:
+                past_len = past_key_values[0][0].size(2) if past_key_values is not None else 0
+                expected_k_len = past_len + 1  # q_len=1
+                mask_shape = current_attention_mask.shape if current_attention_mask is not None else "None"
+                print(f"[DEBUG] Before transformer: inputs_embeds.shape={e.shape}, position_ids={current_position_id.shape}, "
+                      f"attention_mask.shape={mask_shape}, past_key_values exists={past_key_values is not None}, "
+                      f"past_len={past_len}, expected_k_len={expected_k_len}")
+
             transformer_outputs = self.transformer(
                 inputs_embeds=e,
                 position_ids=current_position_id,
-                attention_mask=attention_mask if past_key_values is not None else current_mask,  # Use full mask when using past
+                attention_mask=current_attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 output_hidden_states=output_hidden_states,
@@ -201,6 +211,8 @@ class DTTModel(GPT2LMHeadModel):
 
         for step in range(max_length - prompt_len):
             if step == 0:
+                if self.debug:
+                    print(f"[DEBUG] Processing prompt: attention_mask.shape={attention_mask.shape}")
                 outputs = self(input_ids=input_ids, attention_mask=attention_mask)  # hidden_states forced
                 hidden = outputs.hidden_states[-1][:, -1, :]  # Last layer, last token
                 gate_logit = self.gate_network(hidden).squeeze(-1)
@@ -209,9 +221,12 @@ class DTTModel(GPT2LMHeadModel):
                 next_token_logits = outputs.logits[:, -1, :] / temperature
                 past_key_values = outputs.past_key_values
             else:
-                e = torch.sqrt(1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(1)) + torch.sqrt(g_prev).unsqueeze(-1) * h_prev.unsqueeze(1)
+                e = torch.sqrt(1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(0)) + torch.sqrt(g_prev).unsqueeze(-1) * h_prev.unsqueeze(1)
                 current_position_id = (position_ids[:, -1] + 1).unsqueeze(1)
                 attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=self.device)], dim=1)
+                if self.debug:
+                    past_len = past_key_values[0][0].size(2) if past_key_values else 0
+                    print(f"[DEBUG] Gen step {step}: inputs_embeds.shape={e.shape}, attention_mask.shape={attention_mask.shape}, past_len={past_len}")
                 transformer_outputs = self.transformer(
                     inputs_embeds=e,
                     position_ids=current_position_id,

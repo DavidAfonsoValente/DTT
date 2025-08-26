@@ -37,6 +37,8 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
 
     # Process prompt (non-blended)
     with torch.no_grad():
+        if model.debug:
+            print(f"[DEBUG] Processing prompt in logprobs: prompt_ids.shape={prompt_ids.shape}, attention_mask.shape={attention_mask.shape}")
         outputs = model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
         past_key_values = outputs.past_key_values
         outputs_ref = ref_model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
@@ -50,6 +52,8 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
         e = torch.sqrt(1 - g).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0)) + torch.sqrt(g).unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
         attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
         current_position_id = torch.tensor([[position_id]], device=device)
+        if model.debug:
+            print(f"[DEBUG] Logprobs gen step {t}: inputs_embeds.shape={e.shape}, attention_mask.shape={attention_mask.shape}")
         outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
         past_key_values = outputs.past_key_values
         log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
