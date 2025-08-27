@@ -189,6 +189,7 @@ class DTTModel(GPT2LMHeadModel):
             logits=logits,
             hidden_states=all_hidden_states,
             gates=gates,
+            past_key_values=past_key_values,
         )
 
     @torch._dynamo.disable
@@ -203,6 +204,9 @@ class DTTModel(GPT2LMHeadModel):
         if attention_mask is None:
             attention_mask = input_ids.ne(self.pad_id).long()
         attention_mask = attention_mask.to(self.device)
+        effective_len = attention_mask.sum(dim=1)[0].item()
+        if effective_len == 0:
+            return input_ids[:, :0], torch.empty(batch_size, 0, device=self.device) if return_gates else input_ids[:, :0]
         generated_ids = input_ids.clone()
         gates_list = []
         logprobs_list = [] if return_logprobs else None
@@ -210,25 +214,34 @@ class DTTModel(GPT2LMHeadModel):
         h_prev = None
         g_prev = torch.zeros(batch_size, device=self.device)
         position_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(batch_size, -1)
-        
 
-        for step in range(max_length - prompt_len):
+        for step in range(max_length - effective_len):
             if step == 0:
                 if self.debug:
                     print(f"[DEBUG] Processing prompt: attention_mask.shape={attention_mask.shape}")
                 outputs = self(input_ids=input_ids, attention_mask=attention_mask)  # hidden_states forced
-                hidden = outputs.hidden_states[-1][:, -1, :]  # Last layer, last token
+                last_idx = effective_len - 1
+                hidden = outputs.hidden_states[-1][:, last_idx, :]
                 gate_logit = self.gate_network(hidden).squeeze(-1)
                 g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, training=training)
                 gates_list.append(g_prev.unsqueeze(1))
-                next_token_logits = outputs.logits[:, -1, :] / temperature
-                past_key_values = outputs.past_key_values
+                next_token_logits = outputs.logits[:, last_idx, :] / temperature
+                # Trim past_key_values, attention_mask, position_ids, generated_ids
+                past_key_values = tuple(
+                    (
+                        layer_past[0][:, :, :effective_len, :],
+                        layer_past[1][:, :, :effective_len, :]
+                    ) for layer_past in outputs.past_key_values
+                )
+                attention_mask = attention_mask[:, :effective_len]
+                position_ids = position_ids[:, :effective_len]
+                generated_ids = generated_ids[:, :effective_len]
             else:
-                e = torch.sqrt(1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(0)) + torch.sqrt(g_prev).unsqueeze(-1) * h_prev.unsqueeze(1)
+                e = torch.sqrt(1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(1)) + torch.sqrt(g_prev).unsqueeze(-1) * h_prev.unsqueeze(1)
                 current_position_id = (position_ids[:, -1] + 1).unsqueeze(1)
                 attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=self.device)], dim=1)
                 if self.debug:
-                    past_len = past_key_values[0][0].size(2) if past_key_values else 0
+                    past_len = past_key_values[0][0].size(2) if past_key_values is not None else 0
                     print(f"[DEBUG] Gen step {step}: inputs_embeds.shape={e.shape}, attention_mask.shape={attention_mask.shape}, past_len={past_len}")
                 transformer_outputs = self.transformer(
                     inputs_embeds=e,
@@ -236,10 +249,10 @@ class DTTModel(GPT2LMHeadModel):
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     use_cache=True,
-                    output_hidden_states=True  # Enable hidden states
+                    output_hidden_states=True
                 )
                 past_key_values = transformer_outputs.past_key_values
-                hidden = transformer_outputs.hidden_states[-1][:, -1, :]  # Last layer, last token
+                hidden = transformer_outputs.hidden_states[-1][:, -1, :]
                 gate_logit = self.gate_network(hidden).squeeze(-1)
                 g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, training=training)
                 gates_list.append(g_prev.unsqueeze(1))
