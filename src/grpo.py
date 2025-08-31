@@ -1,3 +1,4 @@
+# src/grpo.py
 from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -25,8 +26,7 @@ def update_temperature(model, step, stage, transition_step=0):
     return tau
 
 def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_without_prompt, gen_gates_without_prompt, training, attention_mask: Optional[torch.Tensor] = None):
-    # Sequential computation to match blended dynamics
-    batch_size = prompt_ids.size(0)  # Typically 1
+    batch_size = prompt_ids.size(0)
     device = model.device
     prompt_len = prompt_ids.size(1)
     if attention_mask is None:
@@ -36,10 +36,10 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     past_key_values = None
     past_key_values_ref = None
     logprobs = []
+    ref_logprobs = []
     kl_terms = []
     position_id = prompt_len
 
-    # Process prompt (non-blended)
     outputs = model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
     past_key_values = outputs.past_key_values
 
@@ -48,11 +48,11 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     past_key_values_ref = outputs_ref.past_key_values
 
     if len(gen_ids_without_prompt) == 0:
-        return torch.tensor([], device=device), torch.tensor(0.0, device=device)
+        return torch.tensor([], device=device), torch.tensor([], device=device), torch.tensor(0.0, device=device)
 
     for t, next_id in enumerate(gen_ids_without_prompt):
         g = gen_gates_without_prompt[t]
-        e = torch.sqrt(1 - g).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0)) + torch.sqrt(g).unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+        e = g.unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1) + (1 - g).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0))  # Linear
         attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
         current_position_id = torch.tensor([[position_id]], device=device)
         outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
@@ -65,14 +65,17 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
             outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values_ref, use_cache=True)
         past_key_values_ref = outputs_ref.past_key_values
         log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
+        ref_logp = log_soft_ref[0, next_id]
+        ref_logprobs.append(ref_logp)
         kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
         kl_terms.append(kl)
 
         position_id += 1
 
     logprobs = torch.stack(logprobs)
+    ref_logprobs = torch.stack(ref_logprobs)
     avg_kl = torch.mean(torch.stack(kl_terms))
-    return logprobs, avg_kl
+    return logprobs, ref_logprobs, avg_kl
 
 def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, tokenizer, debug=False):
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
@@ -106,7 +109,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
         epoch_eff = 0.0
         epoch_loss = 0.0
         epoch_kl = 0.0
-        num_batches = 0
+        num_samples = 0
 
         for batch in dataloader:
             batch_size = batch['input_ids'].size(0)
@@ -131,7 +134,6 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                 group_rewards = []
 
                 for gen_idx in range(config['group_size']):
-                    # Unwrap the model to access the custom generate method
                     unwrapped_model = accelerator.unwrap_model(model)
                     with torch.no_grad():
                         gen_ids, gen_gates = unwrapped_model.generate(
@@ -164,7 +166,6 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                 rewards.extend(group_rewards)
                 prompts.extend([prompt_ids[0]] * config['group_size'])
 
-            # Aggregate for epoch
             epoch_reward_total += sum(rewards)
             epoch_struct += sum(d['struct'] for d in reward_dicts)
             epoch_gate += sum(d['gate'] for d in reward_dicts)
@@ -173,7 +174,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
             else:
                 epoch_corr += sum(d['corr'] for d in reward_dicts)
                 epoch_eff += sum(d['eff'] for d in reward_dicts)
-            num_batches += len(rewards)
+            num_samples += len(rewards)
 
             for _ in range(config['mu']):
                 batch_loss = 0.0
@@ -184,23 +185,21 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     comp = completions[i]
                     gates = gates_list[i]
 
-                    logprobs, avg_kl = compute_sequence_logprobs_and_kl(
+                    logprobs, ref_logprobs, avg_kl = compute_sequence_logprobs_and_kl(
                         model, ref_model, prompt.unsqueeze(0), comp, gates, model.training,
                         attention_mask=batch['attention_mask'][i : i + 1]
                     )
 
                     if logprobs.numel() == 0:
-                        # Handle empty generation: neutral ratio, no PPO update
-                        ratios = torch.tensor(1.0, device=model.device)
                         ppo_term = torch.tensor(0.0, device=model.device)
                     else:
-                        logprob_mean = logprobs.mean()
-                        if torch.isnan(logprob_mean):
-                            logprob_mean = torch.tensor(0.0, device=model.device)  # Fallback for any nan
-                        ratios = torch.exp(logprob_mean)
+                        logprobs = torch.nan_to_num(logprobs, nan=0.0, neginf=0.0)
+                        ref_logprobs = torch.nan_to_num(ref_logprobs, nan=0.0, neginf=0.0)
+                        log_ratios = logprobs - ref_logprobs
+                        ratios = torch.exp(log_ratios)
                         surr1 = ratios * A
                         surr2 = torch.clamp(ratios, 1 - config['epsilon'], 1 + config['epsilon']) * A
-                        ppo_term = torch.min(surr1, surr2)
+                        ppo_term = torch.mean(torch.min(surr1, surr2))
 
                     batch_kl += avg_kl.item()
 
@@ -249,12 +248,11 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                 if accelerator.is_local_main_process:
                     wandb.log(metrics | {"step": step})
 
-        # Epoch logs
-        avg_reward = epoch_reward_total / num_batches if num_batches > 0 else 0.0
-        avg_struct = epoch_struct / num_batches if num_batches > 0 else 0.0
-        avg_gate = epoch_gate / num_batches if num_batches > 0 else 0.0
-        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
-        avg_kl = epoch_kl / num_batches if num_batches > 0 else 0.0
+        avg_reward = epoch_reward_total / num_samples if num_samples > 0 else 0.0
+        avg_struct = epoch_struct / num_samples if num_samples > 0 else 0.0
+        avg_gate = epoch_gate / num_samples if num_samples > 0 else 0.0
+        avg_loss = epoch_loss / num_samples if num_samples > 0 else 0.0
+        avg_kl = epoch_kl / num_samples if num_samples > 0 else 0.0
         log_dict = {
             "epoch": epoch,
             "avg_reward": avg_reward,
@@ -264,10 +262,10 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
             "avg_kl": avg_kl
         }
         if stage == 1:
-            log_dict["avg_basic"] = epoch_basic / num_batches if num_batches > 0 else 0.0
+            log_dict["avg_basic"] = epoch_basic / num_samples if num_samples > 0 else 0.0
         else:
-            log_dict["avg_corr"] = epoch_corr / num_batches if num_batches > 0 else 0.0
-            log_dict["avg_eff"] = epoch_eff / num_batches if num_batches > 0 else 0.0
+            log_dict["avg_corr"] = epoch_corr / num_samples if num_samples > 0 else 0.0
+            log_dict["avg_eff"] = epoch_eff / num_samples if num_samples > 0 else 0.0
         if accelerator.is_local_main_process:
             wandb.log(log_dict)
 

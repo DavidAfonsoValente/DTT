@@ -1,3 +1,4 @@
+# main.py
 import yaml
 from accelerate import Accelerator
 from transformers import GPT2Tokenizer
@@ -9,9 +10,16 @@ import torch
 import wandb
 import os
 
+from datetime import timedelta
+from accelerate.state import PartialState
+
+# Only set timeout if in distributed mode
+if PartialState().distributed_type != 'NO':
+    PartialState(timeout=timedelta(seconds=3600))  # Increase timeout to 1 hour
+
 import torch._dynamo as dynamo
-dynamo.config.cache_size_limit = 64  # Increase from default 8 to handle more shape variations
-dynamo.config.suppress_errors = True  # Fallback to eager mode on compilation failures
+dynamo.config.cache_size_limit = 64
+dynamo.config.suppress_errors = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
@@ -19,7 +27,7 @@ parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--debug', action='store_true', default=False)
 args = parser.parse_args()
 
-accelerator = Accelerator(mixed_precision="no")
+accelerator = Accelerator(mixed_precision="fp16")  # Enable mixed precision for efficiency
 
 if torch.cuda.is_available():
     print(f"Using CUDA device {torch.cuda.current_device()}", flush=True)

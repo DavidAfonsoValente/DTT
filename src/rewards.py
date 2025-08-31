@@ -1,13 +1,19 @@
+# src/rewards.py
 import torch
 import re
 
-def compute_stage1_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset):
-    bot_pos = (completion_ids == bot_id).nonzero(as_tuple=True)[0]
-    bot_pos = bot_pos[0].item() if len(bot_pos) > 0 else -1
-    eot_pos = (completion_ids == eot_id).nonzero(as_tuple=True)[0]
-    eot_pos = eot_pos[0].item() if len(eot_pos) > 0 else -1
+def find_first_valid_span(completion_ids, bot_id, eot_id):
+    bot_positions = (completion_ids == bot_id).nonzero(as_tuple=True)[0]
+    eot_positions = (completion_ids == eot_id).nonzero(as_tuple=True)[0]
+    for bot_pos in bot_positions:
+        for eot_pos in eot_positions:
+            if bot_pos < eot_pos:
+                return bot_pos.item(), eot_pos.item()
+    return -1, -1
 
-    # Structure
+def compute_stage1_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset):
+    bot_pos, eot_pos = find_first_valid_span(completion_ids, bot_id, eot_id)
+
     if bot_pos == -1 and eot_pos == -1:
         r_struct = -2.0
     elif bot_pos == -1 or eot_pos == -1:
@@ -19,7 +25,6 @@ def compute_stage1_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
 
     has_span = bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos
 
-    # Basic correctness (ignore inside-span content)
     if has_span:
         pred_answer = tokenizer.decode(completion_ids[eot_pos + 1 :]).strip()
     else:
@@ -41,15 +46,17 @@ def compute_stage1_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
 
     r_basic = 1.0 if is_approx_correct else 0.0
 
-    # Gate
     if has_span:
         inner_gates = gates[bot_pos + 1 : eot_pos]
-        outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
-        outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
-        outer_gates = torch.cat([outer_gates_before, outer_gates_after])
-        g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
-        g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
-        r_gate = 1.5 * g_in - 0.5 * g_out
+        if len(inner_gates) == 0:
+            r_gate = -0.5  # Penalize empty span
+        else:
+            outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
+            outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
+            outer_gates = torch.cat([outer_gates_before, outer_gates_after])
+            g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
+            g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
+            r_gate = 1.5 * g_in - 0.5 * g_out
     else:
         r_gate = -0.5
 
@@ -62,12 +69,8 @@ def compute_stage1_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
     }
 
 def compute_stage2_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, eot_id, dataset):
-    bot_pos = (completion_ids == bot_id).nonzero(as_tuple=True)[0]
-    bot_pos = bot_pos[0].item() if len(bot_pos) > 0 else -1
-    eot_pos = (completion_ids == eot_id).nonzero(as_tuple=True)[0]
-    eot_pos = eot_pos[0].item() if len(eot_pos) > 0 else -1
+    bot_pos, eot_pos = find_first_valid_span(completion_ids, bot_id, eot_id)
 
-    # Structure (scaled)
     if bot_pos == -1 and eot_pos == -1:
         r_struct = -2.0
     elif bot_pos == -1 or eot_pos == -1:
@@ -80,7 +83,6 @@ def compute_stage2_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
 
     has_span = bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos
 
-    # Efficiency
     if has_span:
         think_len = eot_pos - bot_pos - 1
         r_eff = -0.03 * think_len - 0.01 * max(0, think_len - 10)
@@ -89,7 +91,6 @@ def compute_stage2_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
         r_eff = 0.0
         pred_answer = tokenizer.decode(completion_ids).strip()
 
-    # Correctness
     if dataset == 'gsm8k':
         try:
             pred_num = float(re.findall(r'[\d\.-]+$', pred_answer)[-1]) if re.findall(r'[\d\.-]+$', pred_answer) else 0.0
@@ -120,15 +121,17 @@ def compute_stage2_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
     else:
         r_corr = -1.5
 
-    # Gate (scaled)
     if has_span:
         inner_gates = gates[bot_pos + 1 : eot_pos]
-        outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
-        outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
-        outer_gates = torch.cat([outer_gates_before, outer_gates_after])
-        g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
-        g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
-        r_gate = (1.5 * g_in - 0.5 * g_out) * 0.8
+        if len(inner_gates) == 0:
+            r_gate = -0.5
+        else:
+            outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
+            outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
+            outer_gates = torch.cat([outer_gates_before, outer_gates_after])
+            g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
+            g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
+            r_gate = (1.5 * g_in - 0.5 * g_out) * 0.8
     else:
         r_gate = -0.5
 

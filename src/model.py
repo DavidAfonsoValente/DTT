@@ -1,3 +1,4 @@
+# src/model.py
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -44,11 +45,12 @@ class DTTModel(GPT2LMHeadModel):
         if training:
             u = torch.rand_like(logit)
             gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
-            return F.sigmoid((logit + gumbel_noise) / temperature)
+            g_soft = F.sigmoid((logit + gumbel_noise) / temperature)
+            g_hard = (g_soft > 0.5).float()
+            return g_hard - g_soft.detach() + g_soft  # Straight-through estimator
         else:
             return F.sigmoid(logit)
 
-    #@torch._dynamo.disable
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -61,16 +63,14 @@ class DTTModel(GPT2LMHeadModel):
         output_hidden_states: Optional[bool] = None,
         **kwargs
     ):
-        # Force output_hidden_states to True and use_cache to True
         output_hidden_states = True
         use_cache = True
 
-        # Suppress attentions if requested
         if 'output_attentions' in kwargs:
             kwargs['output_attentions'] = False
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            raise ValueError("Cannot specify both input_ids and inputs_embeds")
         elif input_ids is not None:
             if input_ids.dim() == 1:
                 input_ids = input_ids.unsqueeze(0)
@@ -94,7 +94,7 @@ class DTTModel(GPT2LMHeadModel):
             batch_size, seq_len, _ = inputs_embeds.shape
             device = inputs_embeds.device
         else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+            raise ValueError("Specify either input_ids or inputs_embeds")
 
         if seq_len == 0:
             return CausalLMOutputWithGates(
@@ -132,16 +132,13 @@ class DTTModel(GPT2LMHeadModel):
                 e = inputs_embeds[:, t:t+1, :]
 
             if t > 0:
-                sqrt_g = torch.sqrt(g_prev).unsqueeze(-1)
-                sqrt_1_g = torch.sqrt(1 - g_prev).unsqueeze(-1)
-                e = sqrt_g * h_prev.unsqueeze(1) + sqrt_1_g * e
+                e = g_prev.unsqueeze(-1) * h_prev.unsqueeze(1) + (1 - g_prev).unsqueeze(-1) * e  # Linear blend, no sqrt
 
-            # FIX: Slice attention_mask to current length (t+1) to match effective k_len
             current_attention_mask = attention_mask[:, :(t + 1)] if attention_mask is not None else None
 
             if self.debug:
                 past_len = past_key_values[0][0].size(2) if past_key_values is not None else 0
-                expected_k_len = past_len + 1  # q_len=1
+                expected_k_len = past_len + 1
                 mask_shape = current_attention_mask.shape if current_attention_mask is not None else "None"
                 print(f"[DEBUG] Before transformer: inputs_embeds.shape={e.shape}, position_ids={current_position_id.shape}, "
                       f"attention_mask.shape={mask_shape}, past_key_values exists={past_key_values is not None}, "
@@ -172,7 +169,6 @@ class DTTModel(GPT2LMHeadModel):
         gates = torch.cat(gates, dim=1)
 
         if output_hidden_states:
-            # Post-process hidden states to concatenate along seq_len dim
             processed_hidden_states = []
             for layer_hidden in zip(*all_hidden_states):
                 processed_hidden_states.append(torch.cat(layer_hidden, dim=1))
@@ -192,7 +188,6 @@ class DTTModel(GPT2LMHeadModel):
             past_key_values=past_key_values,
         )
 
-    #@torch._dynamo.disable
     def generate(self, input_ids, max_length=256, do_sample=True, temperature=0.8, top_p=0.95, return_gates=False, return_logprobs=False, training=False, attention_mask: Optional[torch.Tensor] = None):
         if self.debug:
             print(f"[DEBUG] Starting generation with input_ids shape: {input_ids.shape}, do_sample={do_sample}, training={training}")
@@ -219,14 +214,13 @@ class DTTModel(GPT2LMHeadModel):
             if step == 0:
                 if self.debug:
                     print(f"[DEBUG] Processing prompt: attention_mask.shape={attention_mask.shape}")
-                outputs = self(input_ids=input_ids, attention_mask=attention_mask)  # hidden_states forced
+                outputs = self(input_ids=input_ids, attention_mask=attention_mask)
                 last_idx = effective_len - 1
                 hidden = outputs.hidden_states[-1][:, last_idx, :]
                 gate_logit = self.gate_network(hidden).squeeze(-1)
                 g_prev = self.gumbel_sigmoid(gate_logit, self.temperature, training=training)
                 gates_list.append(g_prev.unsqueeze(1))
                 next_token_logits = outputs.logits[:, last_idx, :] / temperature
-                # Trim past_key_values, attention_mask, position_ids, generated_ids
                 past_key_values = tuple(
                     (
                         layer_past[0][:, :, :effective_len, :],
@@ -237,7 +231,7 @@ class DTTModel(GPT2LMHeadModel):
                 position_ids = position_ids[:, :effective_len]
                 generated_ids = generated_ids[:, :effective_len]
             else:
-                e = torch.sqrt(1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(1)) + torch.sqrt(g_prev).unsqueeze(-1) * h_prev.unsqueeze(1)
+                e = g_prev.unsqueeze(-1) * h_prev.unsqueeze(1) + (1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(1))  # Linear blend
                 current_position_id = (position_ids[:, -1] + 1).unsqueeze(1)
                 attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=self.device)], dim=1)
                 if self.debug:
@@ -283,7 +277,7 @@ class DTTModel(GPT2LMHeadModel):
             position_ids = torch.cat([position_ids, (position_ids[:, -1] + 1).unsqueeze(1)], dim=1)
             h_prev = hidden
 
-            if step > 10 and torch.all(generated_ids[:, -10:] == generated_ids[:, -1]):
+            if step > 10 and torch.all(generated_ids[:, -10:] == generated_ids[:, -1].unsqueeze(1).expand(-1, 10)):
                 break
 
         if self.debug:

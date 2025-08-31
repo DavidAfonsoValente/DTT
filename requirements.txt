@@ -1,7 +1,8 @@
-torch==2.8.0
+# requirements.txt
+torch==2.3.1
 transformers==4.45.2
-accelerate==1.10.1
-datasets==4.0.0
-wandb==0.21.1
-tqdm==4.67.1
+accelerate==0.34.0  # Updated to a stable recent version
+datasets==2.20.0   # Updated for compatibility
+wandb==0.17.0      # Updated
+tqdm==4.66.5
 pyyaml==6.0.2

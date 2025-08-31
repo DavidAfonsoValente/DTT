@@ -1,3 +1,4 @@
+# src/utils.py
 from torch.utils.data import DataLoader
 import torch
 from src.rewards import compute_stage1_reward, compute_stage2_reward
@@ -49,13 +50,12 @@ def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
                     reward_dict = compute_stage2_reward(
                         gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, model.bot_id, model.eot_id, config['dataset']
                     )
-                    is_correct = reward_dict['corr'] > 1.0  # Exact match
+                    is_correct = reward_dict['corr'] > 1.0
 
                 total_reward += reward_dict['total']
-                if reward_dict['struct'] == 2.0:  # Proper [bot]...[eot]
+                if reward_dict['struct'] == 2.0 or (stage == 2 and reward_dict['struct'] == 1.2):  # Adjusted for 0.6 scale
                     num_struct_correct += 1
-                    bot_pos = (gen_ids_without_prompt == model.bot_id).nonzero(as_tuple=True)[0][0].item()
-                    eot_pos = (gen_ids_without_prompt == model.eot_id).nonzero(as_tuple=True)[0][0].item()
+                    bot_pos, eot_pos = find_first_valid_span(gen_ids_without_prompt, model.bot_id, model.eot_id)
                     inner_gates = gen_gates_without_prompt[bot_pos + 1 : eot_pos]
                     outer_gates_before = gen_gates_without_prompt[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gen_gates_without_prompt.device)
                     outer_gates_after = gen_gates_without_prompt[eot_pos:] if eot_pos < len(gen_gates_without_prompt) else torch.tensor([], device=gen_gates_without_prompt.device)
@@ -74,7 +74,7 @@ def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
     structure_rate = num_struct_correct / num_samples if num_samples > 0 else 0.0
     mean_inner_gate = total_inner_gate / num_spans if num_spans > 0 else 0.0
     mean_outer_gate = total_outer_gate / num_spans if num_spans > 0 else 0.0
-    gate_ratio = mean_inner_gate / (mean_outer_gate + 0.1) if mean_outer_gate > 0 else 0.0
+    gate_ratio = mean_inner_gate / (mean_outer_gate + 0.1) if num_spans > 0 else 0.0
     accuracy = num_correct / num_samples if num_samples > 0 else 0.0
     avg_think_len = total_think_len / num_spans if num_spans > 0 else 0.0
     avg_reward = total_reward / num_samples if num_samples > 0 else 0.0
