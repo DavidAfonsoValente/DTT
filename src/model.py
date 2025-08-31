@@ -48,7 +48,7 @@ class DTTModel(GPT2LMHeadModel):
         else:
             return F.sigmoid(logit)
 
-    @torch._dynamo.disable
+    #@torch._dynamo.disable
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -192,7 +192,7 @@ class DTTModel(GPT2LMHeadModel):
             past_key_values=past_key_values,
         )
 
-    @torch._dynamo.disable
+    #@torch._dynamo.disable
     def generate(self, input_ids, max_length=256, do_sample=True, temperature=0.8, top_p=0.95, return_gates=False, return_logprobs=False, training=False, attention_mask: Optional[torch.Tensor] = None):
         if self.debug:
             print(f"[DEBUG] Starting generation with input_ids shape: {input_ids.shape}, do_sample={do_sample}, training={training}")
