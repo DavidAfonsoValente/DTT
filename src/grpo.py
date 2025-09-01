@@ -112,7 +112,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
         num_samples = 0
 
         for batch in dataloader:
-            print(f"[DEBUG] Processing new batch of size {batch['input_ids'].size(0)}") if debug else None
+            print(f"[DEBUG] Processing new batch of size {batch['input_ids'].size(0)}")
             batch_size = batch['input_ids'].size(0)
             completions = []
             gates_list = []
