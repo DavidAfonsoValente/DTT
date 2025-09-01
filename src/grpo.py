@@ -10,7 +10,7 @@ import math
 from typing import Optional
 import torch.nn.functional as F
 import os
-import sys  # Added for stdout flushing
+import sys  # For stdout flushing
 
 torch._dynamo.config.suppress_errors = True
 
@@ -219,6 +219,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
             step += 1
             pbar.update(1)
             pbar.refresh()  # Force refresh to update the bar visually
+            sys.stdout.flush()  # Flush stdout to ensure bar updates immediately
 
             if step % 50 == 0:
                 tau = update_temperature(model, step, stage, transition_step)
