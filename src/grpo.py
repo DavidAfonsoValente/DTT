@@ -1,4 +1,3 @@
-# src/grpo.py
 from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -11,6 +10,7 @@ import math
 from typing import Optional
 import torch.nn.functional as F
 import os
+import sys  # Added for stdout flushing
 
 torch._dynamo.config.suppress_errors = True
 
@@ -97,7 +97,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
     transition_history = {'structure_rate': [], 'gate_ratio': [], 'basic_accuracy': []}
 
     max_steps = config['epochs'] * len(dataloader)
-    pbar = tqdm(total=max_steps, desc="Training", disable=not accelerator.is_local_main_process)
+    pbar = tqdm(total=max_steps, desc="Training", disable=not accelerator.is_local_main_process, file=sys.stdout)  # Added file=sys.stdout for flushing
 
     for epoch in range(config['epochs']):
         model.train()
@@ -142,7 +142,6 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                         )
                     gen_ids_without_prompt = gen_ids[0, effective_len:]
                     gen_gates_without_prompt = gen_gates[0, :]
-
                     if stage == 1:
                         reward_dict = compute_stage1_reward(
                             gen_ids_without_prompt, gen_gates_without_prompt, tokenizer, answer_gt, unwrapped_model.bot_id, unwrapped_model.eot_id, config['dataset']
@@ -219,6 +218,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
 
             step += 1
             pbar.update(1)
+            pbar.refresh()  # Force refresh to update the bar visually
 
             if step % 50 == 0:
                 tau = update_temperature(model, step, stage, transition_step)
