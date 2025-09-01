@@ -97,7 +97,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
     transition_history = {'structure_rate': [], 'gate_ratio': [], 'basic_accuracy': []}
 
     max_steps = config['epochs'] * len(dataloader)
-    pbar = tqdm(total=max_steps, desc="Training", disable=not accelerator.is_local_main_process, file=sys.stdout)  # Added file=sys.stdout for flushing
+    pbar = tqdm(total=max_steps, desc="Training", disable=not accelerator.is_local_main_process, file=sys.stdout, mininterval=0.1)  # Lower mininterval for more frequent updates
 
     for epoch in range(config['epochs']):
         model.train()
@@ -112,7 +112,6 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
         num_samples = 0
 
         for batch in dataloader:
-            print(f"[DEBUG] Processing new batch of size {batch['input_ids'].size(0)}")
             batch_size = batch['input_ids'].size(0)
             completions = []
             gates_list = []
