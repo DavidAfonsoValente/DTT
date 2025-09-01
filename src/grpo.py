@@ -112,7 +112,6 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
         num_samples = 0
 
         for batch in dataloader:
-            print(f"[DEBUG] Processing batch of size {batch['input_ids'].size(0)}")
             batch_size = batch['input_ids'].size(0)
             completions = []
             gates_list = []
@@ -122,7 +121,6 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
             prompts = []
 
             for prompt_idx in range(batch_size):
-                print(f"[DEBUG] Starting generations for prompt {prompt_idx}")
                 prompt_mask_row = batch['attention_mask'][prompt_idx]
                 effective_len = prompt_mask_row.sum().item()
                 if effective_len == 0:
