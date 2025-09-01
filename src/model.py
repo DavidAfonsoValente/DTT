@@ -189,7 +189,6 @@ class DTTModel(GPT2LMHeadModel):
         )
 
     def generate(self, input_ids, max_length=256, do_sample=True, temperature=0.8, top_p=0.95, return_gates=False, return_logprobs=False, training=False, attention_mask: Optional[torch.Tensor] = None):
-        print(f"[DEBUG] Starting generation with input_ids shape: {input_ids.shape}, do_sample={do_sample}, training={training}")
         if self.debug:
             print(f"[DEBUG] Starting generation with input_ids shape: {input_ids.shape}, do_sample={do_sample}, training={training}")
         input_ids = input_ids.to(self.device)
