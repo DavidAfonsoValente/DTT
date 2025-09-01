@@ -9,17 +9,15 @@ import argparse
 import torch
 import wandb
 import os
+os.environ["TORCH_COMPILE_DISABLE"] = "1"  # Fully disables compile
+os.environ["TORCHINDUCTOR_MAX_AUTOTUNE"] = "0"  # Fallback if partially fails
 
 from datetime import timedelta
 from accelerate.state import PartialState
 
-# Only set timeout if in distributed mode
-if PartialState().distributed_type != 'NO':
-    PartialState(timeout=timedelta(seconds=3600))  # Increase timeout to 1 hour
-
-import torch._dynamo as dynamo
-dynamo.config.cache_size_limit = 64
-dynamo.config.suppress_errors = True
+#import torch._dynamo as dynamo
+#dynamo.config.cache_size_limit = 64
+#dynamo.config.suppress_errors = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
