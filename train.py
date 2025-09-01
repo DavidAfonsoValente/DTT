@@ -25,7 +25,7 @@ parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--debug', action='store_true', default=False)
 args = parser.parse_args()
 
-accelerator = Accelerator(mixed_precision="fp16")  # Enable mixed precision for efficiency
+accelerator = Accelerator(mixed_precision="no")  # Enable mixed precision for efficiency
 
 if torch.cuda.is_available():
     print(f"Using CUDA device {torch.cuda.current_device()}", flush=True)
