@@ -9,14 +9,15 @@ import argparse
 import torch
 import wandb
 import os
+os.environ["TORCH_COMPILE_DISABLE"] = "1"  # Fully disables compile
+os.environ["TORCHINDUCTOR_MAX_AUTOTUNE"] = "0"  # Fallback if partially fails
 
 from datetime import timedelta
 from accelerate.state import PartialState
 
-
-import torch._dynamo as dynamo
-dynamo.config.cache_size_limit = 64
-dynamo.config.suppress_errors = True
+#import torch._dynamo as dynamo
+#dynamo.config.cache_size_limit = 64
+#dynamo.config.suppress_errors = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
@@ -24,7 +25,7 @@ parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--debug', action='store_true', default=False)
 args = parser.parse_args()
 
-accelerator = Accelerator(mixed_precision="fp16")  # Enable mixed precision for efficiency
+accelerator = Accelerator(mixed_precision="no")  # Enable mixed precision for efficiency
 
 if torch.cuda.is_available():
     print(f"Using CUDA device {torch.cuda.current_device()}", flush=True)
