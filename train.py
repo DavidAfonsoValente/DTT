@@ -52,7 +52,7 @@ ref_model.load_state_dict(model.state_dict())
 collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
 
 os.makedirs('checkpoints', exist_ok=True)
-
+model, ref_model, dataset = accelerator.prepare(model, ref_model, dataset)
 train_grpo(model, ref_model, dataset, config, accelerator, collate, tokenizer, debug=args.debug)
 
 if accelerator.is_local_main_process:

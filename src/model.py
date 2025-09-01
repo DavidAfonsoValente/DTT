@@ -211,6 +211,7 @@ class DTTModel(GPT2LMHeadModel):
         position_ids = torch.arange(0, prompt_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(batch_size, -1)
 
         for step in range(max_length - effective_len):
+            print(f"[DEBUG] Generate step {step}")
             if step == 0:
                 if self.debug:
                     print(f"[DEBUG] Processing prompt: attention_mask.shape={attention_mask.shape}")
