@@ -1,5 +1,5 @@
 dataset: gsm8k
-batch_size: 8                    # increased from 1 for better effective batch
+batch_size: 4                    # increased from 1 for better effective batch
 valid_batch_size: 8             # kept same
 epochs: 20                      # kept same
 lr: 1.0e-5                      # kept same

@@ -51,16 +51,17 @@ model = DTTModel.from_pretrained('gpt2', attn_implementation="eager", ignore_mis
 ref_model = DTTModel.from_pretrained('gpt2', attn_implementation="eager", ignore_mismatched_sizes=True)
 ref_model.load_state_dict(model.state_dict())
 
-# Compile the transformer with dynamic=True to handle varying sequence lengths without excessive recompilation
-model.transformer = torch.compile(model.transformer, dynamic=True)
-
-# Also compile ref_model's transformer
-ref_model.transformer = torch.compile(ref_model.transformer, dynamic=True)
-
 collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
 
 os.makedirs('checkpoints', exist_ok=True)
 model, ref_model, dataset = accelerator.prepare(model, ref_model, dataset)
+
+# Compile after prepare to avoid DDP + Dynamo compatibility issues
+unwrapped_model = accelerator.unwrap_model(model)
+unwrapped_model.transformer = torch.compile(unwrapped_model.transformer, dynamic=True)
+unwrapped_ref = accelerator.unwrap_model(ref_model)
+unwrapped_ref.transformer = torch.compile(unwrapped_ref.transformer, dynamic=True)
+
 train_grpo(model, ref_model, dataset, config, accelerator, collate, tokenizer, debug=args.debug)
 
 if accelerator.is_local_main_process:
