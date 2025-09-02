@@ -16,8 +16,11 @@ import sys  # For stdout flushing
 
 torch._dynamo.config.suppress_errors = True
 
-def get_beta_kl(stage):
-    return 0.02 if stage == 1 else 0.01
+def get_beta_kl(stage, config):
+    if stage == 1:
+        return config.get('beta_kl_stage1', 0.02)
+    else:
+        return config.get('beta_kl_stage2', 0.01)
 
 def update_temperature(model, step, stage, transition_step=0):
     if stage == 1:
@@ -99,6 +102,16 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     return logprobs, ref_logprobs, avg_kl
 
 def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, tokenizer, debug=False):
+    # Add missing config defaults
+    config.setdefault('beta_kl_stage1', 0.02)
+    config.setdefault('beta_kl_stage2', 0.01)
+    config.setdefault('grad_clip', 1.0)
+    config.setdefault('refresh_ref_every_steps', 1000)
+    config.setdefault('eval_every_steps', 500)
+    config.setdefault('transition_check_every_steps', 200)
+    config.setdefault('temperature_log_every_steps', 50)
+    config.setdefault('save_every_steps', 1000)
+    
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
     optimizer = AdamW(model.parameters(), lr=config['lr'])
 
@@ -118,7 +131,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
     transition_history = {'structure_rate': [], 'gate_ratio': [], 'basic_accuracy': []}
 
     max_steps = config['epochs'] * len(dataloader)
-    pbar = tqdm(total=max_steps, desc="Training", disable=not accelerator.is_local_main_process, file=sys.stdout, mininterval=0.1)  # Lower mininterval for more frequent updates
+    pbar = tqdm(total=max_steps, desc="Training", disable=not accelerator.is_local_main_process, file=sys.stdout, mininterval=0.1)
 
     for epoch in range(config['epochs']):
         model.train()
@@ -140,7 +153,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
             reward_dicts = []
             advantages = []
             prompts = []
-            masks = []  # Added to fix mask indexing
+            masks = []
 
             for prompt_idx in range(batch_size):
                 prompt_mask_row = batch['attention_mask'][prompt_idx]
@@ -150,7 +163,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                         print(f"[DEBUG] Skipping empty prompt at batch index {prompt_idx}")
                     continue
                 prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
-                prompt_mask = batch['attention_mask'][prompt_idx : prompt_idx + 1].contiguous()  # Contiguous
+                prompt_mask = batch['attention_mask'][prompt_idx : prompt_idx + 1].contiguous()
                 answer_gt = batch['answer_gt'][prompt_idx]
                 group_completions = []
                 group_gates = []
@@ -187,7 +200,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                 advantages.extend(group_advantages)
                 rewards.extend(group_rewards)
                 prompts.extend([prompt_ids[0]] * config['group_size'])
-                masks.extend([prompt_mask] * config['group_size'])  # Extend masks for each group
+                masks.extend([prompt_mask] * config['group_size'])
 
             epoch_reward_total += sum(rewards)
             epoch_struct += sum(d['struct'] for d in reward_dicts)
@@ -207,7 +220,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     prompt = prompts[i]
                     comp = completions[i]
                     gates = gates_list[i]
-                    mask = masks[i]  # Use per-completion mask
+                    mask = masks[i]
 
                     logprobs, ref_logprobs, avg_kl = compute_sequence_logprobs_and_kl(
                         model, ref_model, prompt.unsqueeze(0), comp, gates, model.training,
@@ -227,14 +240,14 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
 
                     batch_kl += avg_kl.item()
 
-                    beta_kl = get_beta_kl(stage)
+                    beta_kl = get_beta_kl(stage, config)
                     loss_i = -ppo_term + beta_kl * avg_kl
                     batch_loss += loss_i
 
                 if len(completions) > 0:
                     batch_loss /= len(completions)
                     accelerator.backward(batch_loss)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
                     optimizer.step()
                     optimizer.zero_grad()
 
@@ -243,15 +256,17 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
 
             step += 1
             pbar.update(1)
-            pbar.refresh()  # Force refresh to update the bar visually
-            sys.stdout.flush()  # Flush stdout to ensure bar updates immediately
+            pbar.refresh()
+            sys.stdout.flush()
 
-            if step % 50 == 0:
+            # Temperature logging - now uses config
+            if step % config['temperature_log_every_steps'] == 0:
                 tau = update_temperature(model, step, stage, transition_step)
                 if accelerator.is_local_main_process:
                     wandb.log({"temperature": tau, "step": step})
 
-            if step % 200 == 0 and stage == 1:
+            # Transition checking - now uses config
+            if step % config['transition_check_every_steps'] == 0 and stage == 1:
                 metrics = validate_grpo(model, config, accelerator, tokenizer, stage, debug=debug)
                 transition_history['structure_rate'].append(metrics['structure_rate'])
                 transition_history['gate_ratio'].append(metrics['gate_ratio'])
@@ -264,12 +279,17 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     if accelerator.is_local_main_process:
                         wandb.log({"stage": stage, "transition_step": step})
 
-            if step % 1000 == 0:
+            # Reference model refresh - now uses config
+            if step % config['refresh_ref_every_steps'] == 0:
                 ref_model.load_state_dict(model.state_dict())
+                
+            # Checkpointing - now uses config
+            if step % config['save_every_steps'] == 0:
                 if accelerator.is_main_process:
                     torch.save(model.state_dict(), f"checkpoints/model_step_{step}.pth")
 
-            if step % 500 == 0:
+            # Validation - now uses config
+            if step % config['eval_every_steps'] == 0:
                 metrics = validate_grpo(model, config, accelerator, tokenizer, stage, debug=debug)
                 if accelerator.is_local_main_process:
                     wandb.log(metrics | {"step": step})

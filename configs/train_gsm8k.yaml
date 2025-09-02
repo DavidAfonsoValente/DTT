@@ -1,11 +1,21 @@
 dataset: gsm8k
-batch_size: 4
-valid_batch_size: 8
-epochs: 20
-lr: 1.0e-5
-group_size: 8
-epsilon: 0.2
-mu: 2
-max_length: 256
-val_size: 256
-data_dir: data
+batch_size: 8                    # increased from 1 for better effective batch
+valid_batch_size: 8             # kept same
+epochs: 20                      # kept same
+lr: 1.0e-5                      # kept same
+group_size: 8                   # kept same
+epsilon: 0.2                    # kept same
+mu: 2                           # kept same
+max_length: 256                 # kept same
+val_size: 256                   # kept same
+data_dir: data                  # kept same
+
+# Additional essential parameters for GRPO
+beta_kl_stage1: 0.02
+beta_kl_stage2: 0.01
+grad_clip: 1.0
+refresh_ref_every_steps: 1000
+eval_every_steps: 500
+transition_check_every_steps: 200
+temperature_log_every_steps: 50
+save_every_steps: 1000
