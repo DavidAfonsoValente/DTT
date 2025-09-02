@@ -45,32 +45,51 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
 
     with torch.no_grad():
         outputs_ref = ref_model(input_ids=prompt_ids.to(device), attention_mask=attention_mask)
-    past_key_values_ref = outputs_ref.past_key_values
+        past_key_values_ref = outputs_ref.past_key_values
 
-    if len(gen_ids_without_prompt) == 0:
+    gen_len = len(gen_ids_without_prompt)
+    if gen_len == 0:
         return torch.tensor([], device=device), torch.tensor([], device=device), torch.tensor(0.0, device=device)
 
-    for t, next_id in enumerate(gen_ids_without_prompt):
-        g = gen_gates_without_prompt[t]
-        e = g.unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1) + (1 - g).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0))  # Linear
-        attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
-        current_position_id = torch.tensor([[position_id]], device=device)
-        outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
-        past_key_values = outputs.past_key_values
-        log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
-        logp = log_soft[0, next_id]
-        logprobs.append(logp)
+    # Compute first logp and kl (from prompt logits for the first generated token)
+    log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
+    first_id = gen_ids_without_prompt[0].item()  # Assuming scalar tensors or single values
+    logp = log_soft[0, first_id]
+    logprobs.append(logp)
 
-        with torch.no_grad():
-            outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values_ref, use_cache=True)
-        past_key_values_ref = outputs_ref.past_key_values
+    with torch.no_grad():
         log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
-        ref_logp = log_soft_ref[0, next_id]
-        ref_logprobs.append(ref_logp)
-        kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
-        kl_terms.append(kl)
+    ref_logp = log_soft_ref[0, first_id]
+    ref_logprobs.append(ref_logp)
 
-        position_id += 1
+    kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
+    kl_terms.append(kl)
+
+    # Now loop for subsequent tokens if any
+    if gen_len > 1:
+        for t in range(gen_len - 1):
+            g_t = gen_gates_without_prompt[t]
+            next_id = gen_ids_without_prompt[t]
+            e = g_t.unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1) + (1 - g_t).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0))
+            attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
+            current_position_id = torch.tensor([[position_id]], device=device)
+            outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
+            pred_id = gen_ids_without_prompt[t + 1].item()
+            logp = log_soft[0, pred_id]
+            logprobs.append(logp)
+
+            with torch.no_grad():
+                outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values_ref, use_cache=True)
+                past_key_values_ref = outputs_ref.past_key_values
+                log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
+            ref_logp = log_soft_ref[0, pred_id]
+            ref_logprobs.append(ref_logp)
+            kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
+            kl_terms.append(kl)
+
+            position_id += 1
 
     logprobs = torch.stack(logprobs)
     ref_logprobs = torch.stack(ref_logprobs)
