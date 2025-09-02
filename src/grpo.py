@@ -1,3 +1,5 @@
+# src/grpo.py (previously inline in snippet, now as separate file for clarity)
+
 from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -54,12 +56,12 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     # Compute first logp and kl (from prompt logits for the first generated token)
     log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
     first_id = gen_ids_without_prompt[0].item()  # Assuming scalar tensors or single values
-    logp = log_soft[0, first_id]
+    logp = log_soft[:, first_id].mean()  # Use mean for robustness, though batch=1
     logprobs.append(logp)
 
     with torch.no_grad():
         log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
-    ref_logp = log_soft_ref[0, first_id]
+    ref_logp = log_soft_ref[:, first_id].mean()
     ref_logprobs.append(ref_logp)
 
     kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
@@ -77,14 +79,14 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
             past_key_values = outputs.past_key_values
             log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
             pred_id = gen_ids_without_prompt[t + 1].item()
-            logp = log_soft[0, pred_id]
+            logp = log_soft[:, pred_id].mean()
             logprobs.append(logp)
 
             with torch.no_grad():
                 outputs_ref = ref_model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values_ref, use_cache=True)
                 past_key_values_ref = outputs_ref.past_key_values
                 log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
-            ref_logp = log_soft_ref[0, pred_id]
+            ref_logp = log_soft_ref[:, pred_id].mean()
             ref_logprobs.append(ref_logp)
             kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
             kl_terms.append(kl)
@@ -138,6 +140,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
             reward_dicts = []
             advantages = []
             prompts = []
+            masks = []  # Added to fix mask indexing
 
             for prompt_idx in range(batch_size):
                 prompt_mask_row = batch['attention_mask'][prompt_idx]
@@ -147,6 +150,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                         print(f"[DEBUG] Skipping empty prompt at batch index {prompt_idx}")
                     continue
                 prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
+                prompt_mask = batch['attention_mask'][prompt_idx : prompt_idx + 1]  # Added per-prompt mask
                 answer_gt = batch['answer_gt'][prompt_idx]
                 group_completions = []
                 group_gates = []
@@ -157,7 +161,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     with torch.no_grad():
                         gen_ids, gen_gates = unwrapped_model.generate(
                             prompt_ids, max_length=config['max_length'], do_sample=True, top_p=0.9, temperature=0.8, return_gates=True, training=True,
-                            attention_mask=batch['attention_mask'][prompt_idx : prompt_idx + 1]
+                            attention_mask=prompt_mask
                         )
                     gen_ids_without_prompt = gen_ids[0, effective_len:]
                     gen_gates_without_prompt = gen_gates[0, :]
@@ -183,6 +187,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                 advantages.extend(group_advantages)
                 rewards.extend(group_rewards)
                 prompts.extend([prompt_ids[0]] * config['group_size'])
+                masks.extend([prompt_mask] * config['group_size'])  # Extend masks for each group
 
             epoch_reward_total += sum(rewards)
             epoch_struct += sum(d['struct'] for d in reward_dicts)
@@ -202,10 +207,11 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                     prompt = prompts[i]
                     comp = completions[i]
                     gates = gates_list[i]
+                    mask = masks[i]  # Use per-completion mask
 
                     logprobs, ref_logprobs, avg_kl = compute_sequence_logprobs_and_kl(
                         model, ref_model, prompt.unsqueeze(0), comp, gates, model.training,
-                        attention_mask=batch['attention_mask'][i : i + 1]
+                        attention_mask=mask
                     )
 
                     if logprobs.numel() == 0:

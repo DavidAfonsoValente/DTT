@@ -21,9 +21,15 @@ def compute_stage1_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
     elif eot_pos <= bot_pos:
         r_struct = -1.0
     else:
-        r_struct = 2.0
+        think_len = eot_pos - bot_pos - 1
+        if think_len <= 0:
+            r_struct = -1.0  # Downgrade for empty or invalid span
+        else:
+            r_struct = 2.0
 
-    has_span = bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos
+    r_struct = max(-1.5, min(1.5, r_struct))  # Clip per component
+
+    has_span = bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos and think_len > 0  # Updated condition
 
     if has_span:
         pred_answer = tokenizer.decode(completion_ids[eot_pos + 1 :]).strip()
@@ -45,20 +51,20 @@ def compute_stage1_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
         is_approx_correct = False
 
     r_basic = 1.0 if is_approx_correct else 0.0
+    r_basic = max(-1.5, min(1.5, r_basic))
 
     if has_span:
         inner_gates = gates[bot_pos + 1 : eot_pos]
-        if len(inner_gates) == 0:
-            r_gate = -0.5  # Penalize empty span
-        else:
-            outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
-            outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
-            outer_gates = torch.cat([outer_gates_before, outer_gates_after])
-            g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
-            g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
-            r_gate = 1.5 * g_in - 0.5 * g_out
+        outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
+        outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
+        outer_gates = torch.cat([outer_gates_before, outer_gates_after])
+        g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
+        g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
+        r_gate = 1.5 * g_in - 0.5 * g_out
     else:
         r_gate = -0.5
+
+    r_gate = max(-1.5, min(1.5, r_gate))
 
     total = r_struct + r_gate + 0.3 * r_basic
     return {
@@ -78,14 +84,20 @@ def compute_stage2_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
     elif eot_pos <= bot_pos:
         r_struct = -1.0
     else:
-        r_struct = 2.0
+        think_len = eot_pos - bot_pos - 1
+        if think_len <= 0:
+            r_struct = -1.0  # Downgrade for empty or invalid span
+        else:
+            r_struct = 2.0
     r_struct *= 0.6
+    r_struct = max(-1.5, min(1.5, r_struct))
 
-    has_span = bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos
+    has_span = bot_pos != -1 and eot_pos != -1 and bot_pos < eot_pos and think_len > 0  # Updated condition
 
     if has_span:
         think_len = eot_pos - bot_pos - 1
         r_eff = -0.03 * think_len - 0.01 * max(0, think_len - 10)
+        r_eff = max(-1.5, min(1.5, r_eff))
         pred_answer = tokenizer.decode(completion_ids[eot_pos + 1 :]).strip()
     else:
         r_eff = 0.0
@@ -121,19 +133,20 @@ def compute_stage2_reward(completion_ids, gates, tokenizer, answer_gt, bot_id, e
     else:
         r_corr = -1.5
 
+    r_corr = max(-1.5, min(1.5, r_corr))
+
     if has_span:
         inner_gates = gates[bot_pos + 1 : eot_pos]
-        if len(inner_gates) == 0:
-            r_gate = -0.5
-        else:
-            outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
-            outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
-            outer_gates = torch.cat([outer_gates_before, outer_gates_after])
-            g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
-            g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
-            r_gate = (1.5 * g_in - 0.5 * g_out) * 0.8
+        outer_gates_before = gates[:bot_pos] if bot_pos > 0 else torch.tensor([], device=gates.device)
+        outer_gates_after = gates[eot_pos:] if eot_pos < len(gates) else torch.tensor([], device=gates.device)
+        outer_gates = torch.cat([outer_gates_before, outer_gates_after])
+        g_in = inner_gates.mean().item() if len(inner_gates) > 0 else 0.0
+        g_out = outer_gates.mean().item() if len(outer_gates) > 0 else 0.0
+        r_gate = (1.5 * g_in - 0.5 * g_out) * 0.8
     else:
         r_gate = -0.5
+
+    r_gate = max(-1.5, min(1.5, r_gate))
 
     total = r_struct + r_corr + r_eff + r_gate
     return {

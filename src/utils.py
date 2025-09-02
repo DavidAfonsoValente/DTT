@@ -4,6 +4,7 @@ import torch
 from src.rewards import compute_stage1_reward, compute_stage2_reward
 from src.datasets import DTTDataset, collate_fn
 from tqdm import tqdm
+from src.rewards import find_first_valid_span  # Added import
 
 def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
     val_dataset = DTTDataset(config['dataset'], tokenizer, split='valid', data_dir=config.get('data_dir', 'data'))
