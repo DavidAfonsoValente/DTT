@@ -1,9 +1,9 @@
 dataset: gsm8k
-batch_size: 16
+batch_size: 1
 valid_batch_size: 8
 epochs: 20
 lr: 1.0e-5
-group_size: 8
+group_size: 1
 epsilon: 0.2
 mu: 2
 max_length: 256
