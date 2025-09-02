@@ -1,4 +1,5 @@
-# main.py
+# main.py (updated to compile the transformer with dynamic=True to handle varying sequence lengths)
+
 import yaml
 from accelerate import Accelerator
 from transformers import GPT2Tokenizer
@@ -44,8 +45,15 @@ tokenizer.add_special_tokens({
 })
 dataset = DTTDataset(args.dataset, tokenizer, data_dir=config.get('data_dir', 'data'))
 model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
+
+# Compile the transformer with dynamic=True to handle varying sequence lengths without excessive recompilation
+model.transformer = torch.compile(model.transformer, dynamic=True)
+
 ref_model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
 ref_model.load_state_dict(model.state_dict())
+
+# Also compile ref_model's transformer
+ref_model.transformer = torch.compile(ref_model.transformer, dynamic=True)
 
 collate = lambda batch: collate_fn(batch, tokenizer.pad_token_id)
 
