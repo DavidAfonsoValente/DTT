@@ -23,6 +23,9 @@ dynamo.config.suppress_errors = True
 from datetime import timedelta
 from accelerate.state import PartialState
 
+# Set float32 matmul precision to high to enable TensorFloat32
+torch.set_float32_matmul_precision('high')
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
 parser.add_argument('--config', type=str, required=True)
