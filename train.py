@@ -47,8 +47,8 @@ tokenizer.add_special_tokens({
     'pad_token': '<pad>'
 })
 dataset = DTTDataset(args.dataset, tokenizer, data_dir=config.get('data_dir', 'data'))
-model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
-ref_model = DTTModel.from_pretrained('gpt2', ignore_mismatched_sizes=True)
+model = DTTModel.from_pretrained('gpt2', attn_implementation="eager", ignore_mismatched_sizes=True)
+ref_model = DTTModel.from_pretrained('gpt2', attn_implementation="eager", ignore_mismatched_sizes=True)
 ref_model.load_state_dict(model.state_dict())
 
 # Compile the transformer with dynamic=True to handle varying sequence lengths without excessive recompilation
