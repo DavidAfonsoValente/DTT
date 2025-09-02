@@ -26,6 +26,13 @@ from accelerate.state import PartialState
 # Set float32 matmul precision to high to enable TensorFloat32
 torch.set_float32_matmul_precision('high')
 
+# Disable pointwise autotuning to avoid OOM in benchmarking
+import torch._inductor.config as inductor_config
+inductor_config.triton.autotune_pointwise = False
+
+# Enable expandable segments to reduce fragmentation and OOM
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
 parser.add_argument('--config', type=str, required=True)
