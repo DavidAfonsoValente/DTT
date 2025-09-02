@@ -134,7 +134,7 @@ class DTTModel(GPT2LMHeadModel):
             if t > 0:
                 e = g_prev.unsqueeze(-1) * h_prev.unsqueeze(1) + (1 - g_prev).unsqueeze(-1) * e  # Linear blend, no sqrt
 
-            current_attention_mask = attention_mask[:, :(t + 1)] if attention_mask is not None else None
+            current_attention_mask = attention_mask[:, :(t + 1)].contiguous() if attention_mask is not None else None  # Contiguous slice
 
             if self.debug:
                 past_len = past_key_values[0][0].size(2) if past_key_values is not None else 0
@@ -198,7 +198,7 @@ class DTTModel(GPT2LMHeadModel):
             return input_ids, torch.empty(batch_size, 0, device=self.device) if return_gates else input_ids
         if attention_mask is None:
             attention_mask = input_ids.ne(self.pad_id).long()
-        attention_mask = attention_mask.to(self.device)
+        attention_mask = attention_mask.to(self.device).contiguous()  # Contiguous initial
         effective_len = attention_mask.sum(dim=1)[0].item()
         if effective_len == 0:
             return input_ids[:, :0], torch.empty(batch_size, 0, device=self.device) if return_gates else input_ids[:, :0]
@@ -227,13 +227,13 @@ class DTTModel(GPT2LMHeadModel):
                         layer_past[1][:, :, :effective_len, :]
                     ) for layer_past in outputs.past_key_values
                 )
-                attention_mask = attention_mask[:, :effective_len]
+                attention_mask = attention_mask[:, :effective_len].contiguous()  # Contiguous
                 position_ids = position_ids[:, :effective_len]
                 generated_ids = generated_ids[:, :effective_len]
             else:
                 e = g_prev.unsqueeze(-1) * h_prev.unsqueeze(1) + (1 - g_prev).unsqueeze(-1) * self.transformer.wte(next_token.unsqueeze(1))  # Linear blend
                 current_position_id = (position_ids[:, -1] + 1).unsqueeze(1)
-                attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=self.device)], dim=1)
+                attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=self.device)], dim=1).contiguous()  # Contiguous after cat
                 if self.debug:
                     past_len = past_key_values[0][0].size(2) if past_key_values is not None else 0
                     print(f"[DEBUG] Gen step {step}: inputs_embeds.shape={e.shape}, attention_mask.shape={attention_mask.shape}, past_len={past_len}")

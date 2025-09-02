@@ -36,7 +36,7 @@ def validate_grpo(model, config, accelerator, tokenizer, stage, debug=False):
 
                 gen_ids, gen_gates = model.generate(
                     prompt_ids, max_length=config['max_length'], do_sample=False, return_gates=True, training=False,
-                    attention_mask=batch['attention_mask'][prompt_idx : prompt_idx + 1]
+                    attention_mask=batch['attention_mask'][prompt_idx : prompt_idx + 1].contiguous()  # Contiguous
                 )
 
                 gen_ids_without_prompt = gen_ids[0, effective_len:]

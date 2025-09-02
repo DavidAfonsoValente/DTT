@@ -34,7 +34,7 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     if attention_mask is None:
         attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
     else:
-        attention_mask = attention_mask.to(device)
+        attention_mask = attention_mask.to(device).contiguous()  # Ensure contiguous
     past_key_values = None
     past_key_values_ref = None
     logprobs = []
@@ -56,7 +56,7 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     # Compute first logp and kl (from prompt logits for the first generated token)
     log_soft = F.log_softmax(outputs.logits[:, -1, :], dim=-1)
     first_id = gen_ids_without_prompt[0].item()  # Assuming scalar tensors or single values
-    logp = log_soft[:, first_id].mean()  # Use mean for robustness, though batch=1
+    logp = log_soft[:, first_id].mean()
     logprobs.append(logp)
 
     with torch.no_grad():
@@ -64,7 +64,7 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
     ref_logp = log_soft_ref[:, first_id].mean()
     ref_logprobs.append(ref_logp)
 
-    kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
+    kl = F.kl_div(log_soft, log_soft_ref, reduction='batchmean', log_target=True)  # Swapped to KL(theta || ref)
     kl_terms.append(kl)
 
     # Now loop for subsequent tokens if any
@@ -73,7 +73,7 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
             g_t = gen_gates_without_prompt[t]
             next_id = gen_ids_without_prompt[t]
             e = g_t.unsqueeze(-1) * outputs.hidden_states[-1][:, -1, :].unsqueeze(1) + (1 - g_t).unsqueeze(-1) * model.transformer.wte(next_id.to(device).unsqueeze(0).unsqueeze(0))
-            attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
+            attention_mask = torch.cat([attention_mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1).contiguous()  # Contiguous after cat
             current_position_id = torch.tensor([[position_id]], device=device)
             outputs = model(inputs_embeds=e, position_ids=current_position_id, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
             past_key_values = outputs.past_key_values
@@ -88,7 +88,7 @@ def compute_sequence_logprobs_and_kl(model, ref_model, prompt_ids, gen_ids_witho
                 log_soft_ref = F.log_softmax(outputs_ref.logits[:, -1, :], dim=-1)
             ref_logp = log_soft_ref[:, pred_id].mean()
             ref_logprobs.append(ref_logp)
-            kl = F.kl_div(log_soft_ref, log_soft, reduction='batchmean', log_target=True)
+            kl = F.kl_div(log_soft, log_soft_ref, reduction='batchmean', log_target=True)  # Swapped to KL(theta || ref)
             kl_terms.append(kl)
 
             position_id += 1
@@ -150,7 +150,7 @@ def train_grpo(model, ref_model, dataset, config, accelerator, collate_fn, token
                         print(f"[DEBUG] Skipping empty prompt at batch index {prompt_idx}")
                     continue
                 prompt_ids = batch['input_ids'][prompt_idx : prompt_idx + 1]
-                prompt_mask = batch['attention_mask'][prompt_idx : prompt_idx + 1]  # Added per-prompt mask
+                prompt_mask = batch['attention_mask'][prompt_idx : prompt_idx + 1].contiguous()  # Contiguous
                 answer_gt = batch['answer_gt'][prompt_idx]
                 group_completions = []
                 group_gates = []
