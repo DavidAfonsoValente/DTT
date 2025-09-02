@@ -1,4 +1,4 @@
-# main.py (updated to load state_dict before compiling the transformers)
+# main.py (updated to suppress dynamo and fx warnings)
 
 import yaml
 from accelerate import Accelerator
@@ -10,15 +10,18 @@ import argparse
 import torch
 import wandb
 import os
-os.environ["TORCH_COMPILE_DISABLE"] = "1"  # Fully disables compile
 os.environ["TORCHINDUCTOR_MAX_AUTOTUNE"] = "0"  # Fallback if partially fails
+
+import logging
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+logging.getLogger("torch.fx").setLevel(logging.ERROR)
+
+import torch._dynamo as dynamo
+dynamo.config.cache_size_limit = 512
+dynamo.config.suppress_errors = True
 
 from datetime import timedelta
 from accelerate.state import PartialState
-
-#import torch._dynamo as dynamo
-#dynamo.config.cache_size_limit = 64
-#dynamo.config.suppress_errors = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, choices=['gsm8k', 'prontoqa', 'prosqa'], required=True)
